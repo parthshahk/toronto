@@ -256,7 +256,19 @@ const SUR_FRINGE_MAX = 1800;
 // the quadratic horizon closer, the last of which is not scaled by the sun) put a ground plane at
 // 13 km at 98.5-100% airlight at every one of the four time presets and every altitude the
 // camera can reach — measured, not asserted; auditHorizon() re-derives it every load.
-const HAZE_REACH = 13000;
+// The synthesised city beyond the survey is OFF. It was built to satisfy an earlier reading of
+// "make the boundary definitive", but the user's actual requirement is narrower: no dangling
+// roads, and the road may simply END where the city ends -- just don't extend it far. Inventing
+// 185 km of streets and 1,147 blocks of massing past the data produced a grey sprawl, visible
+// radial spokes at the corners, and an apron so large it read as a plate. Terminating cleanly at
+// the data edge is both what was asked for and what looks right.
+//
+// What remains: the terrain still pads a short way past the survey so the ground does not end at
+// a visible cut, and fog closes it out. No invented streets, blocks or masses.
+const SUR_ENABLED = false;
+// Was 13000 -- a 13 km flat apron. That is the "lot of grey land". Now just far enough that the
+// ground reaches the fog and stops being legible before it stops existing.
+const HAZE_REACH = 2600;
 
 // Where the player is stopped, measured outward from the data extent. Deliberately a fraction of
 // the fringe and then capped at 300 m, because main.js's own WORLD_MARGIN backstop is 320 m: the
@@ -9251,9 +9263,9 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     const y = terrainY(x, z);
     return isNum(y) && y > WATER_Y + 0.20;
   };
-  const SUR = buildSurround({
-    extent, fringe: SUR_FRINGE, landAt, terrainY, roadsRaw, buildingsRaw, stats,
-  });
+  const SUR = SUR_ENABLED
+    ? buildSurround({ extent, fringe: SUR_FRINGE, landAt, terrainY, roadsRaw, buildingsRaw, stats })
+    : { roads: [], blocks: [], strips: [] };
   // Everything the player can physically reach is a real obstacle. The reachable band is thin —
   // the soft limit is SOFT_OUT past the data and a body radius past that — so only the first few
   // rings are registered, and they are registered from the SAME pure enumeration the geometry
