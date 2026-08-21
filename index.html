@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="A geometrically accurate, free-roam recreation of downtown Toronto in the browser. WebGL2, zero dependencies.">
+<title>Toronto — Downtown</title>
+<style>
+  /* Blue-hour palette. Cool and desaturated; the only warmth is the western horizon and the
+     sodium/interior light, exactly as in the renderer. */
+  :root {
+    --ink:     #05080e;
+    --deep:    #0a1220;
+    --indigo:  #12203a;
+    --slate:   #1b2c44;
+    --cyan:    #7fb8ca;
+    --cyan-dk: #3c6f83;
+    --warm:    #c8794a;
+    --text:    #dbe6ee;
+    --dim:     #8296a6;
+    --faint:   #5d7183;
+    --rule:    rgba(219, 230, 238, 0.16);
+    --mono:    ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --sans:    "Helvetica Neue", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: var(--ink); color: var(--text);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+    touch-action: none; overscroll-behavior: none;
+  }
+
+  canvas { display: block; position: absolute; inset: 0; width: 100%; height: 100%; }
+  #gl  { z-index: 1; background: #070d17; }
+  #hud { z-index: 2; pointer-events: none; }
+
+  /* ------------------------------------------------------------ overlays -- */
+
+  .overlay {
+    position: absolute; inset: 0; z-index: 10;
+    display: flex; flex-direction: column; align-items: center;
+    /* The controls table is tall. Centring is done with `margin: auto` on the panel, NOT with
+       justify-content: center — a centred flex child that overflows is pushed above the scroll
+       origin and its top becomes permanently unreachable on a short window. */
+    justify-content: flex-start; overflow-y: auto;
+    padding: 28px 0 82px;
+    background:
+      radial-gradient(120% 92% at 6% 98%, rgba(200, 121, 74, 0.30) 0%, rgba(200, 121, 74, 0) 56%),
+      linear-gradient(179deg, #05080e 0%, #08101d 26%, #0d1a2e 52%, #13253c 76%, #1a3149 92%, #24425c 100%);
+  }
+  .overlay.hidden { display: none; }
+
+  /* Faint horizon rule — the only "graphic" on the screen. */
+  .overlay::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: 16%; height: 1px;
+    background: linear-gradient(90deg, rgba(200,121,74,0) 0%, rgba(200,121,74,0.42) 12%,
+                rgba(127,184,202,0.30) 48%, rgba(127,184,202,0) 96%);
+    pointer-events: none;
+  }
+
+  /* The title screen sits over the live render, so it is a scrim rather than a wall. */
+  #title { background:
+      radial-gradient(120% 92% at 6% 98%, rgba(200, 121, 74, 0.16) 0%, rgba(200, 121, 74, 0) 56%),
+      linear-gradient(179deg, rgba(5,8,14,0.94) 0%, rgba(8,16,29,0.86) 40%,
+                      rgba(15,37,60,0.72) 78%, rgba(30,60,84,0.62) 100%); }
+
+  .wrap { position: relative; z-index: 3; text-align: center; padding: 0 26px;
+          max-width: 940px; margin: auto 0; }
+
+  h1 {
+    margin: 0; font-weight: 200; line-height: 1;
+    font-size: clamp(38px, 9.2vw, 106px);
+    letter-spacing: 0.24em; text-indent: 0.24em;
+    color: #eef5fa;
+    text-shadow: 0 0 42px rgba(127, 184, 202, 0.22);
+  }
+
+  .tag {
+    margin: 18px 0 0; font-family: var(--mono); font-size: 10.5px;
+    letter-spacing: 0.42em; text-indent: 0.42em; text-transform: uppercase;
+    color: var(--cyan); opacity: 0.85;
+  }
+  .sub {
+    margin: 9px 0 0; font-family: var(--mono); font-size: 10.5px;
+    letter-spacing: 0.2em; color: var(--faint);
+  }
+
+  /* -------------------------------------------------------------- loading -- */
+
+  #loading .bar {
+    margin: 40px auto 12px; width: min(460px, 76vw); height: 2px;
+    background: rgba(219, 230, 238, 0.14); overflow: hidden;
+  }
+  #loading .fill {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--cyan-dk) 0%, var(--cyan) 62%, var(--warm) 100%);
+    transition: width 0.16s linear;
+  }
+  .status {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.24em;
+    text-transform: uppercase; color: var(--dim); min-height: 15px;
+  }
+  .pct { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.24em; color: var(--faint); }
+
+  /* ---------------------------------------------------------------- title -- */
+
+  .cta {
+    margin-top: 30px; display: inline-block; padding: 14px 46px;
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.32em;
+    text-transform: uppercase; text-indent: 0.32em;
+    color: var(--text); background: transparent;
+    border: 1px solid rgba(127, 184, 202, 0.55); border-radius: 1px;
+    cursor: pointer; pointer-events: auto;
+    transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
+  }
+  .cta:hover, .cta:focus-visible {
+    background: rgba(127, 184, 202, 0.14); border-color: var(--cyan); color: #f2f8fb; outline: none;
+  }
+
+  .legend { margin: 24px 0 10px; font-family: var(--mono); font-size: 9.5px;
+            letter-spacing: 0.24em; text-transform: uppercase; color: var(--faint); }
+  .legend b { color: var(--cyan); font-weight: 500; }
+  .legend i { color: var(--warm); font-style: normal; font-weight: 500; }
+
+  .keys {
+    margin: 0 auto; display: grid; gap: 0 34px;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    max-width: 800px; font-family: var(--mono); font-size: 11px;
+    color: var(--dim); text-align: left;
+  }
+  .keys div {
+    display: grid; grid-template-columns: 1fr auto auto; gap: 3px 14px;
+    align-items: baseline; padding: 6px 0;
+    border-bottom: 1px solid rgba(219, 230, 238, 0.08);
+  }
+  .keys b, .keys i { font-style: normal; text-align: right; min-width: 74px; font-weight: 500; }
+  .keys b { color: var(--cyan); }
+  .keys i { color: var(--warm); opacity: 0.9; }
+
+  .foot { margin-top: 20px; font-family: var(--mono); font-size: 10px;
+          letter-spacing: 0.16em; color: var(--faint); }
+
+  /* ---------------------------------------------------------------- error -- */
+
+  #error { background:
+      linear-gradient(179deg, #05080e 0%, #0a1220 60%, #101b2c 100%); }
+  #error .panel {
+    margin: auto 0; max-width: 660px; padding: 34px 36px; text-align: left;
+    border: 1px solid rgba(200, 121, 74, 0.42); background: rgba(8, 14, 24, 0.86);
+  }
+  #error h2 {
+    margin: 0 0 16px; font-weight: 300; font-size: 19px;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--warm);
+  }
+  #error p {
+    font-family: var(--mono); font-size: 12px; line-height: 1.7; color: var(--text);
+    margin: 0 0 12px; white-space: pre-wrap; word-break: break-word;
+  }
+  #error pre {
+    font-family: var(--mono); font-size: 11px; line-height: 1.6; color: var(--dim);
+    background: rgba(0, 0, 0, 0.42); border-left: 1px solid var(--rule);
+    padding: 12px 14px; margin: 0 0 14px; max-height: 240px; overflow: auto;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  /* The message and the stack keep their newlines; the standing hint is ordinary prose and must
+     not inherit pre-wrap, or the source indentation leaks into the panel. */
+  #error .hint { color: var(--faint); font-size: 11px; margin: 0; white-space: normal; }
+
+  /* ---------------------------------------------------------- attribution -- */
+  /* Mandatory and always visible while a shell overlay is up. Once the world is running the 2D
+     HUD draws the same line every frame, so this one steps out of the way. */
+  #attrib {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 12;
+    text-align: center; padding: 16px 18px 14px; pointer-events: none;
+    font-family: var(--mono); font-size: 9.5px; line-height: 1.7;
+    letter-spacing: 0.11em; color: var(--faint);
+    background: linear-gradient(180deg, rgba(5, 8, 14, 0) 0%, rgba(5, 8, 14, 0.72) 42%,
+                rgba(5, 8, 14, 0.9) 100%);
+  }
+  #attrib.hidden { display: none; }
+  #attrib b { color: var(--dim); font-weight: 500; }
+
+  @media (max-width: 560px) {
+    .keys { grid-template-columns: 1fr; }
+    h1 { letter-spacing: 0.16em; text-indent: 0.16em; }
+  }
+</style>
+</head>
+<body>
+  <canvas id="gl"></canvas>
+  <canvas id="hud"></canvas>
+
+  <!-- BOOT / LOADING ---------------------------------------------------- -->
+  <div class="overlay" id="loading">
+    <div class="wrap">
+      <h1>TORONTO</h1>
+      <p class="tag">Downtown &middot; Blue hour</p>
+      <p class="sub">43.6440&deg; N &nbsp; 79.3885&deg; W &nbsp;&middot;&nbsp; 3.14 &times; 2.23 km</p>
+      <div class="bar"><div class="fill" id="loadFill"></div></div>
+      <div class="status" id="loadStatus">Starting</div>
+      <div class="pct" id="loadPct">0%</div>
+    </div>
+  </div>
+
+  <!-- TITLE ------------------------------------------------------------- -->
+  <div class="overlay hidden" id="title">
+    <div class="wrap">
+      <h1>TORONTO</h1>
+      <p class="tag">Downtown &middot; Blue hour</p>
+      <p class="sub">Free roam &middot; every footprint from open data</p>
+      <button class="cta" id="startBtn">Enter the city</button>
+      <p class="legend"><b>&#9642; standard</b> &nbsp;&middot;&nbsp; <i>&#9642; left-handed (arrows)</i></p>
+      <div class="keys">
+        <div><span>Move</span><b>W A S D</b><i>&uarr; &larr; &darr; &rarr;</i></div>
+        <div><span>Look</span><b>Mouse</b><i>Mouse</i></div>
+        <div><span>Run / boost</span><b>Shift</b><i>R&#8209;Shift</i></div>
+        <div><span>Jump / ascend</span><b>Space</b><i>/ &nbsp;Num0</i></div>
+        <div><span>Descend</span><b>L&#8209;Ctrl</b><i>R&#8209;Ctrl</i></div>
+        <div><span>Walk / fly</span><b>F</b><i>.</i></div>
+        <div><span>Quality &minus; / +</span><b>Q &nbsp;E</b><i>[ &nbsp;]</i></div>
+        <div><span>Next viewpoint</span><b>V</b><i>&#39;</i></div>
+        <div><span>Back to the start</span><b>R</b><i>,</i></div>
+        <div><span>Help</span><b>H</b><i>&minus;</i></div>
+        <div><span>Diagnostics</span><b>`</b><i>End</i></div>
+        <div><span>Release mouse</span><b>Esc</b><i>Backspace</i></div>
+      </div>
+      <p class="foot">Both layouts are live at once &middot; a click is needed for pointer lock &middot; Esc releases it</p>
+    </div>
+  </div>
+
+  <!-- ERROR ------------------------------------------------------------- -->
+  <div class="overlay hidden" id="error">
+    <div class="panel">
+      <h2 id="errTitle">Toronto can&rsquo;t start</h2>
+      <p id="errMsg">This browser could not create a WebGL2 context.</p>
+      <pre id="errDetail"></pre>
+      <p class="hint">WebGL2 is required: Chrome, Edge, Firefox, or Safari 15 and later, with
+      hardware acceleration switched on. The page must also be served over HTTP &mdash; ES modules
+      do not load from a <code>file://</code> URL.</p>
+    </div>
+  </div>
+
+  <!-- MANDATORY DATA ATTRIBUTION ---------------------------------------- -->
+  <div id="attrib">
+    <b>Buildings:</b> City of Toronto Open Data (3D Massing 2025)
+    &nbsp;&middot;&nbsp;
+    <b>Streets:</b> &copy; OpenStreetMap contributors, ODbL
+  </div>
+
+<script>
+// Shell API consumed by src/main.js. Deliberately a plain script, outside the module graph, so a
+// module-level throw (a syntax error, a bad import specifier) still leaves us able to draw the
+// error panel.
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const startHandlers = [];
+  let started = false;
+  let titleShown = false;
+
+  // A click that lands while the city is still loading must NOT consume the start: main.js has
+  // not registered its handler yet, so firing here would hide the title and never boot the loop.
+  // Nothing can start until showTitle() has run, and a handler registered after the fact still
+  // gets called — the handshake works in either order.
+  function fire() {
+    if (started || !titleShown) return;
+    started = true;
+    const el = $('attrib');
+    if (el) el.classList.add('hidden');
+    for (let i = 0; i < startHandlers.length; i++) {
+      try { startHandlers[i](); } catch (e) { console.error(e); }
+    }
+  }
+
+  const shell = {
+    setProgress(frac, label) {
+      const f = Math.max(0, Math.min(1, Number(frac) || 0));
+      const fill = $('loadFill');
+      if (fill) fill.style.width = (f * 100).toFixed(1) + '%';
+      const pct = $('loadPct');
+      if (pct) pct.textContent = Math.round(f * 100) + '%';
+      if (label) {
+        const st = $('loadStatus');
+        if (st) st.textContent = String(label);
+      }
+    },
+    hideLoading() {
+      const el = $('loading');
+      if (el) el.classList.add('hidden');
+    },
+    showTitle() {
+      titleShown = true;
+      const el = $('title');
+      if (el) el.classList.remove('hidden');
+      const at = $('attrib');
+      if (at && !started) at.classList.remove('hidden');
+    },
+    hideTitle() {
+      const el = $('title');
+      if (el) el.classList.add('hidden');
+      const at = $('attrib');
+      if (at) at.classList.add('hidden');
+    },
+    onStart(fn) {
+      if (typeof fn !== 'function') return;
+      startHandlers.push(fn);
+      if (started) { try { fn(); } catch (e) { console.error(e); } }
+    },
+    showError(msg, detail) {
+      const l = $('loading'); if (l) l.classList.add('hidden');
+      const t = $('title'); if (t) t.classList.add('hidden');
+      const a = $('attrib'); if (a) a.classList.remove('hidden');
+      const e = $('error'); if (e) e.classList.remove('hidden');
+      const m = $('errMsg'); if (m) m.textContent = msg || 'Something went wrong.';
+      const d = $('errDetail');
+      if (d) {
+        d.textContent = detail || '';
+        d.style.display = detail ? '' : 'none';
+      }
+    },
+  };
+
+  const btn = $('startBtn');
+  if (btn) btn.addEventListener('click', (e) => { e.preventDefault(); fire(); });
+  const titleEl = $('title');
+  if (titleEl) titleEl.addEventListener('click', fire);
+
+  window.VH_SHELL = shell;
+
+  window.addEventListener('error', (e) => {
+    const panel = $('error');
+    if (panel && !panel.classList.contains('hidden')) return;
+    shell.showError('A script error stopped the city from loading.',
+      (e.message || 'unknown error') + '\n' + (e.filename || '') + ':' + (e.lineno || 0));
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    console.error('Unhandled rejection:', e.reason);
+  });
+  // Right-drag is a look control; the browser menu must not eat it.
+  window.addEventListener('contextmenu', (e) => { e.preventDefault(); });
+})();
+</script>
+<script type="module" src="./src/main.js?v=1787277595"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+node_modules/
+.DS_Store
+
+# Source data for the build pipeline — 406 MB, all of it re-downloadable.
+# tools/build_city.py and tools/match_osm.py regenerate data/toronto.json from these.
+data/raw/
+
+# The BUILT city (data/toronto.json, ~3.3 MB) IS committed: the app needs it to run,
+# and rebuilding requires a 210 MB shapefile download.
