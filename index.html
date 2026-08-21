@@ -361,7 +361,7 @@
   </div>
 
 <script>
-// Shell API consumed by src/main.js. Deliberately a plain script, outside the module graph, so a
+// Shell API consumed by src/app/main.js. Deliberately a plain script, outside the module graph, so a
 // module-level throw (a syntax error, a bad import specifier) still leaves us able to draw the
 // error panel.
 (function () {
@@ -459,7 +459,7 @@
   };
 
   // First guess at the input mode, before the module graph has loaded. main.js overrides this
-  // with src/touch.js's detectPointer(), which is the same test written once properly; doing it
+  // with src/app/touch.js's detectPointer(), which is the same test written once properly; doing it
   // here as well means the title screen is never briefly wrong on a phone.
   (function () {
     let coarse = false, fine = false;
@@ -513,21 +513,117 @@
 <script type="importmap">
 {
   "imports": {
-    "./src/city.js": "./src/city.js?v=1787341008",
-    "./src/facades.js": "./src/facades.js?v=1787341008",
-    "./src/gl.js": "./src/gl.js?v=1787341008",
-    "./src/harbour.js": "./src/harbour.js?v=1787341008",
-    "./src/input.js": "./src/input.js?v=1787341008",
-    "./src/main.js": "./src/main.js?v=1787341008",
-    "./src/math.js": "./src/math.js?v=1787341008",
-    "./src/props.js": "./src/props.js?v=1787341008",
-    "./src/render.js": "./src/render.js?v=1787341008",
-    "./src/text.js": "./src/text.js?v=1787341008",
-    "./src/tiles.js": "./src/tiles.js?v=1787341008",
-    "./src/touch.js": "./src/touch.js?v=1787341008"
+    "./src/app/controls.js": "./src/app/controls.js?v=1787361200",
+    "./src/app/hud.js": "./src/app/hud.js?v=1787361200",
+    "./src/app/input.js": "./src/app/input.js?v=1787361200",
+    "./src/app/main.js": "./src/app/main.js?v=1787361200",
+    "./src/app/quality.js": "./src/app/quality.js?v=1787361200",
+    "./src/app/time.js": "./src/app/time.js?v=1787361200",
+    "./src/app/touch.js": "./src/app/touch.js?v=1787361200",
+    "./src/city.js": "./src/city.js?v=1787361200",
+    "./src/city/articulation.js": "./src/city/articulation.js?v=1787361200",
+    "./src/city/buildings.js": "./src/city/buildings.js?v=1787361200",
+    "./src/city/facadekit.js": "./src/city/facadekit.js?v=1787361200",
+    "./src/city/facades.js": "./src/city/facades.js?v=1787361200",
+    "./src/city/frontage.js": "./src/city/frontage.js?v=1787361200",
+    "./src/city/landmarks.js": "./src/city/landmarks.js?v=1787361200",
+    "./src/city/lod.js": "./src/city/lod.js?v=1787361200",
+    "./src/city/materials.js": "./src/city/materials.js?v=1787361200",
+    "./src/city/queries.js": "./src/city/queries.js?v=1787361200",
+    "./src/city/report.js": "./src/city/report.js?v=1787361200",
+    "./src/city/roofs.js": "./src/city/roofs.js?v=1787361200",
+    "./src/city/stats.js": "./src/city/stats.js?v=1787361200",
+    "./src/city/tilebuild.js": "./src/city/tilebuild.js?v=1787361200",
+    "./src/city/tileindex.js": "./src/city/tileindex.js?v=1787361200",
+    "./src/city/unitfronts.js": "./src/city/unitfronts.js?v=1787361200",
+    "./src/city/unitkinds.js": "./src/city/unitkinds.js?v=1787361200",
+    "./src/city/units.js": "./src/city/units.js?v=1787361200",
+    "./src/core/async.js": "./src/core/async.js?v=1787361200",
+    "./src/core/gl.js": "./src/core/gl.js?v=1787361200",
+    "./src/core/math.js": "./src/core/math.js?v=1787361200",
+    "./src/core/util.js": "./src/core/util.js?v=1787361200",
+    "./src/core/vertex.js": "./src/core/vertex.js?v=1787361200",
+    "./src/data/index.js": "./src/data/index.js?v=1787361200",
+    "./src/data/load.js": "./src/data/load.js?v=1787361200",
+    "./src/data/schema.js": "./src/data/schema.js?v=1787361200",
+    "./src/geom/extrude.js": "./src/geom/extrude.js?v=1787361200",
+    "./src/geom/ribbon.js": "./src/geom/ribbon.js?v=1787361200",
+    "./src/geom/ring.js": "./src/geom/ring.js?v=1787361200",
+    "./src/geom/triangulate.js": "./src/geom/triangulate.js?v=1787361200",
+    "./src/props/airfield.js": "./src/props/airfield.js?v=1787361200",
+    "./src/props/furniture.js": "./src/props/furniture.js?v=1787361200",
+    "./src/props/index.js": "./src/props/index.js?v=1787361200",
+    "./src/props/kit.js": "./src/props/kit.js?v=1787361200",
+    "./src/props/lighting.js": "./src/props/lighting.js?v=1787361200",
+    "./src/props/marine.js": "./src/props/marine.js?v=1787361200",
+    "./src/props/materials.js": "./src/props/materials.js?v=1787361200",
+    "./src/props/people.js": "./src/props/people.js?v=1787361200",
+    "./src/props/rooftop.js": "./src/props/rooftop.js?v=1787361200",
+    "./src/props/structures.js": "./src/props/structures.js?v=1787361200",
+    "./src/props/vegetation.js": "./src/props/vegetation.js?v=1787361200",
+    "./src/props/vehicles.js": "./src/props/vehicles.js?v=1787361200",
+    "./src/render/bloom.js": "./src/render/bloom.js?v=1787361200",
+    "./src/render/camera.js": "./src/render/camera.js?v=1787361200",
+    "./src/render/env.js": "./src/render/env.js?v=1787361200",
+    "./src/render/font.js": "./src/render/font.js?v=1787361200",
+    "./src/render/lights.js": "./src/render/lights.js?v=1787361200",
+    "./src/render/post.js": "./src/render/post.js?v=1787361200",
+    "./src/render/programs.js": "./src/render/programs.js?v=1787361200",
+    "./src/render/renderer.js": "./src/render/renderer.js?v=1787361200",
+    "./src/render/shaders/common.glsl.js": "./src/render/shaders/common.glsl.js?v=1787361200",
+    "./src/render/shaders/facade.glsl.js": "./src/render/shaders/facade.glsl.js?v=1787361200",
+    "./src/render/shaders/grade.glsl.js": "./src/render/shaders/grade.glsl.js?v=1787361200",
+    "./src/render/shaders/lights.glsl.js": "./src/render/shaders/lights.glsl.js?v=1787361200",
+    "./src/render/shaders/post.glsl.js": "./src/render/shaders/post.glsl.js?v=1787361200",
+    "./src/render/shaders/scene.glsl.js": "./src/render/shaders/scene.glsl.js?v=1787361200",
+    "./src/render/shaders/shadow.glsl.js": "./src/render/shaders/shadow.glsl.js?v=1787361200",
+    "./src/render/shaders/sky.glsl.js": "./src/render/shaders/sky.glsl.js?v=1787361200",
+    "./src/render/shaders/text.glsl.js": "./src/render/shaders/text.glsl.js?v=1787361200",
+    "./src/render/shaders/water.glsl.js": "./src/render/shaders/water.glsl.js?v=1787361200",
+    "./src/render/shadows.js": "./src/render/shadows.js?v=1787361200",
+    "./src/render/ssao.js": "./src/render/ssao.js?v=1787361200",
+    "./src/render/ssr.js": "./src/render/ssr.js?v=1787361200",
+    "./src/render/targets.js": "./src/render/targets.js?v=1787361200",
+    "./src/render/text.js": "./src/render/text.js?v=1787361200",
+    "./src/render/uniforms.js": "./src/render/uniforms.js?v=1787361200",
+    "./src/render/util.js": "./src/render/util.js?v=1787361200",
+    "./src/tiles.js": "./src/tiles.js?v=1787361200",
+    "./src/world/airfield.js": "./src/world/airfield.js?v=1787361200",
+    "./src/world/areas.js": "./src/world/areas.js?v=1787361200",
+    "./src/world/audit.js": "./src/world/audit.js?v=1787361200",
+    "./src/world/context.js": "./src/world/context.js?v=1787361200",
+    "./src/world/fringe.js": "./src/world/fringe.js?v=1787361200",
+    "./src/world/furniture.js": "./src/world/furniture.js?v=1787361200",
+    "./src/world/grade.js": "./src/world/grade.js?v=1787361200",
+    "./src/world/ground.js": "./src/world/ground.js?v=1787361200",
+    "./src/world/islanddetail.js": "./src/world/islanddetail.js?v=1787361200",
+    "./src/world/islandkit.js": "./src/world/islandkit.js?v=1787361200",
+    "./src/world/islandplan.js": "./src/world/islandplan.js?v=1787361200",
+    "./src/world/islands.js": "./src/world/islands.js?v=1787361200",
+    "./src/world/islandterrain.js": "./src/world/islandterrain.js?v=1787361200",
+    "./src/world/junctions.js": "./src/world/junctions.js?v=1787361200",
+    "./src/world/limits.js": "./src/world/limits.js?v=1787361200",
+    "./src/world/marine.js": "./src/world/marine.js?v=1787361200",
+    "./src/world/markings.js": "./src/world/markings.js?v=1787361200",
+    "./src/world/people.js": "./src/world/people.js?v=1787361200",
+    "./src/world/quay.js": "./src/world/quay.js?v=1787361200",
+    "./src/world/rail.js": "./src/world/rail.js?v=1787361200",
+    "./src/world/roads.js": "./src/world/roads.js?v=1787361200",
+    "./src/world/shoreline.js": "./src/world/shoreline.js?v=1787361200",
+    "./src/world/surround.js": "./src/world/surround.js?v=1787361200",
+    "./src/world/surveyed.js": "./src/world/surveyed.js?v=1787361200",
+    "./src/world/termini.js": "./src/world/termini.js?v=1787361200",
+    "./src/world/terrain.js": "./src/world/terrain.js?v=1787361200",
+    "./src/world/trench.js": "./src/world/trench.js?v=1787361200",
+    "./src/world/vehicles.js": "./src/world/vehicles.js?v=1787361200",
+    "./src/world/walk.js": "./src/world/walk.js?v=1787361200",
+    "./src/world/water.js": "./src/world/water.js?v=1787361200",
+    "./src/world/waterkit.js": "./src/world/waterkit.js?v=1787361200",
+    "./src/world/weld.js": "./src/world/weld.js?v=1787361200",
+    "./src/world/works.js": "./src/world/works.js?v=1787361200"
   }
 }
 </script>
-<script type="module" src="./src/main.js?v=1787341378"></script>
+<script type="module" src="./src/app/main.js?v=1787349672"></script>
 </body>
 </html>

@@ -11,9 +11,9 @@
 //
 // Zero dependencies, like everything else here.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, relative } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -67,7 +67,7 @@ const glStub = new Proxy({
 
 /* ------------------------------------------------------------------ audit -- */
 
-const { VERT_FLOATS: VF } = await import(resolve(ROOT, 'src/gl.js'));
+const { VERT_FLOATS: VF } = await import(resolve(ROOT, 'src/core/vertex.js'));
 
 function auditMesh(name, data) {
   const n = (data.length / VF) | 0;
@@ -271,11 +271,25 @@ check((PE.cyclists | 0) > 0 && (PE.groups | 0) > 0 && (PE.sitting | 0) > 0,
 soft(PE.core / Math.max(1, PE.total) > 0.09,
   'only ' + pct(PE.core, PE.total) + ' of the crowd is in the Financial District core');
 
-// Amendment 7: city.js must contain no notion of time of day at all — the renderer owns WHEN a
-// lamp is on. Detail may only ever mark WHAT is an emitter.
-const citySrc = readFileSync(resolve(ROOT, 'src/city.js'), 'utf8');
-for (const word of ['daylight', 'nightFactor', 'TIME_PRESET', 'applyTime']) {
-  check(citySrc.indexOf(word) < 0, 'city.js references ' + word + ': detail must be time-agnostic');
+// Amendment 7: the CITY BUILDERS must contain no notion of time of day at all — the renderer owns
+// WHEN a lamp is on. Detail may only ever mark WHAT is an emitter.
+//
+// city.js used to be the whole build, so scanning that one file covered it. It is now a loader
+// over src/world/ and src/city/, so the scan walks those directories too; anything less would let
+// a time-of-day branch land in a builder unnoticed. src/render/ is deliberately NOT scanned — the
+// renderer is exactly the thing that is allowed to know what time it is.
+const timeScan = [resolve(ROOT, 'src/city.js')];
+for (const dir of ['src/world', 'src/city']) {
+  for (const name of readdirSync(resolve(ROOT, dir))) {
+    if (name.endsWith('.js')) timeScan.push(resolve(ROOT, dir, name));
+  }
+}
+for (const path of timeScan) {
+  const srcText = readFileSync(path, 'utf8');
+  const rel = relative(ROOT, path);
+  for (const word of ['daylight', 'nightFactor', 'TIME_PRESET', 'applyTime']) {
+    check(srcText.indexOf(word) < 0, rel + ' references ' + word + ': detail must be time-agnostic');
+  }
 }
 
 // Every emitter in the scene, so it can be eyeballed against "is this a real light source?".

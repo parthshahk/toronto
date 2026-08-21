@@ -10,6 +10,9 @@
     "build:city": "python3 tools/build_city.py && python3 tools/match_osm.py && python3 tools/attach_pois.py && python3 tools/pack_city.py",
     "pack:city": "python3 tools/pack_city.py",
     "fingerprint": "node tools/fingerprint.mjs",
-    "fingerprint:check": "node tools/fingerprint.mjs --check"
+    "fingerprint:check": "node tools/fingerprint.mjs --check",
+    "scope": "node tools/scopecheck.mjs",
+    "shaders": "node tools/shadercheck.mjs",
+    "shaders:check": "node tools/shadercheck.mjs --check"
   }
 }

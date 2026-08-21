@@ -119,14 +119,14 @@ the mast to 553 m is modelled in `city.js`; `SURF_ELEV` uses `0` for "missing" a
 fill value, so terrain is interpolated from the trustworthy 62% of samples; and on the islands
 `max(AVG_HEIGHT, MAX_HEIGHT)` returns the tree canopy over a cottage rather than its roof — the
 median height on Ward's and Algonquin comes out at 19.9 m on a 100 m² footprint, and 225 of the
-288 records read over 12 m. `islandBuildingHeight()` in `harbour.js` caps a small island footprint
+288 records read over 12 m. `islandBuildingHeight()` in `world/islands.js` caps a small island footprint
 at a plausible house, hashed on world position; everywhere else it returns `b.h` untouched.
 
 **`build_city.py` does not read every tag the map needs.** It takes `highway`, `railway`,
 `natural=water`, `leisure`, `landuse`, `amenity` and `man_made`; `aeroway`, `natural=beach`,
 `natural=sand`, `route=ferry` and `attraction` all fall on the floor, which leaves Billy Bishop as
 a handful of buildings on bare ground. Those five layers are read out of `data/raw/`, projected
-with the same `Proj`, and frozen as literal tables in `harbour.js` — the same treatment as the CN
+with the same `Proj`, and frozen as literal tables in `world/islandplan.js` — the same treatment as the CN
 Tower's mast, and the only route to them that does not mean regenerating `toronto.bin`.
 
 ## Vertex format
@@ -151,21 +151,185 @@ px py pz   nx ny nz   r g b   emissive  tintable  rough  profile  uv
 
 ## Modules
 
+108 ES modules, no build step, no dependencies. Every import is relative and carries its `.js`
+extension, so the browser resolves the graph exactly as Node does.
+
+**The rule that keeps it workable: dependencies point one way.**
+
+```
+core  <-  geom / data  <-  world / city / props  <-  tiles.js, city.js  <-  app
+render  <-  core
+```
+
+`core/` imports nothing. `render/` reaches down into `core/` and nowhere else — it never sees the
+data schema, a road record or a building. Builders in `world/`, `city/` and `props/` are pure
+functions over a MeshBuilder, a feature and a context; they hold no module-level mutable state, so
+tiles build independently and in any order, which is what makes the geometry deterministic. **The
+graph has no cycles.**
+
+Two kinds of edge cross a layer boundary. One is inherent; the other is a seam in the
+wrong place, recorded here rather than papered over:
+
+- **six builders import `render/text.js`** — `city/lod.js`, `city/unitfronts.js`, `city.js`,
+  `props/lighting.js`, `props/furniture.js` and `props/structures.js`, for the glyph run layout
+  and the text LOD distances. Lettering is geometry a builder emits, but it needs the atlas the
+  renderer owns. `render/text.js` and `render/font.js` import *nothing at all*, so this points at
+  a leaf and cannot become a cycle.
+- **three builders import `tiles.js`** — `world/roads.js` and `city/report.js` for `TILE_SIZE` and
+  `makeTileGrid`, `city/lod.js` for `TileManager`, which it subclasses. This one really is an
+  upward edge: the tile grid is a spatial primitive that would sit more honestly next to
+  `data/index.js`, and `city/lod.js` is an orchestration module filed under `city/` that belongs
+  beside `tiles.js`. Moving either is a pure code move and the fingerprint would prove it.
+
+**Target: no file over ~800 lines.** Past that a file is holding more than one responsibility. Two
+are over today; both are called out under *Files that are still too big*.
+
+Two definitions are deliberately singular and must stay that way:
+
+- **the vertex format** — `core/vertex.js`, nothing else. It has already changed three times
+  (11 → 12 → 13 → 14 floats); the next change must touch that file and the shaders, and nothing
+  else. No module hard-codes a stride, a float count or a byte offset into a vertex, with one
+  known exception: `app/quality.js` carries `VERT_BYTES = 48`, left over from the 12-float format
+  and now 8 bytes short. It is read only by the HUD's resident-memory readout and one console
+  line, so it costs nothing but a wrong number — 11 M resident vertices is 616 MB of VBO, not the
+  528 MB the comment beside it claims. The fix is `VERT_BYTES = VERT_STRIDE` off `core/vertex.js`;
+  it is left alone here only because this pass was a move and changing a displayed number is not.
+- **the data schema** — `data/schema.js`, nothing else. Field names (`u`, `lv`, `hn`, `rs`,
+  `pois`) are read there once, turned into named properties on the prepared record, and every
+  consumer downstream reads the property rather than the raw field.
+
+### `core/` — depends on nothing
+
 | | |
 |---|---|
-| `math.js` | vec3, column-major mat4, seeded RNG |
-| `gl.js` | context, `Shader`, `Mesh`, `MeshBuilder` |
-| `render.js` | `Camera`, `Renderer`, all GLSL, CSM, SSAO, SSR, bloom |
-| `city.js` | `toronto.bin` → analysis, per-tile geometry, grade separation, collision, walkability, the world boundary |
+| `core/vertex.js` | **THE vertex format**: `VERT_FLOATS`, `ATTR`, offsets, `packUv`, `GLSL_UV` |
+| `core/gl.js` | context creation, `Shader`, `Mesh`, `DynamicMesh`, `MeshBuilder` |
+| `core/math.js` | scalar helpers, seeded RNG, angles, vec3 and a column-major mat4 |
+| `core/util.js` | the shared predicates and the position hashes |
+| `core/async.js` | cooperative scheduling: `now`, `frame`, `chunked`, the yield counter |
+
+### `data/` — the file on disk
+
+| | |
+|---|---|
+| `data/schema.js` | **THE shape of `toronto.json` / `toronto.bin`**, in one place |
+| `data/load.js` | fetch and decode the packed binary, with the JSON fallback |
+| `data/index.js` | the uniform-grid broadphase, and per-tile assignment of long ways |
+
+### `geom/` — plan-space geometry
+
+| | |
+|---|---|
+| `geom/ring.js` | signed area, winding, point-in-polygon, ring repair |
+| `geom/triangulate.js` | ear clipping with hole bridging |
+| `geom/ribbon.js` | polyline to ribbon: resampling, spike pruning, mitred frames |
+| `geom/extrude.js` | footprints to solids: tapered prisms, flat caps, draped caps |
+
+### `world/` — the ground and everything on it
+
+| | |
+|---|---|
+| `world/ground.js` | the ground plane's datum ladder and the tolerances everyone shares |
+| `world/terrain.js` | the height field: build, pad, sample, the cut, and the lake |
+| `world/grade.js` | grade separation: which way passes over which, and by how much |
+| `world/weld.js` | the position-welded node set and the priority queue the grade solve runs on |
+| `world/trench.js` | retaining walls, verges, portals, ceilings, concourses |
+| `world/roads.js` | the prepared road record, its sidewalk bands and the surveyed footways |
+| `world/markings.js` | the paint: lane lines, crossings, stop bars, arrows, bike lanes |
+| `world/junctions.js` | the corners: dropped kerbs, tactile plates, the corner record |
+| `world/rail.js` | the streetcar: embedded track, overhead wire, poles and stops |
+| `world/context.js` | the street-detail context `C` — every question a placement pass may ask of a point |
+| `world/furniture.js` | the procedural street furniture pass: what goes along a kerb line |
+| `world/surveyed.js` | the OSM node extract, placed where it really is, suppressing the procedural pass |
+| `world/people.js`, `world/vehicles.js`, `world/marine.js`, `world/works.js` | who is on the pavement; what is parked; what is moored; service yards and works |
+| `world/areas.js` | parks, grass, surface lots and piers, and the per-city budgets over them |
+| `world/walk.js` | the walkability graph and the audit that is an acceptance test |
+| `world/termini.js` | no dangling ends: every way terminates deliberately |
+| `world/surround.js`, `world/fringe.js`, `world/limits.js` | the edge of the world: the plan, its geometry, the soft limit and the horizon audit |
+| `world/audit.js` | the ground-plane geometry audit, bound to the live stats once per load |
+| `world/waterkit.js` | tunables, materials and helpers shared by the harbourfront and the islands |
+| `world/water.js` | `buildHarbour()`, `carveHarbourTerrain()` and the harbour queries |
+| `world/shoreline.js` | chaining the surveyed shore ways into a usable shoreline |
+| `world/quay.js` | the harbour geometry: quay walls, piers, mounds, marinas, walkways |
+| `world/islandplan.js`, `world/islandkit.js` | the frozen island survey, and the tunables over it |
+| `world/islands.js` | the island model: rings, shore runs, ferry docks, the public API |
+| `world/islandterrain.js`, `world/islanddetail.js` | carving the island edge; what it is made of at eye level |
+| `world/airfield.js` | Billy Bishop: pavement, markings, lighting, fencing, aircraft, plant |
+
+### `city/` — buildings
+
+| | |
+|---|---|
+| `city/materials.js` | the material palette, the surveyed-colour remap, and how a building picks one |
+| `city/buildings.js` | footprint preparation, extrusion, and the coplanar wall/cap resolution |
+| `city/landmarks.js` | the named towers, and the CN Tower, which is modelled by hand |
+| `city/units.js` | the block-face model: every street-facing edge, subdivided into premises |
+| `city/unitkinds.js` | the surveyed unit taxonomy: OSM premises tag to kind to style |
+| `city/unitfronts.js` | one addressed unit's frontage: glazing, fascia, shutter, doorway, sign |
+| `city/frontage.js` | building the block face the unit model laid out |
+| `city/facadekit.js` | the `(u, v, d)` frame, materials, LOD and the coplanar audit every facade builder uses |
+| `city/facades.js` | street level: entrances, shopfronts, awnings, canopies, ground floors |
+| `city/articulation.js` | above street level: balconies, cornices, string courses, parapets, fire escapes |
+| `city/roofs.js` | roof form from the surveyed tag, and the plant standing on the deck |
+| `city/lod.js` | the city's tile manager, its level-of-detail stages and its vertex budget |
+| `city/tileindex.js` | which tile owns which feature, and the cut-up of the two global passes |
+| `city/tilebuild.js` | the per-tile generator: everything a tile is made of, in stage order |
+| `city/queries.js` | the runtime surface: `buildingAt`, `collide`, `confine`, `streetNameAt` |
+| `city/stats.js`, `city/report.js` | the measurement surface, and the console summary that reads it |
+
+### `props/` — one module per domain, over one shared kit
+
+| | |
+|---|---|
+| `props/kit.js`, `props/materials.js` | the shared drawing kit and the prop palette |
+| `props/index.js` | the barrel and **the prop registry** — a new prop is a file plus one entry here |
+| `props/lighting.js` | cobra heads, acorns, pedestrian lamps, signals, sign posts, utility poles |
+| `props/furniture.js` | seating, waste, cycle parking, bollards, shelters, meters, hardware |
+| `props/vegetation.js` | street trees in pits, park trees, shrubs, beach grass |
+| `props/vehicles.js` | parked cars, vans, SUVs and rail stock |
+| `props/people.js` | pedestrians, cyclists, dog walkers, and the poses behind them |
+| `props/marine.js` | pleasure craft, ferries, docks, bollards, ladders, buoys, the lighthouse |
+| `props/structures.js` | tower cranes, scaffolding, fencing, signage, subway entrances, rides |
+| `props/rooftop.js` | rooftop plant and the tower crown: signage, condensers, antennae, penthouses |
+| `props/airfield.js` | runway and taxiway lighting, approach bars, windsocks, hangars, aircraft, GSE |
+
+### `render/` — depends on `core/` and nothing else
+
+| | |
+|---|---|
+| `render/renderer.js` | the `Renderer`: frame orchestration, the draw API, tracked GL state |
+| `render/camera.js` | the `Camera` and every matrix the frame and the post chain derive from it |
+| `render/programs.js` | every GLSL program, built once; each optional one degrades on its own |
+| `render/env.js` | the lighting environment and every uniform derived from it |
+| `render/uniforms.js` | the once-per-frame uniform block for each geometry program |
+| `render/targets.js` | the offscreen render targets and their three-tier fallback |
+| `render/shadows.js` | cascaded shadow maps: the atlas, the cascade fit, the depth pass |
+| `render/lights.js` | the clustered local-light rig |
+| `render/post.js` | the post chain order, the resolve and the composite |
+| `render/ssao.js`, `render/ssr.js`, `render/bloom.js` | the individual post passes |
+| `render/util.js` | the render layer leaf: guards, the blend enum, the identity matrix, `mixin` |
+| `render/font.js` | the SDF glyph atlas, rasterised at boot from a system font with Canvas 2D |
+| `render/text.js` | the run layout that turns a string into quads, and the text LOD distances |
+| `render/shaders/*.glsl.js` | the GLSL itself, composed by interpolation from one shared `common` |
+
+### orchestration and `app/`
+
+| | |
+|---|---|
+| `city.js` | **the loader.** `toronto.bin` → the pipeline above, in order, and the object the game holds |
 | `tiles.js` | the spatial grid, the LOD stages, the build scheduler and the eviction cache |
-| `props.js` | street furniture, vegetation, vehicles, pedestrians |
-| `facades.js` | entrances, shopfronts, balconies, cornices, the surveyed unit model — at two levels of detail |
-| `text.js` | the SDF glyph atlas, rasterised at boot from a system font with Canvas 2D, and the run layout that turns a string into quads |
-| `harbour.js` | quay walls, piers, slips, waterfront walkways, the islands, Billy Bishop |
-| `input.js` | keyboard/mouse/pointer-lock, dual-layout aliasing, the touch feeds |
-| `touch.js` | the Maps-style multi-touch camera, on-screen controls, the walk-mode thumbstick |
-| `main.js` | boot, free-roam camera, time of day, loop, the device profile and the adaptive quality step |
-| `index.html` | shell, loading and title screens, attribution, the safe-area probe |
+| `app/main.js` | boot, the shared state `G`, and the frame loop |
+| `app/controls.js` | the free-roam controllers: viewpoints, walk, fly, the camera and the key commands |
+| `app/input.js` | keyboard / mouse / pointer-lock / gamepad / touch state, and the dual-layout aliasing |
+| `app/touch.js` | the Maps-style multi-touch camera, on-screen controls, the walk-mode thumbstick |
+| `app/hud.js` | the 2D HUD: compass, readouts, attribution, help sheet, diagnostics |
+| `app/time.js` | the four time-of-day presets and the environment writer |
+| `app/quality.js` | the device profile, the quality presets and the adaptive step |
+| `index.html` | shell, loading and title screens, attribution, the import map, the safe-area probe |
+
+`index.html` carries a version-stamped **import map** covering every module. It exists so a
+cache-busting query string can be applied without editing 108 import statements; when you change
+any module, bump `V` in every URL there and in the entry `<script src>` — they must all match.
 
 Geometry is merged into one mesh per material class **per tile** — see below.
 
@@ -180,14 +344,14 @@ noon and glowing at midnight for free. Check every change at all four presets.
 mid-feature, synthesise something plausible — a believable invention beats a hole. A road may end
 only at a junction, a designed terminus, or the world boundary. Land never simply becomes water.
 
-**Nothing in the renderer may hold a world coordinate as a literal.** `render.js` has no access to
+**Nothing in the renderer may hold a world coordinate as a literal.** `src/render/` has no access to
 `meta.origin`, so any constant it carries in local metres is silently wrong the moment the extract
 is rebuilt around a different centre. There is exactly one such uniform, `uCnTower` — the xz axis
 of the mask that carries the CN Tower's LED rib wash, its two glazed bands and the red beacons up
 the mast — and the expansion moved the origin 1,020 m out from under it, which put the whole
 lighting rig over open water and left the most recognisable object in the scene an unlit concrete
 shaft at blue hour and night. `city.js` now exports `city.cnTower` from the same position it
-extrudes the tower at, and `main.js` writes it into `env.cnTower` *and* into `TIME_DEFAULTS`, which
+extrudes the tower at, and `app/main.js` writes it into `env.cnTower` *and* into `TIME_DEFAULTS`, which
 is snapshotted before the city loads and would otherwise put the stale literal straight back on the
 next preset change. If a second such constant is ever added, it needs the same treatment.
 
@@ -200,7 +364,7 @@ roughly 3× the sight lines it was tuned for.
 buffer the quantisation step is `2^-24 · z² / near · (1 − near/far)`, so precision is set by the
 near plane and almost nothing else — at 0.3 m it is 0.2 m of depth resolution at a kilometre,
 wider than the gap between the stacked massing slabs the dataset carries for one real building.
-`main.js` probes the clearance around the eye and lengthens the plane when it can; shortening
+`app/main.js` probes the clearance around the eye and lengthens the plane when it can; shortening
 lands the same frame (safety), lengthening eases in (precision only).
 
 **Far plane 18,600 m.** Set by visibility, not precision: the algebra above says raising it from
@@ -248,7 +412,7 @@ around it do.
 
 ## Touch
 
-`touch.js` adds a Google-Maps-style camera on phones and tablets. One finger pans, two pinch for
+`app/touch.js` adds a Google-Maps-style camera on phones and tablets. One finger pans, two pinch for
 height, twist for heading and sweep for tilt; a double tap zooms in a step and a two-finger tap out.
 Nothing is installed unless the device reports touch points, and every handler returns immediately
 unless `pointerType` is `touch` or `pen` — a mouse never reaches the module, and a touchscreen
@@ -279,7 +443,7 @@ Pinch is a dolly about the ground point between the fingers, so that point holds
 while altitude scales; twist rotates about the same point; tilt slides the camera along its own
 bearing so the ground point at the centre of the screen stays put and altitude does not change.
 Pitch is clamped to −88°…−2.5°, altitude to 4.5 m above terrain and 2,300 m, and the camera to the
-same world bounds the keyboard uses (`worldBounds()` in `main.js`, derived from `meta.extent`).
+same world bounds the keyboard uses (`worldBounds()` in `app/main.js`, derived from `meta.extent`).
 
 **Two-finger work is batched to the frame.** A browser delivers multi-touch moves *one pointer at a
 time*, so acting on each event in turn acts on a pair where one finger has moved and the other has
@@ -296,7 +460,7 @@ camera. A burst that spans no time simply reports no velocity.
 **The title screen teaches whichever controls exist.** `index.html` carries both tables — keys and
 gestures — and `shell.setInputMode('keyboard' | 'touch' | 'both')` picks one. The inline shell makes
 a first guess before the module graph has loaded so a phone is never briefly shown a keyboard, and
-`main.js` overrides it with `detectPointer()`. A hybrid gets **both**, because on that machine both
+`app/main.js` overrides it with `detectPointer()`. A hybrid gets **both**, because on that machine both
 really are live.
 
 **On-screen controls.** A phone has no `T`, no `Q`/`E` and no `H`, so the buttons sit in the lower
@@ -311,7 +475,7 @@ true; a desktop draws none of them and installs no listeners at all.
 
 ## Device profile, resolution and the adaptive step
 
-`main.js` classifies the machine once at boot from what the browser reports about itself — pointer
+`app/main.js` classifies the machine once at boot from what the browser reports about itself — pointer
 type and touch points via `detectPointer()`, the viewport's long side, `deviceMemory` and
 `hardwareConcurrency` where they exist. No user-agent string is consulted. There are four profiles:
 
@@ -377,13 +541,13 @@ struck-off set stayed empty. On the phone profile the same controller opened at 
 8.4 ms, stepped up once to High and stopped: `steps = 1`. Down is a rescue and is quick; up is a
 luxury and is rate-limited to one rung per 9 s of unbroken headroom.
 
-**The cheapest preset was the most expensive one.** `gl.js` asks for `antialias: true`, so the
+**The cheapest preset was the most expensive one.** `core/gl.js` asks for `antialias: true`, so the
 default framebuffer is 4× multisampled (`SAMPLES = 4`). Every preset that runs the post chain draws
 one full-screen composite quad into it and nothing else — but *Minimal* used to disable the chain
 outright and shade the whole city into that MSAA surface. Measured in foreground Chrome on an M1
 Pro, 3248 × 1500, 447 draws: Minimal direct **16.3 ms / 61 fps**, Minimal through the offscreen
 target plus one composite **8.7 ms / 115 fps**, Low **8.8 ms / 114 fps**. The ladder's bottom rung
-was 1.87× the rung above it. `render.js` now keeps the offscreen path whenever it is supported, even
+was 1.87× the rung above it. `render/targets.js` now keeps the offscreen path whenever it is supported, even
 with every effect off; the in-shader-grade fallback for a GPU with no renderable offscreen format is
 untouched. Minimal gives up the default framebuffer's free MSAA — it has FXAA off anyway — and its
 grade now matches the rest of the ladder to within 1% of mean luminance instead of running 6% hot.
@@ -405,7 +569,7 @@ them out as a run of **units** — the premises between two party walls — rath
 shopfront along the wall. Where `buildings[].u` has surveyed premises for that frontage, they are
 placed at their real `s`/`t` position along the ring and in their real order; the gaps between them
 are filled with a synthesised unit whose trade is hashed on **world position**, so a block builds
-identically whether or not its neighbours are loaded. `facades.js` turns each unit into glazing, a
+identically whether or not its neighbours are loaded. `city/unitfronts.js` turns each unit into glazing, a
 bulkhead, a sign band, a recessed or flush entry, an awning and a shutter box, all chosen by trade
 from one frozen `STYLES` table.
 
@@ -413,7 +577,7 @@ from one frozen `STYLES` table.
 stage 2 (`SIGN_RANGE`), built after massing and detail and dropped first. The signage pass re-runs
 the same layout with `textOnly`, and because every appearance decision inside `appendUnitFront` is
 hashed on world position it lands on exactly the fascias the detail stage built. Glyph quads are
-not an opaque material class — `render.js` draws them with its own program through `drawText()`,
+not an opaque material class — the renderer draws them with its own program through `drawText()`,
 which `CityTiles.forEachMesh` flushes behind the last opaque class.
 
 **Names are real or generic, never invented.** A surveyed unit is lettered with its actual name
@@ -430,7 +594,7 @@ that match is sometimes the building next door.
 
 ## Local lights
 
-Street lamps used to be geometry and nothing else. `render.js` has carried a clustered forward
+Street lamps used to be geometry and nothing else. `render/lights.js` has carried a clustered forward
 light rig the whole time and no caller ever registered anything with it, so `lightStats.registered`
 sat at **0** and the only light in a night frame was the sky: the road measured RGB (1, 1, 2) —
 luma 0.006 — while the shopfronts above it glowed. Walking Queen Street at 23:30 read as a power
@@ -507,7 +671,7 @@ Stage 1 is *additive* — the detail is geometry proud of massing that already e
 the boundary fades detail in rather than changing a silhouette. 780 m is where a 9.5 m lamp mast is
 19 px tall and one across on a 900-line frame, and a balcony band is under two.
 
-**`facades.js` builds at two levels**, selected through the `lod` field of the `opts` object every
+**The facade builders build at two levels**, selected through the `lod` field of the `opts` object every
 builder already takes: `FACADE_LOD.FULL` (the default, and byte-identical to what the module
 emitted before LOD existed) and `FACADE_LOD.COARSE`, which keeps the silhouette, the materials and
 the random choices and drops the internal articulation — 1.7× cheaper on a parapet that was
@@ -547,12 +711,12 @@ frame of 11.8 ms and one frame over 50 ms, which was the teleport. Parked out of
 20 s grace period, 6.83 M vertices and 224 GL buffers come back.
 
 **Two passes cannot be tiled and are captured instead.** The walkability audit has to see the whole
-network before it knows where to build a flight of steps, and the *mainland* half of `harbour.js`
+network before it knows where to build a flight of steps, and the *mainland* half of the harbour model (`world/water.js` and `world/quay.js`)
 walks 32 km of surveyed shoreline as continuous runs. Both run once into scratch builders;
 `captureSplit` then cuts the result up by triangle centroid and hands each tile the float run it
 owns. That costs 2.6 M vertices (128 MB) of CPU-side chunks held for rebuild. The proper fix is a
-bounding-box predicate in `harbour.js` — the same change the full city needs anyway, and the island
-half of the module is already written that way: `appendIslandMass` and `appendIslandDetail` take
+bounding-box predicate in `world/quay.js` — the same change the full city needs anyway, and the island
+half of the model is already written that way: `appendIslandMass` and `appendIslandDetail` take
 the tile's core cell and emit only the strips, stripes, trees and lights whose anchor falls inside
 it, off a spatial model built once.
 
@@ -560,7 +724,7 @@ it, off a spatial model built once.
 
 The extract's southern half is 3.44 km² of island in sixteen rings, 35.5 km of surveyed shore, an
 airport, and the two shipping channels either side of the harbour. It is a different place from
-the mainland waterfront and `harbour.js` builds it differently.
+the mainland waterfront and `world/islands.js` builds it differently.
 
 **A surveyed shoreline is a line, not an edge.** Amendment 9.2 forbids land simply becoming water,
 so every one of those 35.5 km is classified — from the survey where the survey says something, by
@@ -698,7 +862,7 @@ ejection from a footprint and no recovery from NaN can put anyone outside the wo
 **Proof that the world never visibly ends** (§9.4). The drawn world is a rectangle, so along any
 bearing from any viewpoint there is exactly one distance at which it stops — computable in closed
 form. `auditHorizon()` casts 6,240 rays from the whole perimeter of the soft limit, at five
-altitudes up to the 2,400 m ceiling and 24 bearings, and evaluates `render.js`'s own fog model
+altitudes up to the 2,400 m ceiling and 24 bearings, and evaluates the renderer's own fog model
 (faithfully duplicated for audit, deliberately, so it fails loudly if either drifts) at all four
 time presets. Nearest world edge 13,907 m; **worst airlight 99.15%** (Night, 2,400 m, 14.1 km
 sightline); **0 rays below the 97% threshold**. Confirmed against the framebuffer: at 2,400 m
@@ -774,3 +938,53 @@ string and against the safe box.
 Safe-area insets can be exercised without a notched device by setting `--sat`/`--sar`/`--sab`/`--sal`
 on `:root`: that drives the `#safe` probe the canvas HUD reads *and* the CSS padding on the shell
 overlays, so both paths are tested at once.
+
+## The safety nets
+
+Four checks run without a browser. Between them they cover the geometry, the module graph and the
+shaders; none of them covers the frame, which is why the last step is always to boot the thing.
+
+| | | |
+|---|---|---|
+| `npm run check` | `node --check` on every module | catches a syntax error |
+| `npm run fingerprint:check` | `tools/fingerprint.mjs` | catches **changed geometry** |
+| `npm run scope` | `tools/scopecheck.mjs` | catches a **free variable** left behind by a move |
+| `npm run shaders:check` | `tools/shadercheck.mjs` | catches a changed program or an unwritten uniform |
+
+**The fingerprint** builds the real city against a stub GL context, drives `tiles.js` through every
+stage of every tile, and reduces every emitted vertex to an order-independent hash — each vertex is
+hashed alone and the hashes are summed, so re-ordering tiles, re-ordering emitters inside a tile or
+splitting one module into six cannot move the number. 34,477,884 vertices, plus 468 stats fields,
+plus every landmark height. It is the proof that a refactor was a move and not a rewrite.
+
+It has two blind spots, both structural:
+
+- **the signs class.** Lettering needs the Canvas 2D font atlas, which does not exist headlessly,
+  so `facades.textGlyphs` is 0 and the `signs` bucket is empty. The summary prints a COVERAGE line
+  whenever that happens, so it is never silent — but any change to `render/text.js`, `render/font.js`
+  or the facade signage pass has to be checked in the browser. In a real tab that pass emits about
+  14,700 glyphs.
+- **the completion path.** The tool calls `loadCity()` and then walks the tiles itself; it never
+  calls `warm()`, so the console summary at the end of a boot never runs under it.
+
+**The scope check** exists because of that second blind spot. Splitting `city.js` moved
+`logCitySummary()` out of `loadCity()`'s closure into `city/report.js` still reading two of that
+closure's variables, `extent` and `HARBOUR`. `node --check` passes — an unresolved identifier is
+legal JavaScript until the line runs — the fingerprint passes, and the browser throws a
+`ReferenceError` at the end of a 70-second boot. `tools/scopecheck.mjs` scans every module for an
+identifier that is read but never imported, declared, taken as a parameter or global. It is a
+scanner and not a parser: bindings are collected generously and reads narrowly, so a finding is
+worth reading the line for and a clean run is evidence rather than proof.
+
+## Files that are still too big
+
+Two modules are over the ~800-line ceiling. Both are known and neither is a good split today:
+
+- **`app/touch.js`, 1,350 lines.** One gesture classifier. Pan, two-finger pinch/rotate/tilt, the
+  walk-mode thumbstick and the on-screen buttons all share one pointer table and one state machine,
+  and the correctness of the whole thing is in the transitions between them. Splitting it by
+  gesture would put that state machine across three files and buy nothing.
+- **`render/renderer.js`, 874 lines.** Already the residue of a much larger file: shadows, lights,
+  post, targets, uniforms, programs and env are each their own module and install their methods on
+  `Renderer.prototype` through the `mixin` in `render/util.js`. What is left is the frame itself
+  plus the tracked GL state, which is one object with one lifetime.

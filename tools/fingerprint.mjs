@@ -125,7 +125,7 @@ const glStub = new Proxy({
 
 /* ------------------------------------------------------------------- hash -- */
 
-const { VERT_FLOATS: VF } = await import(resolve(ROOT, 'src/gl.js'));
+const { VERT_FLOATS: VF } = await import(resolve(ROOT, 'src/core/vertex.js'));
 
 // Quantisation per vertex float. Index order is the vertex format:
 //   0..2 position   3..5 normal   6..8 colour   9 emissive  10 tintable  11 rough

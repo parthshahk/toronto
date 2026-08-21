@@ -28,7 +28,7 @@
 //
 // Zero dependencies.
 
-import { MeshBuilder } from './gl.js';
+import { MeshBuilder } from './core/gl.js';
 
 /* ================================================================ constants == */
 

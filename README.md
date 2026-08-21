@@ -190,6 +190,21 @@ open http://localhost:8123
 
 Needs WebGL2 — Chrome, Edge, Firefox or Safari 15+, hardware acceleration on.
 
+## Checks
+
+Four, all headless, all zero-dependency. Run them before and after any change to the engine.
+
+```bash
+npm run check              # node --check on every module
+npm run fingerprint:check  # 34.5 M vertices hashed order-independently — did the city move?
+npm run scope              # any identifier read but never bound (a move left a variable behind)
+npm run shaders:check      # every GLSL program, and every uniform the draw path writes
+```
+
+The fingerprint is the important one: it builds the real city against a stub GL context and
+reduces every vertex the map can emit to one hash, so a refactor can be proved to be a move rather
+than a rewrite. What none of them cover is the frame itself — boot it and look.
+
 ## Rebuilding the city data
 
 `data/toronto.json` is committed, so you only need this to change the area or refresh the source.
