@@ -7,3 +7,6 @@ data/raw/
 
 # The BUILT city (data/toronto.json, ~3.3 MB) IS committed: the app needs it to run,
 # and rebuilding requires a 210 MB shapefile download.
+
+# Working spec / notes, not documentation.
+CONTRACT.md
