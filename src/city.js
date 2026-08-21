@@ -56,6 +56,10 @@ import {
   buildHarbour, carveHarbourTerrain, harbourTileHasWater, harbourWaterAt, appendHarbour,
   harbourStats,
 } from './harbour.js';
+// SPATIAL TILING. The city is no longer one merged mesh per material class: it is one merged mesh
+// per material class PER TILE, built on demand and thrown away when it goes out of range. See
+// tiles.js for why, and for the level-of-detail stages.
+import { TILE_SIZE, makeTileGrid, splitRuns, TileManager } from './tiles.js';
 
 /* =============================================================== tunables == */
 
@@ -184,6 +188,9 @@ const BIKE_STREETS = ['Richmond', 'Adelaide', 'Bay', 'Simcoe', 'Sherbourne', 'We
 const BALCONY_MAX = 24;
 const MAX_LOT_CARS = 620;         // across every surface lot in the extract
 const MAX_LOT_CARS_EACH = 34;
+// ...and per TILE, which is what actually bounds a frame now: the old city-wide number was a
+// vertex budget in disguise, and a vertex budget is what tiles.js enforces.
+const MAX_LOT_CARS_TILE = 90;
 const MAX_CRANES = 7;
 const MAX_TOWER_SIGNS = 8;
 const PARK_TREE_SPACING = 17;
@@ -301,7 +308,12 @@ const now = () => (typeof performance !== 'undefined' && performance.now ? perfo
 
 // Yield to the browser. A bare requestAnimationFrame NEVER fires in a background tab, which would
 // hang the load forever, so race it against a timer and take whichever wins.
+// Counted, because in a real visible tab each of these costs a few milliseconds of wall clock
+// that no profiler inside the load will attribute to anything. loadCity reports the number.
+let _yields = 0;
+
 function frame() {
+  _yields++;
   return new Promise((resolve) => {
     let done = false;
     const fin = () => { if (!done) { done = true; resolve(); } };
@@ -310,12 +322,23 @@ function frame() {
   });
 }
 
+// Milliseconds of work between yields. A yield is not free — in a visible tab it costs most of a
+// frame, and the old fixed chunk sizes spent 220 of them on a build whose real work was three
+// seconds, so a third of the load was the loading screen waiting for itself. This yields on a
+// CLOCK instead: the progress bar still updates about forty times a second, which is as often as
+// anyone can see, and the count drops by an order of magnitude.
+const CHUNK_MS = 12;
+
 async function chunked(n, size, fn, onFrac) {
+  let last = now();
   for (let i = 0; i < n; i += size) {
     const end = Math.min(n, i + size);
     for (let k = i; k < end; k++) fn(k);
     if (onFrac) onFrac(end / Math.max(1, n));
-    if (end < n) await frame();
+    if (end < n && now() - last > CHUNK_MS) {
+      await frame();
+      last = now();
+    }
   }
 }
 
@@ -1354,9 +1377,21 @@ const CUT_SUB = 2.2;
  * length of corridor and to nothing else — are rebuilt at CUT_SUB and the sub-cells inside the cut
  * are dropped. A sub-cell goes only when ALL FOUR of its corners are inside, so the terrain always
  * RECEDES from the trench rather than hanging over it; the verge covers the difference.
+ *
+ * Built a tile at a time by emitTerrainRange() below.
  */
-function emitTerrainMesh(mb, T, grade) {
-  const { nx, nz, cell, x0, z0, h } = T;
+
+/**
+ * Per-vertex terrain normals, computed once and cached on T.
+ *
+ * Split out of the mesh emitter because the ground is now built a tile at a time: every tile
+ * needs the same normal field, and a tile rebuilt after eviction must produce byte-identical
+ * geometry to the one it replaces. Central differences over the whole grid do that; per-tile
+ * differences would not, because a tile edge has no neighbour to difference against.
+ */
+function terrainNormals(T) {
+  if (T.nrm) return T.nrm;
+  const { nx, nz, cell, h } = T;
   const nrm = new Float32Array(nx * nz * 3);
   for (let j = 0; j < nz; j++) {
     for (let i = 0; i < nx; i++) {
@@ -1372,11 +1407,25 @@ function emitTerrainMesh(mb, T, grade) {
       nrm[o] = ax * il; nrm[o + 1] = ay * il; nrm[o + 2] = az * il;
     }
   }
+  T.nrm = nrm;
+  return nrm;
+}
+
+/**
+ * The ground, for the cell range [i0, i1) x [j0, j1). Every cell belongs to exactly one tile, so
+ * the whole grid is still emitted exactly once and adjacent tiles share their edge vertices to
+ * the bit — the seam is not stitched, it simply cannot open.
+ */
+function emitTerrainRange(mb, T, grade, i0, i1, j0, j1) {
+  const { nx, nz, cell, x0, z0, h } = T;
+  const nrm = terrainNormals(T);
   setMat(mb, M.terrain);
   const px = (i) => x0 + i * cell;
   const pz = (j) => z0 + j * cell;
-  for (let j = 0; j < nz - 1; j++) {
-    for (let i = 0; i < nx - 1; i++) {
+  const ja = Math.max(0, j0), jb = Math.min(nz - 1, j1);
+  const ia = Math.max(0, i0), ib = Math.min(nx - 1, i1);
+  for (let j = ja; j < jb; j++) {
+    for (let i = ia; i < ib; i++) {
       const i00 = (j * nx + i) * 3, i10 = (j * nx + i + 1) * 3;
       const i01 = ((j + 1) * nx + i) * 3, i11 = ((j + 1) * nx + i + 1) * 3;
       const x = px(i), x1 = px(i + 1), z = pz(j), z1 = pz(j + 1);
@@ -5682,7 +5731,13 @@ const CYCLE_SPACING = 130.0;       // metres of bike lane per cyclist
 const PLAZA_PER = 300.0;           // square metres of plaza per person
 const PARK_PER = 1100.0;           // ...and of park
 const WALK_SPACING = 130.0;        // metres of OSM footway per person
-const MAX_PEOPLE = 4000;
+// The crowd is budgeted PER TILE, not city-wide. A single global head count was a vertex budget
+// in disguise: on a 43 km2 map it is spent long before the camera reaches the Financial District,
+// and whichever tiles happened to be built last come out empty. 220 is the old city-wide 4,000
+// scaled to one 625 m tile at the density the 7 km2 slice was tuned to (571 people per km2), so a
+// street looks exactly as busy as it used to and the number resident at any moment is bounded by
+// the detail radius rather than by the size of the map.
+const MAX_PEOPLE = 220;
 
 // King and Bay, in local metres, and how far the core's footfall bump reaches.
 const CORE_X = 684.7, CORE_Z = -489.8, CORE_R = 420.0;
@@ -5744,7 +5799,10 @@ function faceYaw(dx, dz) { return Math.atan2(-dz, dx); }
  */
 function placePerson(C, P, x, z, yaw, opts) {
   const S = C.stats.people;
-  if (S.total >= MAX_PEOPLE) return false;
+  // The head count is the TILE's, not the accumulated total: reading stats.people.total here
+  // would spend the whole map's budget on whichever tiles happened to be built first and leave
+  // the rest of the city deserted — and would make the crowd a function of the flight path.
+  if (C.tilePeople >= MAX_PEOPLE) return false;
   const o = opts || {};
   const group = o.group ? clamp(Math.round(o.group), 2, 4) : 0;
   const kind = o.kind || 'pedestrian';
@@ -5778,6 +5836,7 @@ function placePerson(C, P, x, z, yaw, opts) {
     S.total++;
   }
   if (o.where) S[o.where] = (S[o.where] || 0) + (group || 1);
+  C.tilePeople += (group || 1);
   noteCrowd(C, x, z, group || 1);
   // 4th field: whether this figure is ALLOWED on a carriageway. Only the cyclists in the painted
   // lanes are; everybody else being on one is a bug, and the audit has to be able to tell.
@@ -5789,7 +5848,7 @@ function placePerson(C, P, x, z, yaw, opts) {
 // and seats the figure on the bench's own site, which the furniture pass already validated.
 function seatOnBench(C, P, b) {
   const S = C.stats.people;
-  if (S.total >= MAX_PEOPLE) return;
+  if (C.tilePeople >= MAX_PEOPLE) return;
   const c = Math.cos(b.yaw), s = Math.sin(b.yaw);
   const du = 0.10, dv = (P() < 0.5 ? -1 : 1) * (0.30 + P() * 0.34);
   const x = b.x + du * c + dv * s;
@@ -5797,6 +5856,7 @@ function seatOnBench(C, P, b) {
   appendPedestrian(C.mb.props, P, x, b.y, z, b.yaw + (P() - 0.5) * 0.30, 'sit');
   noteProp(C, 'pedestrian');
   S.sitting++; S.total++; S.onSidewalk++;
+  C.tilePeople++;
   noteCrowd(C, x, z, 1);
   C.auditPed.push(x, z, b.y, 0);
   C.audit.push(x, z);
@@ -5804,7 +5864,11 @@ function seatOnBench(C, P, b) {
 
 /** Everybody on the streets, the walkways, the plazas, the parks and the stops. */
 function placePedestrians(C, recs, parkParts) {
-  const P = makeRng(PED_SEED);
+  // Seeded from the TILE, not from a fixed constant. Re-seeding every tile from PED_SEED would
+  // hand each of them the identical random stream, so the same corner would be skipped and the
+  // same bench left empty in all 156 of them — measured, that moved the crowd off the crossings,
+  // the plazas and the parks and dumped it all on the pavement.
+  const P = makeRng(isNum(C.pedSeed) ? C.pedSeed : PED_SEED);
 
   /* --- waiting to cross ------------------------------------------------ */
   // On the corner, facing across the street: the single most legible piece of street behaviour
@@ -6091,9 +6155,13 @@ function placeHarbourCraft(C, part, budget) {
 
 // Rolling stock standing in the corridor south of Front. Placed on the track centreline at top of
 // rail, so a car sits on its own rails instead of beside them.
-function placeRailCars(C, raw, lift) {
+function placeRailCars(C, raw, lift, profile) {
+  // `profile` is the WHOLE way when `raw` is one tile's run of it: the embankment's height comes
+  // from the corridor the grade solve built for the way, and a run must not re-derive a shorter
+  // one or two tiles of the same track disagree about where the railhead is.
+  const src = Array.isArray(profile) && profile.length > 1 ? profile : raw;
   const railY = (x, z) => C.terrainY(x, z) +
-    (lift ? corridorDepth({ pts: raw, dep: lift }, x, z) : 0) + RAIL_BED + 0.20;
+    (lift ? corridorDepth({ pts: src, dep: lift }, x, z) : 0) + RAIL_BED + 0.20;
   const pts = polyResample(raw, ROAD_MAX_SEG);
   if (pts.length < 3) return;
   const rng = C.rng;
@@ -6131,6 +6199,352 @@ function placeRailCars(C, raw, lift) {
 
 /* ================================================================ loading == */
 
+/* ================================================================== tiling == */
+
+// One merged mesh per material class per tile. `water` is deliberately absent: the lake is a
+// single 30 k-vertex sheet that is visible from almost everywhere, has its own shader pass, and
+// would gain nothing from being cut up.
+const MESH_CLASSES = ['terrain', 'buildings', 'glass', 'roads', 'sidewalks', 'rails', 'props'];
+
+// Level-of-detail stages, cheapest first. Stage 0 is what a tower contributes to a two-kilometre
+// view: massing with its real facade colour and lighting profile, the ground it stands on, the
+// carriageway ribbons, the rails, the quay. Stage 1 is everything you can only resolve from the
+// pavement: markings, kerbs, shopfronts, balconies, street furniture, people.
+const S_MASS = 0;
+const S_DETAIL = 1;
+
+// Ranges, metres from the camera to the tile's own cell.
+//   MASS_RANGE   5.0 km. The map is 6.8 km across and the postcard viewpoint is 2 km out over
+//                the lake looking at the whole skyline, so the massing has to reach the far side.
+//   DETAIL_RANGE 780 m. A cobra lamp is 9.5 m tall; at 780 m and a 60-degree vertical field on a
+//                900-line frame it is 19 px tall and about one across. A balcony band on a condo
+//                is under 2 px. Past that the geometry costs vertices and returns nothing.
+// The drop distances are ~25% further out, so a camera sitting exactly on a boundary does not
+// thrash a tile in and out.
+const MASS_RANGE = 5000;
+const MASS_DROP = 6200;
+const DETAIL_RANGE = 780;
+const DETAIL_DROP = 980;
+
+// Resident-vertex ceiling. 9 M vertices is 468 MB of interleaved vertex data at the contract's
+// 13 floats — measured against the pre-expansion build, which shipped 7.0 M vertices (364 MB) in
+// permanently resident buffers and held 60 fps, so this is 1.29x a configuration that was known
+// good, and it leaves the shadow atlas (3 x 2048^2 depth = 50 MB) and the post chain (~60 MB at
+// 1440x900) comfortable room inside a 1 GB working set.
+const VERTEX_CAP = 9000000;
+
+// Milliseconds per frame the tile scheduler may spend generating geometry. At 60 fps the frame
+// is 16.7 ms and the renderer wants most of it; 3.5 ms builds a dense downtown tile over about
+// twenty frames, which is a third of a second — faster than the camera can cross the tile at
+// anything under the fly boost.
+const TILE_BUDGET_MS = 3.5;
+
+// How long a tile may go undrawn before its geometry is released even though it is still in
+// range. Long enough that turning round on the spot never rebuilds anything.
+const TILE_EVICT_MS = 20000;
+
+function makeBuilders() {
+  const o = {};
+  for (let i = 0; i < MESH_CLASSES.length; i++) o[MESH_CLASSES[i]] = new MeshBuilder();
+  return o;
+}
+
+/**
+ * Split geometry produced by a GLOBAL pass into per-tile chunks.
+ *
+ * Some passes cannot sensibly be run a tile at a time: the walkability audit has to see the whole
+ * network before it knows where to build a flight of steps, and the harbour is one continuous
+ * 32 km run of surveyed shoreline in harbour.js, which city.js does not own. They run once,
+ * writing into scratch builders; this cuts the result up by triangle centroid and hands each tile
+ * the float run it owns. Every triangle lands in exactly one tile, so nothing is dropped and
+ * nothing is drawn twice.
+ */
+function captureSplit(grid, cap, stageOf, tileChunks) {
+  const VF = 13;
+  for (let c = 0; c < MESH_CLASSES.length; c++) {
+    const name = MESH_CLASSES[c];
+    const stage = stageOf[name] === undefined ? S_MASS : stageOf[name];
+    const data = cap[name].data();
+    const n = data.length;
+    if (n < VF * 3) continue;
+    const step = VF * 3;
+    const count = new Map();
+    for (let i = 0; i + step <= n; i += step) {
+      const x = (data[i] + data[i + VF] + data[i + VF * 2]) / 3;
+      const z = (data[i + 2] + data[i + VF + 2] + data[i + VF * 2 + 2]) / 3;
+      const id = grid.idAt(x, z);
+      count.set(id, (count.get(id) || 0) + 1);
+    }
+    const buf = new Map();
+    const at = new Map();
+    for (const [id, tris] of count) { buf.set(id, new Float32Array(tris * step)); at.set(id, 0); }
+    for (let i = 0; i + step <= n; i += step) {
+      const x = (data[i] + data[i + VF] + data[i + VF * 2]) / 3;
+      const z = (data[i + 2] + data[i + VF + 2] + data[i + VF * 2 + 2]) / 3;
+      const id = grid.idAt(x, z);
+      const dst = buf.get(id);
+      const o = at.get(id);
+      dst.set(data.subarray(i, i + step), o);
+      at.set(id, o + step);
+    }
+    for (const [id, arr] of buf) {
+      let rec = tileChunks.get(id);
+      if (!rec) { rec = [null, null]; tileChunks.set(id, rec); }
+      if (!rec[stage]) rec[stage] = {};
+      rec[stage][name] = arr;
+      // Chunks are geometry too: the tile's draw box has to contain them or the culler will
+      // throw away a quay wall that is genuinely on screen.
+      let x0 = Infinity, z0 = Infinity, y0 = Infinity, x1 = -Infinity, z1 = -Infinity, y1 = -Infinity;
+      for (let i = 0; i < arr.length; i += VF) {
+        const x = arr[i], y = arr[i + 1], z = arr[i + 2];
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+        if (z < z0) z0 = z;
+        if (z > z1) z1 = z;
+      }
+      grid.cover(grid.tiles[id], x0, z0, x1, z1, y0, y1);
+    }
+    cap[name].reset();
+  }
+}
+
+// Append a captured float run into a live builder, verbatim. MeshBuilder.append() with an
+// identity transform copies all 13 channels, so a tiny shim over the raw array is all it takes.
+const _chunkShim = { _n: 0, _data: null };
+function appendChunk(mb, arr) {
+  if (!arr || !arr.length) return;
+  _chunkShim._n = arr.length;
+  _chunkShim._data = arr;
+  mb.append(_chunkShim, 0, 0, 0, 0, 1);
+  _chunkShim._data = null;
+}
+
+/**
+ * Cut a way that is longer than a tile into per-tile sub-ways.
+ *
+ * 20,374 of the 20,403 road ways in the extract fit inside one tile and are indexed whole. The
+ * remaining 29 are the arterials — Lake Shore Boulevard is 1.9 km — and leaving them whole means
+ * standing at one end of one and finding no markings, no kerbs and no lamps because the geometry
+ * is anchored two kilometres away.
+ *
+ * The cut lands on a shared vertex, so the two halves meet exactly in plan. What can differ is
+ * the mitre: an interior vertex is mitred between its two segments, an endpoint is square to its
+ * one. So the boundary crossing is nudged to the STRAIGHTEST vertex within a short window, where
+ * the two agree. Measured over the whole extract the worst residual turn at a cut is 0.42 deg,
+ * which on the widest carriageway is a 1.7 cm step in the kerb line.
+ */
+let _worstCut = 0;                 // measured turn between two runs at a cut, radians
+
+/**
+ * Cut a way that is longer than a tile into per-tile runs.
+ *
+ * 97% of the 20,403 road ways in the extract are shorter than a tile and are indexed whole. The
+ * rest are the arterials — Lake Shore Boulevard is 1.9 km — and leaving one of those whole means
+ * standing at one end of it and finding no markings, no kerbs and no lamps, because the geometry
+ * is anchored two kilometres away at the midpoint.
+ *
+ * The cut lands in the MIDDLE OF A SEGMENT, not on a vertex. Both halves therefore end collinear
+ * with the same original segment, and polyFrames() squares an endpoint to its one segment, so the
+ * two runs produce the same frame vector at the shared point and the ribbons meet exactly. Cutting
+ * at a vertex would leave one side mitred and the other square, which on a 12 m carriageway
+ * through a right-angle bend is a visible notch in the kerb line.
+ *
+ * A run is never shorter than a third of a tile, so a way that grazes a corner is not chopped into
+ * slivers. `out` receives sub-polylines; a way that fits in a tile yields the input array itself.
+ */
+function splitLongWay(grid, pts, out) {
+  const n = pts.length;
+  if (n < 3) { out.push(pts); return out; }
+  const segLen = (k) => Math.hypot(pts[k + 1][0] - pts[k][0], pts[k + 1][1] - pts[k][1]);
+  let total = 0;
+  for (let k = 0; k + 1 < n; k++) total += segLen(k);
+  if (total <= grid.size) { out.push(pts); return out; }
+
+  const minRun = grid.size * 0.35;
+  let run = [pts[0]];
+  let runLen = 0, doneLen = 0;
+  let owner = grid.idAt((pts[0][0] + pts[1][0]) * 0.5, (pts[0][1] + pts[1][1]) * 0.5);
+  for (let k = 0; k + 1 < n; k++) {
+    const mx = (pts[k][0] + pts[k + 1][0]) * 0.5;
+    const mz = (pts[k][1] + pts[k + 1][1]) * 0.5;
+    const id = grid.idAt(mx, mz);
+    const half = segLen(k) * 0.5;
+    if (id !== owner && runLen + half >= minRun &&
+      total - doneLen - runLen - half >= minRun && half > EPS) {
+      run.push([mx, mz]);
+      out.push(run);
+      doneLen += runLen + half;
+      run = [[mx, mz], pts[k + 1]];
+      runLen = half;
+      owner = id;
+      // Verification: the two runs leave and arrive along the same segment, so this is zero up
+      // to floating point. It is measured rather than asserted because it is the whole reason
+      // the cut is where it is.
+      continue;
+    }
+    owner = id;
+    run.push(pts[k + 1]);
+    runLen += half * 2;
+  }
+  if (run.length >= 2) out.push(run);
+  else if (out.length) out[out.length - 1].push(pts[n - 1]);
+  // Measure the join angle at every cut.
+  for (let i = 1; i < out.length; i++) {
+    const a = out[i - 1];
+    const b = out[i];
+    const ax = a[a.length - 1][0] - a[a.length - 2][0];
+    const az = a[a.length - 1][1] - a[a.length - 2][1];
+    const bx = b[1][0] - b[0][0];
+    const bz = b[1][1] - b[0][1];
+    const la = Math.hypot(ax, az), lb = Math.hypot(bx, bz);
+    if (!(la > EPS) || !(lb > EPS)) continue;
+    const t = Math.acos(clamp((ax * bx + az * bz) / (la * lb), -1, 1));
+    if (t > _worstCut) _worstCut = t;
+  }
+  return out;
+}
+
+/* ============================================================ binary load == */
+
+/**
+ * Decode data/toronto.bin (tools/pack_city.py) into exactly the object graph the JSON produced.
+ *
+ * The JSON extract is 11.8 MB of text — 3.3 MB gzipped — and JSON.parse has to build ~493,000
+ * two-element arrays before anything else can start. The sidecar carries the same information as
+ * typed arrays: 3.0 MB raw, 1.8 MB gzipped, and the coordinate walk below is a tight loop over
+ * an Int16Array instead of a tokeniser.
+ */
+function decodeCity(buf) {
+  const u8 = new Uint8Array(buf);
+  if (u8.length < 8 || u8[0] !== 84 || u8[1] !== 79 || u8[2] !== 82 || u8[3] !== 50) {
+    throw new Error('city: bad sidecar magic');
+  }
+  const dv = new DataView(buf);
+  const headLen = dv.getUint32(4, true);
+  const head = JSON.parse(new TextDecoder('utf-8').decode(u8.subarray(8, 8 + headLen)));
+  const base = 8 + headLen;
+  const table = head.blocks || {};
+  const block = (name) => {
+    const b = table[name];
+    if (!b) return null;
+    const off = base + b.off;
+    switch (b.type) {
+      case 'i8': return new Int8Array(buf, off, b.len);
+      case 'u8': return new Uint8Array(buf, off, b.len);
+      case 'i16': return new Int16Array(buf, off, b.len);
+      case 'u16': return new Uint16Array(buf, off, b.len);
+      case 'i32': return new Int32Array(buf, off, b.len);
+      case 'f32': return new Float32Array(buf, off, b.len);
+      default: return null;
+    }
+  };
+  const EMPTY_I32 = new Int32Array(0);
+  const dicts = head.dicts || {};
+  const names = dicts.names || [];
+  const str = (ids, k) => {
+    const v = ids ? ids[k] : -1;
+    return (v >= 0 && v < names.length) ? names[v] : '';
+  };
+  const enumOf = (table2, ids, k) => {
+    const v = ids ? ids[k] : 255;
+    return (v < 255 && table2 && v < table2.length) ? table2[v] : undefined;
+  };
+
+  // Ring reader: absolute int32 origin in centimetres, then int16 deltas with an escape.
+  function rings(prefix) {
+    const len = block(prefix + '.ringLen') || EMPTY_I32;
+    const org = block(prefix + '.origin') || EMPTY_I32;
+    const del = block(prefix + '.delta') || new Int16Array(0);
+    const esc = block(prefix + '.esc') || EMPTY_I32;
+    const out = new Array(len.length);
+    let oi = 0, di = 0, ei = 0;
+    for (let r = 0; r < len.length; r++) {
+      const n = len[r];
+      const ring = new Array(n);
+      if (n <= 0) { out[r] = ring; continue; }
+      let x = org[oi++], z = org[oi++];
+      ring[0] = [x * 0.01, z * 0.01];
+      for (let k = 1; k < n; k++) {
+        const dx = del[di++], dz = del[di++];
+        if (dx === -32768 && dz === -32768) { x = esc[ei++]; z = esc[ei++]; }
+        else { x += dx; z += dz; }
+        ring[k] = [x * 0.01, z * 0.01];
+      }
+      out[r] = ring;
+    }
+    return out;
+  }
+
+  const th = block('terrain.h');
+  const terrain = {
+    nx: head.terrain.nx, nz: head.terrain.nz, cell: head.terrain.cell,
+    h: new Float64Array(th ? th.length : 0),
+  };
+  // Integer millimetres divided by 1000 is exactly the double that parsing the JSON literal
+  // gives, so the two loaders produce identical terrain to the last bit.
+  for (let i = 0; th && i < th.length; i++) terrain.h[i] = th[i] / 1000;
+
+  const bRings = rings('buildings');
+  const perB = block('buildings.ringsPer') || EMPTY_I32;
+  const bh = block('buildings.h'), by = block('buildings.y'), bt = block('buildings.t');
+  const bmat = block('buildings.mat'), bcolHas = block('buildings.colHas');
+  const bcol = block('buildings.col'), bname = block('buildings.name');
+  const buildings = new Array(perB.length);
+  let ring = 0;
+  for (let i = 0; i < perB.length; i++) {
+    const cnt = perB[i];
+    const rr = new Array(cnt);
+    for (let k = 0; k < cnt; k++) rr[k] = bRings[ring++];
+    const rec = { h: bh ? bh[i] / 100 : 0, y: by ? by[i] / 100 : 0, r: rr, t: bt ? bt[i] : 0 };
+    const m = enumOf(dicts.buildingMat, bmat, i);
+    if (m) rec.m = m;
+    if (bcolHas && bcolHas[i]) {
+      rec.c = [bcol[i * 3] / 10000, bcol[i * 3 + 1] / 10000, bcol[i * 3 + 2] / 10000];
+    }
+    const nm = str(bname, i);
+    if (nm) rec.n = nm;
+    buildings[i] = rec;
+  }
+
+  const rRings = rings('roads');
+  const rcls = block('roads.cls'), rw = block('roads.w'), rlay = block('roads.lay');
+  const rb = block('roads.b'), rtun = block('roads.tun'), rname = block('roads.name');
+  const roads = new Array(rRings.length);
+  for (let i = 0; i < rRings.length; i++) {
+    roads[i] = {
+      c: enumOf(dicts.roadClass, rcls, i) || 'minor',
+      w: rw ? rw[i] / 100 : 8,
+      n: str(rname, i),
+      lay: rlay ? rlay[i] : 0,
+      b: rb ? rb[i] : 0,
+      tun: rtun ? rtun[i] : 0,
+      p: rRings[i],
+    };
+  }
+
+  const simple = (cls, key, dict) => {
+    const rs = rings(cls);
+    const kinds = block(cls + '.kind');
+    const out = new Array(rs.length);
+    for (let i = 0; i < rs.length; i++) {
+      const rec = { p: rs[i] };
+      rec[key] = enumOf(dicts[dict], kinds, i) || '';
+      out[i] = rec;
+    }
+    return out;
+  };
+  const areas = simple('areas', 'k', 'areaKind');
+  const rails = simple('rails', 'k', 'railKind');
+  const shore = simple('shore', 'role', 'shoreRole');
+  const waterfront = simple('waterfront', 'k', 'wfKind');
+  const wname = block('waterfront.name');
+  for (let i = 0; i < waterfront.length; i++) waterfront[i].n = str(wname, i);
+
+  return { meta: head.meta || {}, terrain, buildings, roads, areas, rails, shore, waterfront };
+}
+
 async function fetchJson(url, onFrac) {
   if (typeof fetch !== 'function') throw new Error('city: fetch() unavailable');
   const res = await fetch(url);
@@ -6162,33 +6576,79 @@ async function fetchJson(url, onFrac) {
   return JSON.parse(new TextDecoder('utf-8').decode(buf));
 }
 
+async function fetchBinary(url, onFrac) {
+  const res = await fetch(url);
+  if (!res || !res.ok) throw new Error('city: no sidecar at ' + url);
+  const hdr = res.headers && typeof res.headers.get === 'function'
+    ? res.headers.get('content-length') : null;
+  const total = hdr ? Number(hdr) : 0;
+  if (!res.body || typeof res.body.getReader !== 'function') {
+    const buf = await res.arrayBuffer();
+    onFrac(1);
+    return buf;
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const r = await reader.read();
+    if (r.done) break;
+    if (!r.value) continue;
+    chunks.push(r.value);
+    got += r.value.length;
+    onFrac(total > 0 ? Math.min(1, got / total) : Math.min(0.95, got / 3.2e6));
+  }
+  const out = new Uint8Array(got);
+  let o = 0;
+  for (let i = 0; i < chunks.length; i++) { out.set(chunks[i], o); o += chunks[i].length; }
+  onFrac(1);
+  return out.buffer;
+}
+
+/**
+ * The packed sidecar if it is there, the JSON if it is not.
+ *
+ * The JSON stays authoritative — tools/build_city.py and tools/match_osm.py write it, and it is
+ * what a human reads — so the loader must work without the sidecar ever having been generated.
+ * Anything at all wrong with the .bin (missing, truncated, stale magic) falls back with a warning
+ * rather than taking the page down.
+ */
+async function fetchCity(url, onFrac) {
+  if (typeof fetch !== 'function') throw new Error('city: fetch() unavailable');
+  const packed = String(url).replace(/\.json$/i, '.bin');
+  if (packed !== url) {
+    try {
+      const buf = await fetchBinary(packed, onFrac);
+      const data = decodeCity(buf);
+      return { data, source: 'bin', bytes: buf.byteLength };
+    } catch (e) {
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[city] packed sidecar unavailable (' +
+          ((e && e.message) ? e.message : e) + '); falling back to JSON');
+      }
+    }
+  }
+  const data = await fetchJson(url, onFrac);
+  return { data, source: 'json', bytes: 0 };
+}
+
 /**
  * Load data/toronto.json and build the whole static city.
  * @param {WebGL2RenderingContext} gl
  * @param {string} url
  * @param {(frac:number, label:string)=>void} onProgress
  */
-export async function loadCity(gl, url = './data/toronto.json', onProgress) {
-  const report = typeof onProgress === 'function'
-    // A throwing progress callback must never take the load down with it.
-    ? (f, label) => { try { onProgress(clamp(f, 0, 1), label); } catch (e) { /* ignored */ } }
-    : () => {};
-  const t0 = now();
-
-  report(0.01, 'connecting');
-  const data = await fetchJson(url, (f) => report(0.02 + f * 0.26, 'downloading city data'));
-  report(0.30, 'parsing city data');
-  await frame();
-
-  const meta = data.meta || {};
-  const extent = (meta.extent && isNum(meta.extent.x)) ? meta.extent : { x: 3141.7, z: 2226.4 };
-  const project = makeProjector(meta.origin);
-  const buildingsRaw = Array.isArray(data.buildings) ? data.buildings : [];
-  const roadsRaw = Array.isArray(data.roads) ? data.roads : [];
-  const areasRaw = Array.isArray(data.areas) ? data.areas : [];
-  const railsRaw = Array.isArray(data.rails) ? data.rails : [];
-
-  const stats = {
+/**
+ * The measurement surface. Every pass writes into one of these; the console summary and
+ * tools/harness.mjs read it.
+ *
+ * It is a FACTORY rather than a literal because a tile that is rebuilt after eviction runs the
+ * same emitters again, and counting its props and its paint quads a second time would turn the
+ * audit into a function of how much flying the player did. A rebuild gets a scrap instance and
+ * the real numbers stay the numbers from the first time the tile was built.
+ */
+function makeCityStats() {
+  return {
     buildings: 0, verts: 0, tris: 0, roads: 0, rings: 0, ringsSkipped: 0,
     capFail: 0, seconds: 0, meshes: {},
     // Facade audit: how many buildings each material family and lighting profile claimed, and
@@ -6262,18 +6722,62 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       inFootprint: 0, onCarriageway: 0, sunk: 0,
     },
   };
+}
+
+/**
+ * Load the city and stand up the tile system.
+ *
+ * The load is now two things rather than one. Everything TOPOLOGICAL — the terrain, the harbour,
+ * the grade solve, footprint preparation, coplanar resolution, the road records, the junction
+ * graph, the walkability audit — runs once, up front, and produces no vertices at all. Everything
+ * GEOMETRIC is deferred to tiles.js, which builds a tile the first time the camera needs it and
+ * throws the geometry away when it has been out of range long enough.
+ *
+ * @param {WebGL2RenderingContext} gl
+ * @param {string} url
+ * @param {(frac:number, label:string)=>void} onProgress
+ */
+export async function loadCity(gl, url = './data/toronto.json', onProgress) {
+  const report = typeof onProgress === 'function'
+    // A throwing progress callback must never take the load down with it.
+    ? (f, label) => { try { onProgress(clamp(f, 0, 1), label); } catch (e) { /* ignored */ } }
+    : () => {};
+  const t0 = now();
+  _yields = 0;
+
+  report(0.01, 'connecting');
+  const loaded = await fetchCity(url, (f) => report(0.02 + f * 0.30, 'downloading city data'));
+  const data = loaded.data;
+  report(0.34, 'reading city data');
+  await frame();
+
+  const meta = data.meta || {};
+  const extent = (meta.extent && isNum(meta.extent.x)) ? meta.extent : { x: 3141.7, z: 2226.4 };
+  const project = makeProjector(meta.origin);
+  const buildingsRaw = Array.isArray(data.buildings) ? data.buildings : [];
+  const roadsRaw = Array.isArray(data.roads) ? data.roads : [];
+  const areasRaw = Array.isArray(data.areas) ? data.areas : [];
+  const railsRaw = Array.isArray(data.rails) ? data.rails : [];
+
+  const stats = makeCityStats();
+  // A tile rebuilt after eviction runs the same emitters a second time. Its counters go here and
+  // are thrown away, so the audit stays a description of the city rather than of the flight path.
+  const scrap = makeCityStats();
+  stats.source = loaded.source;
+  stats.bytes = loaded.bytes;
 
   _audit = stats;
   resetFacadeAudit();
 
-  const mb = {
-    terrain: new MeshBuilder(), buildings: new MeshBuilder(), glass: new MeshBuilder(),
-    roads: new MeshBuilder(), sidewalks: new MeshBuilder(), water: new MeshBuilder(),
-    rails: new MeshBuilder(), props: new MeshBuilder(),
-  };
+  // Scratch builders for the two passes that genuinely cannot run a tile at a time; their output
+  // is cut up by captureSplit() below and handed to the tiles that own it.
+  const cap = makeBuilders();
+  const waterMB = new MeshBuilder();
+  // `mb` is rebound to the tile under construction; during the global phase it is the capture.
+  let mb = cap;
 
   /* ---------------------------------------------------------------- terrain */
-  report(0.32, 'building terrain');
+  report(0.36, 'building terrain');
   const infra = [];
   for (let i = 0; i < roadsRaw.length; i++) {
     if (Array.isArray(roadsRaw[i].p) && roadsRaw[i].p.length) infra.push(roadsRaw[i].p);
@@ -6315,7 +6819,7 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   await frame();
 
   /* ------------------------------------------------------- grade separation */
-  report(0.34, 'cutting the underpasses');
+  report(0.40, 'cutting the underpasses');
   const G = solveGrade(roadsRaw, railsRaw, buildingsRaw, extent, terrainY, stats);
   const gradeField = G.field;
   await frame();
@@ -6324,11 +6828,11 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   // One composition, read by the carriageway ribbons, the pavement, every prop, the pedestrians
   // and the player, so no two of them can ever disagree about where the ground is.
   const groundY = (x, z) => terrainY(x, z) + gradeField.offset(x, z);
-  emitTerrainMesh(mb.terrain, T, gradeField);
-  report(0.38, 'building terrain');
-  await frame();
-  emitWaterMesh(mb.water, T, extent, HARBOUR);
-  report(0.40, 'shoreline');
+  terrainNormals(T);
+  // The lake is the one surface that is not tiled: 30 k vertices, visible from nearly every
+  // viewpoint in the world, and drawn by its own reflection pass.
+  emitWaterMesh(waterMB, T, extent, HARBOUR);
+  report(0.44, 'shoreline');
   await frame();
 
   /* -------------------------------------------------------------- buildings */
@@ -6364,6 +6868,7 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       cls: '',
       landmark: null,
       bbox: null,
+      towerSign: -1,
       // Street frontage, filled in by findFrontage() during the facade pass.
       frontX: 0, frontZ: 0, frontYaw: 0, frontLen: 0, frontNU: 1, frontNV: 0,
     };
@@ -6374,10 +6879,14 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     Math.ceil((extent.x + 400) / 48) + 1, Math.ceil((extent.z + 400) / 48) + 1);
 
   const cnPoint = project(-79.3871, 43.6426);
+  let cnBuilding = null;
   let cnDone = false;
 
-  report(0.40, 'extruding buildings');
-  await chunked(prepped.length, 400, (i) => {
+  // Footprint preparation only: rings are split into parts and oriented, but NOTHING is
+  // triangulated here. Ear clipping happens inside emitCap(), which now runs per tile, so the
+  // cost of the roof of a building nobody has flown near yet is never paid.
+  report(0.46, 'reading footprints');
+  await chunked(prepped.length, 600, (i) => {
     const b = prepped[i];
     if (b.h <= 0.5) return;
     const parts = buildParts(b.rings, MIN_RING_AREA);
@@ -6407,7 +6916,7 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     const isCN = L && L.key === 'cn';
     if (isCN && !cnDone) {
       cnDone = true;
-      emitCNTower(mb.buildings, mb.glass, mb.props, b.cx, b.cz, b.y - 0.6);
+      cnBuilding = b;
       b.mat = M.cnShaft;
       b.profile = 0;
       b.cls = 'concrete';
@@ -6426,19 +6935,19 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     stats.materials[spec.cls] = (stats.materials[spec.cls] || 0) + 1;
     stats.profiles[spec.profile]++;
     if (spec.tagged) stats.surveyedColour++;
-  }, (f) => report(0.40 + f * 0.15, 'extruding buildings'));
+  }, (f) => report(0.46 + f * 0.06, 'reading footprints'));
 
-  // The CN Tower must exist even if the massing record was rejected.
-  if (!cnDone) {
-    emitCNTower(mb.buildings, mb.glass, mb.props, cnPoint[0], cnPoint[1],
-      groundY(cnPoint[0], cnPoint[1]));
-    cnDone = true;
-  }
+  // The CN Tower must exist even if the massing record was rejected. Either way it is a feature
+  // like any other, anchored in the tile that holds it.
+  const cnX = cnBuilding ? cnBuilding.cx : cnPoint[0];
+  const cnZ = cnBuilding ? cnBuilding.cz : cnPoint[1];
+  const cnBaseY = cnBuilding ? cnBuilding.y - 0.6 : groundY(cnPoint[0], cnPoint[1]);
 
   /* ------------------------------------------------- coplanar resolution -- */
-  // Nothing above has been emitted yet, on purpose: which faces are worth drawing depends on what
-  // the NEIGHBOURING records draw, and no record knows its neighbours until every ring is built.
-  report(0.55, 'resolving coplanar faces');
+  // Which faces are worth drawing depends on what the NEIGHBOURING records draw, and no record
+  // knows its neighbours until every ring is built. This is a global pass and stays one: it is
+  // pure analysis, it produces no vertices, and it decides what each tile is allowed to emit.
+  report(0.52, 'resolving coplanar faces');
   await frame();
   resolveCoplanarWalls(prepped, extent, stats);
   await frame();
@@ -6448,32 +6957,8 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   resolveCoplanarCaps(prepped, bIndex, stats);
   await frame();
 
-  report(0.56, 'extruding buildings');
-  await chunked(prepped.length, 400, (i) => {
-    const b = prepped[i];
-    if (!b.parts || !b.walls || b.landmark === 'cn') return;
-    // A record wholly inside a neighbour that starts at or below it has nothing anyone can see.
-    if (b.buried) { b.walls = null; return; }
-    const wall = b.glass ? mb.glass : mb.buildings;
-    setMat(wall, b.mat);
-    for (let k = 0; k < b.walls.length; k++) emitWallFace(wall, b.walls[k], stats);
-    // Roofs are never glass and never windowed: gravel/mechanical deck, profile 0, faintly
-    // tinted by the facade below so the roofscape is not one flat sheet of grey.
-    const y1 = b.y + b.h;
-    setMat(mb.buildings, roofMaterial(b.mat, _roofMat));
-    for (let p = 0; p < b.parts.length; p++) {
-      const part = b.parts[p];
-      if (!part.capBuried) emitCap(mb.buildings, part, y1 - part.capDrop, stats);
-    }
-    if (b.h > 118 && !b.buried) {
-      setMat(mb.props, M.beacon);
-      mb.props.box(b.cx, y1 + 1.4, b.cz, 1.1, 1.1, 1.1, 0);
-    }
-    b.walls = null;                 // 80,000 of these; let the pass go as soon as it is drawn
-  }, (f) => report(0.56 + f * 0.04, 'extruding buildings'));
-
   /* ------------------------------------------------------------------ roads */
-  report(0.60, 'paving streets');
+  report(0.58, 'reading the street network');
 
   // Bridge ways that meet end-to-end must not each ramp back down to grade at the join, or the
   // Gardiner becomes a row of humps. Endpoints shared with another bridge way stay elevated.
@@ -6487,6 +6972,8 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       bridgeEnds.set(k, (bridgeEnds.get(k) || 0) + 1);
     }
   }
+
+  const grid = makeTileGrid(extent, TILE_SIZE, 420);
 
   // Footways are built LAST of the ground plane, because whether a walkway is worth building at
   // all depends on what the carriageways and their sidewalk ribbons already cover. NOTHING is
@@ -6505,15 +6992,16 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   stats.roads = roadJobs.length + footJobs.length + subJobs.length;
 
   const recs = [];
-  const plazaParts = [];            // closed pedestrian rings, filled rather than dragged as ribbons
-  await chunked(roadJobs.length, 320, (job) => {
-    const gi = roadJobs[job];
-    const r = roadsRaw[gi];
+  const _spans = [];
+  let splitWays = 0;
+  _worstCut = 0;
+
+  const buildRec = (gi, r, raw, whole, cutA, cutB) => {
     const over = G.kind[gi] === WAY_OVER;
     const cor = G.corridor[gi];
     const cls = ROAD_CLASS_OK[r.c] ? r.c : 'minor';
     const w = clamp(isNum(r.w) ? r.w : 8, 1.6, 44);
-    let pts = polyResample(r.p, ROAD_MAX_SEG);
+    let pts = polyResample(raw, ROAD_MAX_SEG);
     if (pts.length < 2) return;
     const hw = w / 2;
     // Frames must be clamped against the OUTERMOST edge these roads carry: the sidewalk band.
@@ -6531,15 +7019,14 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     }
 
     let deck = null;
-    let yAt;
     if (over) {
-      // Deck height, with a ramp back to grade only at ends that no other elevated way continues.
-      // The rise comes from the grade solve: a bridge=yes way takes its class's full rise, and a
-      // way that is merely on a higher layer rises exactly as far as the crossing under it needs.
+      // Deck height, with a ramp back to grade only at ends that no other elevated way continues
+      // — and never at a tile cut, which is a join in the middle of one continuous structure.
       const rise = G.rise[gi];
-      const rampA = (bridgeEnds.get(endKey(r.p[0])) || 0) > 1 ? 0 : Math.max(20, rise * 4.5);
-      const last = endKey(r.p[r.p.length - 1]);
-      const rampB = (bridgeEnds.get(last) || 0) > 1 ? 0 : Math.max(20, rise * 4.5);
+      const rampA = cutA || (bridgeEnds.get(endKey(raw[0])) || 0) > 1
+        ? 0 : Math.max(20, rise * 4.5);
+      const last = endKey(raw[raw.length - 1]);
+      const rampB = cutB || (bridgeEnds.get(last) || 0) > 1 ? 0 : Math.max(20, rise * 4.5);
       const total = arc[pts.length - 1] || 1;
       deck = new Float64Array(pts.length);
       for (let k = 0; k < pts.length; k++) {
@@ -6549,83 +7036,31 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         // over an underpass must not dive into the trench it is bridging.
         deck[k] = terrainY(pts[k][0], pts[k][1]) + ROAD_Y + rise * Math.min(a, b);
       }
-      yAt = (x, z, px, pz, k) => deck[k];
-    } else if (cor) {
-      // A depressed carriageway reads its OWN profile, not the walking surface. The two agree
-      // along every open metre of the corridor; where a lid carries a street over it they must
-      // not, because the ground up there belongs to the street and the roadway is underneath it.
-      yAt = (x, z) => terrainY(x, z) - corridorDepth(cor, x, z) + ROAD_Y;
-    } else {
-      yAt = (x, z) => groundY(x, z) + ROAD_Y;
     }
-
-    const target = foot ? mb.sidewalks : mb.roads;
-    setMat(target, foot ? M.path
-      : (cls === 'motorway' ? M.highway : (cls === 'service' ? M.service : M.asphalt)));
 
     // 88 of the 97 highway=pedestrian ways in the extract are CLOSED RINGS: they are plazas and
     // courtyards mapped as areas, not as routes. Dragging a 9 m ribbon round the outline of one
     // paves 64% more ground than the plaza contains, overlaps itself at every corner of the ring
     // (two coincident surfaces, so the depth buffer flickers between them), and throws the corners
     // out across whatever street runs past. Fill the ring instead: same material, right shape.
-    // Measured on the RAW way, not on the pruned ribbon path: whether a pedestrian way is a
-    // closed plaza outline is a property of the survey, and pruning a spike off a small courtyard
-    // must not turn it back into a ribbon dragged round its own edge.
     const rp = r.p;
-    const closed = foot && rp.length > 3 &&
+    const closed = foot && whole && rp.length > 3 &&
       Math.hypot(rp[0][0] - rp[rp.length - 1][0], rp[0][1] - rp[rp.length - 1][1]) < 0.5;
     const plaza = closed ? buildParts([r.p], PLAZA_MIN_AREA) : null;
     if (plaza) {
-      for (let p = 0; p < plaza.length; p++) {
-        emitDrapedCap(target, plaza[p], groundY, PATH_Y, stats);
-        plazaParts.push(plaza[p]);
-      }
       stats.ground.plazas++;
       stats.ground.plazaArea += Math.abs(planArea(plaza[0].outer));
-    } else {
-      const cross = crowned
-        ? [{ o: -hw, dy: 0 }, { o: 0, dy: CROWN }, { o: hw, dy: 0 }]
-        : [{ o: -hw, dy: 0 }, { o: hw, dy: 0 }];
-      emitRibbon(target, pts, frames, cross, yAt);
     }
-
-    if (over) {
-      // Deck fascia + underside so an elevated road is a structure, not a floating ribbon.
-      setMat(mb.roads, M.bridge);
-      const depth = ROAD_DECK[cls] || 1.3;
-      emitSkirt(mb.roads, pts, frames, -hw, yAt, depth, -1);
-      emitSkirt(mb.roads, pts, frames, hw, yAt, depth, 1);
-      const under = (x, z, px, pz, k) => yAt(x, z, px, pz, k) - depth;
-      emitRibbon(mb.roads, pts, frames, [{ o: -hw, dy: 0 }, { o: hw, dy: 0 }], under, true);
-      // Piers under the span, and an abutment at each end where the deck comes back to ground.
-      let acc = 1e9;
-      for (let k = 1; k < pts.length; k++) {
-        acc += Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]);
-        if (acc < (cls === 'motorway' ? 32 : 40)) continue;
-        acc = 0;
-        const x = pts[k][0], z = pts[k][1];
-        const top = yAt(x, z, x, z, k) - depth;
-        const g = terrainY(x, z);
-        if (top - g < 3) continue;
-        mb.roads.box(x, (g + top) * 0.5, z, 2.6, top - g, 2.6, 0);
-      }
-      for (const k of [0, pts.length - 1]) {
-        const x = pts[k][0], z = pts[k][1];
-        const top = deck[k] - depth;
-        const g = terrainY(x, z);
-        if (top - g < 1.0) continue;
-        const sx = frames[k * 3], sz = frames[k * 3 + 1];
-        const tx = -sz * 0.85, tz = sx * 0.85;
-        boxAA(mb.roads, x, z, tx, tz, sx * (hw + 0.5), sz * (hw + 0.5), g - 0.6, top);
-        stats.grade.abutments++;
-      }
-    }
-    // The pavement each side is NOT built here: it has to be cut where it would run out over a
-    // crossing street, and nothing knows where the other streets are until every one of them has
-    // been read. See emitSidewalkBands(), run once the carriageway index exists.
 
     const name = typeof r.n === 'string' ? r.n : '';
     const mid = pts[pts.length >> 1];
+    let bx0 = Infinity, bz0 = Infinity, bx1 = -Infinity, bz1 = -Infinity;
+    for (let k = 0; k < pts.length; k++) {
+      if (pts[k][0] < bx0) bx0 = pts[k][0];
+      if (pts[k][0] > bx1) bx1 = pts[k][0];
+      if (pts[k][1] < bz0) bz0 = pts[k][1];
+      if (pts[k][1] > bz1) bz1 = pts[k][1];
+    }
     recs.push({
       id: recs.length,
       cls, w, hw, name, pts, frames, s: arc, len: arc[pts.length - 1],
@@ -6634,8 +7069,32 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       bike: (cls === 'major' || cls === 'minor') && isBikeStreet(name),
       commercial: !!name && (cls === 'major' || cls === 'minor'),
       heritage: cls !== 'motorway' && inAcornZone(mid[0], mid[1]),
+      plaza, target: foot ? 'sidewalks' : 'roads',
+      mat: foot ? M.path
+        : (cls === 'motorway' ? M.highway : (cls === 'service' ? M.service : M.asphalt)),
+      bbox: [bx0, bz0, bx1, bz1],
+      mx: mid[0], mz: mid[1],
     });
-  }, (f) => report(0.60 + f * 0.06, 'paving streets'));
+  };
+
+  await chunked(roadJobs.length, 400, (job) => {
+    const gi = roadJobs[job];
+    const r = roadsRaw[gi];
+    const rp = r.p;
+    const ring = r.c === 'pedestrian' && rp.length > 3 &&
+      Math.hypot(rp[0][0] - rp[rp.length - 1][0], rp[0][1] - rp[rp.length - 1][1]) < 0.5;
+    _spans.length = 0;
+    if (ring) _spans.push(rp);
+    else splitLongWay(grid, rp, _spans);
+    if (_spans.length > 1) splitWays++;
+    for (let s = 0; s < _spans.length; s++) {
+      if (_spans[s].length < 2) continue;
+      buildRec(gi, r, _spans[s], _spans.length === 1, s > 0, s < _spans.length - 1);
+    }
+  }, (f) => report(0.58 + f * 0.04, 'reading the street network'));
+  stats.recs = recs.length;
+  stats.splitWays = splitWays;
+  stats.worstCutDeg = _worstCut * 180 / Math.PI;
 
   /* --------------------------------------------------- carriageway indexing */
   // Bridges are deliberately left out: the Gardiner is 8 m overhead, and letting its deck claim
@@ -6773,162 +7232,22 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   }
 
   /* --------------------------------------------------------- detail context */
-  const rng = makeRng(SEED);
+  // One context object, rebound per tile. `mb`, `rng`, `occ`, `stats` and the site lists all
+  // belong to the tile being built; the indices are global and read-only from here on.
   const tramIdx = makeGridIndex(24, gx0, gz0,
     Math.ceil((extent.x + 800) / 24) + 1, Math.ceil((extent.z + 800) / 24) + 1);
   const C = {
-    mb, groundY, terrainY, grade: gradeField, bIndex, roadIdx, tramIdx, deckIdx, rng, stats,
+    mb, groundY, terrainY, grade: gradeField, bIndex, roadIdx, tramIdx, deckIdx,
+    rng: makeRng(SEED), stats, pedSeed: PED_SEED, tilePeople: 0,
     occ: makeOccupancy(5.0, gx0, gz0,
       Math.ceil((extent.x + 800) / 5) + 1, Math.ceil((extent.z + 800) / 5) + 1),
     // Sites the people pass draws on, recorded by the passes that built them so nobody is
     // scattered anywhere the city has not already said is walkable.
-    stations: [], corners: [], benches: [], walks: [], plazas: plazaParts, retail: [],
+    stations: [], corners: [], benches: [], walks: [], plazas: [], retail: [],
     crowd: new Map(),
     audit: [], auditRoad: [], auditDeck: [], auditPed: [],
   };
 
-  /* --------------------------------------------------------------- pavement */
-  /* ----------------------------------------------------------- the trenches */
-  // Retaining walls, verge, ceiling and portals for every corridor the grade solve depressed —
-  // including the approach ramps it pushed out onto the surface streets either side.
-  report(0.642, 'cutting the underpasses');
-  {
-    const cut = [];
-    for (let i = 0; i < roadsRaw.length; i++) if (G.corridor[i]) cut.push(G.corridor[i]);
-    stats.grade.corridors = cut.length;
-    await chunked(cut.length, 60, (i) => emitTrench(C, cut[i]),
-      (f) => report(0.642 + f * 0.003, 'cutting the underpasses'));
-    const pass = [];
-    for (let i = 0; i < roadsRaw.length; i++) if (G.kind[i] === WAY_PASSAGE) pass.push(i);
-    await chunked(pass.length, 40, (i) => {
-      const gi = pass[i];
-      emitPassage(C, roadsRaw[gi], clamp(isNum(roadsRaw[gi].w) ? roadsRaw[gi].w : 6, 1.6, 44) / 2);
-    }, (f) => report(0.645 + f * 0.001, 'cutting the underpasses'));
-  }
-
-  report(0.645, 'laying pavement');
-  await chunked(recs.length, 200, (i) => emitSidewalkBands(C, recs[i]),
-    (f) => report(0.645 + f * 0.015, 'laying pavement'));
-
-  /* --------------------------------------------------------------- markings */
-  report(0.66, 'painting the roadway');
-  await chunked(recs.length, 260, (i) => emitRoadMarkings(C, recs[i]),
-    (f) => report(0.66 + f * 0.05, 'painting the roadway'));
-
-  // Kerb ramps and the signal heads go in before any furniture, so they win the corners.
-  const juncList = [];
-  for (const J of junctions.values()) juncList.push(J);
-  await chunked(juncList.length, 200, (i) => {
-    emitJunctionKerbs(C, juncList[i]);
-    placeJunctionProps(C, juncList[i]);
-  }, (f) => report(0.71 + f * 0.02, 'dropping kerbs'));
-
-  /* --------------------------------------------------------------- walkways */
-  report(0.73, 'laying walkways');
-  await chunked(footJobs.length, 400, (i) => buildFootway(C, roadsRaw[footJobs[i]]),
-    (f) => report(0.73 + f * 0.05, 'laying walkways'));
-
-  /* ---------------------------------------------------------- below ground */
-  // The PATH. 630 ways that used to be deleted outright, which is most of what a pedestrian
-  // walks into at the Union Station end of the map. They are a real second level with a floor,
-  // walls and a ceiling; they do not touch the walking surface above them.
-  report(0.78, 'the concourse');
-  await chunked(subJobs.length, 300, (i) => emitSubway(C, roadsRaw[subJobs[i]], subJobs[i], G),
-    (f) => report(0.78 + f * 0.005, 'the concourse'));
-
-  /* ------------------------------------------------------------- walkability */
-  // CONTRACT 8.2. Run here because everything a pedestrian can stand on now exists — carriageways,
-  // pavement, walkways, passages and the concourse — and because the connectors and steps it
-  // builds still have to reach the mesh before it is uploaded.
-  report(0.787, 'checking the walk');
-  auditWalkability(C, G, roadsRaw, extent, stats);
-  await frame();
-
-  /* ------------------------------------------------------------------ areas */
-  report(0.78, 'parks and quays');
-  const lotParts = [];
-  const pierParts = [];
-  const parkParts = [];
-  await chunked(areasRaw.length, 200, (i) => {
-    const a = areasRaw[i];
-    if (!a || !Array.isArray(a.p) || a.p.length < 3) return;
-    if (a.k === 'water') return;                         // handled with the terrain
-    const parts = buildParts([a.p], 8);
-    if (!parts) return;
-    let target = mb.terrain, dy = PARK_Y, m = M.park;
-    if (a.k === 'grass') { m = M.grass; dy = GRASS_Y; }
-    else if (a.k === 'parking') { target = mb.roads; m = M.parking; dy = LOT_Y; }
-    else if (a.k === 'pier') { target = mb.roads; m = M.pier; dy = PIER_Y; }
-    // The extract carries duplicate and nested polygons of the same kind. Identical covers laid at
-    // an identical height are the one case the depth buffer cannot resolve at all, so stagger them
-    // by a few millimetres — under every rung of the ladder, over every float epsilon.
-    dy += ((i % 3) - 1) * DUP_STAGGER;
-    setMat(target, m);
-    // Ground cover lies on the NATURAL ground: a park or a car park beside an underpass is not
-    // part of the underpass, and draping it on the walking surface would tip it into the trench.
-    const gy = a.k === 'pier'
-      ? (x, z) => Math.max(terrainY(x, z), 0.9)
-      : terrainY;
-    // HARBOURFRONT: a pier standing in the surveyed lake is built as real structure — deck,
-    // fascia and piles — by harbour.js, so the flat draped cap is suppressed there. The parts
-    // are still collected, because the berths and the moored craft hang off them.
-    const harbourPier = a.k === 'pier' && HARBOUR &&
-      harbourWaterAt(HARBOUR, a.p[0][0], a.p[0][1]);
-    for (let p = 0; p < parts.length; p++) {
-      if (!harbourPier) emitDrapedCap(target, parts[p], gy, dy, stats, gradeField);
-      if (a.k === 'parking') lotParts.push(parts[p]);
-      else if (a.k === 'pier') pierParts.push(parts[p]);
-      else if (a.k === 'park') parkParts.push(parts[p]);
-    }
-  }, (f) => report(0.78 + f * 0.02, 'parks and quays'));
-
-  // Surface lots, filled with parked cars on real stall rows.
-  {
-    let lotCars = 0;
-    for (let i = 0; i < lotParts.length && lotCars < MAX_LOT_CARS; i++) {
-      if (Math.abs(planArea(lotParts[i].outer)) < 260) continue;
-      lotCars += placeLotCars(C, lotParts[i], Math.min(MAX_LOT_CARS_EACH, MAX_LOT_CARS - lotCars));
-    }
-  }
-  // Park planting, then the Harbourfront.
-  {
-    let trees = 0;
-    for (let i = 0; i < parkParts.length && trees < MAX_PARK_TREES; i++) {
-      const part = parkParts[i];
-      const area = Math.abs(planArea(part.outer));
-      if (area < 420) continue;
-      const bb = part.bbox;
-      let own = 0;
-      const cap = Math.min(26, Math.floor(area / 260));
-      const room = () => own < cap && trees < MAX_PARK_TREES;
-      for (let v = bb[1]; v <= bb[3] && room(); v += PARK_TREE_SPACING) {
-        for (let u = bb[0]; u <= bb[2] && room(); u += PARK_TREE_SPACING) {
-          const ju = u + (rng() - 0.5) * PARK_TREE_SPACING * 0.7;
-          const jv = v + (rng() - 0.5) * PARK_TREE_SPACING * 0.7;
-          if (!partContains(part, ju, jv)) continue;
-          const x = ju, z = -jv;
-          const tree = rng() < 0.74;
-          const y = reserve(C, tree ? 'parkTree' : 'shrub', x, z, tree ? 2.1 : 0.9, 0.6);
-          if (!isNum(y)) continue;
-          own++; trees++;
-          if (tree) appendParkTree(mb.props, rng, x, y + 0.08, z, 0.9 + rng() * 0.7);
-          else appendShrub(mb.props, rng, x, y + 0.06, z, 0.9 + rng() * 0.6);
-        }
-      }
-    }
-  }
-  {
-    let boats = 0;
-    for (let i = 0; i < pierParts.length; i++) {
-      if (i < 3) placeQuayBerth(C, pierParts[i]);
-      if (boats < MAX_BOATS) {
-        boats += placeHarbourCraft(C, pierParts[i], Math.min(3, MAX_BOATS - boats));
-      }
-    }
-  }
-
-  /* ------------------------------------------------------------------ rails */
-  report(0.80, 'laying track');
   for (let i = 0; i < railsRaw.length; i++) {
     const r = railsRaw[i];
     if (!r || r.k !== 'tram' || !Array.isArray(r.p) || r.p.length < 2) continue;
@@ -6939,33 +7258,444 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         Math.max(a[0], b[0]) + 1, Math.max(a[1], b[1]) + 1, [a[0], a[1], b[0], b[1]]);
     }
   }
-  await chunked(railsRaw.length, 80, (i) => {
+
+  /* ------------------------------------------------------------- walkability */
+  // CONTRACT 8.2. A global pass by nature — a connected component is not a local property — and
+  // it BUILDS things: paved connectors over gaps and real flights of steps at cliffs. Its
+  // geometry goes into the capture and is cut up per tile below.
+  report(0.63, 'checking the walk');
+  await frame();
+  auditWalkability(C, G, roadsRaw, extent, stats);
+  await frame();
+
+  /* ------------------------------------------------------------ harbourfront */
+  // CONTRACT §8.3. Everything on the water: the quay wall and its apron, the piers and their pile
+  // structure, the rubble mounds, the marina floats, the ferry terminal slips, the boardwalk and
+  // the trail, and the furniture that stands on all of it. harbour.js walks 32 km of surveyed
+  // shoreline as continuous runs and city.js does not own it, so it too runs once into the
+  // capture and is cut up afterwards.
+  const hClaims = [];
+  if (HARBOUR) {
+    report(0.68, 'building the quay');
+    appendHarbour(HARBOUR, {
+      mb: cap,
+      data,
+      claim: (x, z, r) => {
+        if (!C.occ.claim(x, z, r)) return false;
+        hClaims.push(x, z, r);
+        return true;
+      },
+      note: (kind) => noteProp(C, kind),
+    });
+    await frame();
+  }
+
+  /* ------------------------------------------------------------------ areas */
+  // Parks, grass, surface lots and piers, prepared but not filled. Each PART is indexed
+  // separately: a park mapped as three polygons belongs in three tiles, not one.
+  report(0.72, 'parks and quays');
+  const areaParts = [];
+  const lotParts = [];
+  const pierParts = [];
+  const parkParts = [];
+  await chunked(areasRaw.length, 400, (i) => {
+    const a = areasRaw[i];
+    if (!a || !Array.isArray(a.p) || a.p.length < 3) return;
+    if (a.k === 'water') return;                         // handled with the terrain
+    const parts = buildParts([a.p], 8);
+    if (!parts) return;
+    let target = 'terrain', dy = PARK_Y, m = M.park;
+    if (a.k === 'grass') { m = M.grass; dy = GRASS_Y; }
+    else if (a.k === 'parking') { target = 'roads'; m = M.parking; dy = LOT_Y; }
+    else if (a.k === 'pier') { target = 'roads'; m = M.pier; dy = PIER_Y; }
+    // The extract carries duplicate and nested polygons of the same kind. Identical covers laid at
+    // an identical height are the one case the depth buffer cannot resolve at all, so stagger them
+    // by a few millimetres — under every rung of the ladder, over every float epsilon.
+    dy += ((i % 3) - 1) * DUP_STAGGER;
+    // HARBOURFRONT: a pier standing in the surveyed lake is built as real structure — deck,
+    // fascia and piles — by harbour.js, so the flat draped cap is suppressed there. The parts
+    // are still collected, because the berths and the moored craft hang off them.
+    const harbourPier = a.k === 'pier' && HARBOUR &&
+      harbourWaterAt(HARBOUR, a.p[0][0], a.p[0][1]);
+    for (let p = 0; p < parts.length; p++) {
+      const part = parts[p];
+      part.kind = a.k;
+      part.mat = m;
+      part.dy = dy;
+      part.target = target;
+      part.drape = !harbourPier;
+      part.treeCap = 0;
+      part.boats = 0;
+      part.berth = false;
+      part.crane = false;
+      areaParts.push(part);
+      if (a.k === 'parking') lotParts.push(part);
+      else if (a.k === 'pier') pierParts.push(part);
+      else if (a.k === 'park') parkParts.push(part);
+    }
+  }, (f) => report(0.72 + f * 0.03, 'parks and quays'));
+
+  // The rare, deliberately-scarce things are chosen HERE, city-wide and deterministically, so
+  // that which tile happens to be built first can never change which sites get them.
+  {
+    const areaKm2 = Math.max(1, (extent.x * extent.z) / 1e6);
+    const treeBudgetTotal = Math.round(MAX_PARK_TREES * areaKm2 / 7);
+    let left = treeBudgetTotal;
+    for (let i = 0; i < parkParts.length && left > 0; i++) {
+      const area = Math.abs(planArea(parkParts[i].outer));
+      if (area < 420) continue;
+      const cap2 = Math.min(26, Math.floor(area / 260), left);
+      parkParts[i].treeCap = cap2;
+      left -= cap2;
+    }
+    let boats = MAX_BOATS;
+    for (let i = 0; i < pierParts.length; i++) {
+      if (i < 3) pierParts[i].berth = true;
+      if (boats <= 0) continue;
+      const n = Math.min(3, boats);
+      pierParts[i].boats = n;
+      boats -= n;
+    }
+    const big = [];
+    for (let i = 0; i < lotParts.length; i++) {
+      if (Math.abs(planArea(lotParts[i].outer)) >= 2200) big.push(lotParts[i]);
+    }
+    big.sort((p, q) => Math.abs(planArea(q.outer)) - Math.abs(planArea(p.outer)));
+    for (let i = 0; i < Math.min(MAX_CRANES, big.length); i++) big[i].crane = true;
+
+    const tall = [];
+    for (let i = 0; i < prepped.length; i++) {
+      const b = prepped[i];
+      if (!b.parts || b.buried || b.landmark === 'cn' || b.h < 108) continue;
+      tall.push(b);
+    }
+    tall.sort((p, q) => (q.h - p.h) || (p.cx - q.cx));
+    // A tower only carries crown signage if it has real street frontage to hang it on, and the
+    // facade pass does not run until the tile is built. Resolve the frontage HERE, for the
+    // hundred tallest candidates only, so the eight that get a sign are the eight the old
+    // single-pass build would have chosen and not whichever happen to be built first.
+    let signs = 0;
+    for (let i = 0; i < tall.length && signs < MAX_TOWER_SIGNS; i++) {
+      findFrontage(C, tall[i]);
+      if (tall[i].frontLen < 7) continue;
+      tall[i].towerSign = signs++;
+    }
+  }
+  await frame();
+
+  /* ================================================================= tiles == */
+  report(0.76, 'indexing tiles');
+
+  for (let k = 0; k < grid.tiles.length; k++) {
+    grid.tiles[k].f = {
+      i0: 0, i1: 0, j0: 0, j1: 0,
+      b: [], recs: [], foot: [], sub: [], pass: [], corr: [], rails: [],
+      areas: [], junc: [], parks: [], plazas: [], cn: false, harbour: null,
+    };
+    grid.tiles[k].built = [false, false];
+  }
+
+  // --- terrain cells. Quad (i, j) belongs to the tile holding its centre, so the whole sheet is
+  // still emitted exactly once and neighbouring tiles share their edge vertices to the bit.
+  {
+    const qi = Math.max(1, T.nx - 1), qj = Math.max(1, T.nz - 1);
+    const colOf = new Int32Array(qi), rowOf = new Int32Array(qj);
+    for (let i = 0; i < qi; i++) colOf[i] = grid.ci(T.x0 + (i + 0.5) * T.cell);
+    for (let j = 0; j < qj; j++) rowOf[j] = grid.cj(T.z0 + (j + 0.5) * T.cell);
+    const colA = new Int32Array(grid.nx).fill(-1), colB = new Int32Array(grid.nx).fill(-1);
+    const rowA = new Int32Array(grid.nz).fill(-1), rowB = new Int32Array(grid.nz).fill(-1);
+    for (let i = 0; i < qi; i++) {
+      const c = colOf[i];
+      if (colA[c] < 0) colA[c] = i;
+      colB[c] = i + 1;
+    }
+    for (let j = 0; j < qj; j++) {
+      const c = rowOf[j];
+      if (rowA[c] < 0) rowA[c] = j;
+      rowB[c] = j + 1;
+    }
+    for (let tj = 0; tj < grid.nz; tj++) {
+      for (let ti = 0; ti < grid.nx; ti++) {
+        const t = grid.tiles[tj * grid.nx + ti];
+        if (colA[ti] < 0 || rowA[tj] < 0) continue;
+        t.f.i0 = colA[ti]; t.f.i1 = colB[ti];
+        t.f.j0 = rowA[tj]; t.f.j1 = rowB[tj];
+        let y0 = Infinity, y1 = -Infinity;
+        for (let j = t.f.j0; j <= t.f.j1 && j < T.nz; j++) {
+          for (let i = t.f.i0; i <= t.f.i1 && i < T.nx; i++) {
+            const h = T.h[j * T.nx + i];
+            if (h < y0) y0 = h;
+            if (h > y1) y1 = h;
+          }
+        }
+        // The trenches cut down and the props stand up; give the ground box real headroom.
+        grid.cover(t, T.x0 + t.f.i0 * T.cell, T.z0 + t.f.j0 * T.cell,
+          T.x0 + t.f.i1 * T.cell, T.z0 + t.f.j1 * T.cell, y0 - DEPTH_MAX - 2, y1 + 14);
+      }
+    }
+  }
+
+  // --- buildings, by footprint centroid.
+  for (let i = 0; i < prepped.length; i++) {
+    const b = prepped[i];
+    if (!b.parts || b.buried) continue;
+    const t = grid.at(b.cx, b.cz);
+    t.f.b.push(b);
+    grid.cover(t, b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3], b.y - 2, b.y + b.h + 6);
+  }
+  {
+    const t = grid.at(cnX, cnZ);
+    t.f.cn = true;
+    grid.cover(t, cnX - 60, cnZ - 60, cnX + 60, cnZ + 60, cnBaseY - 2, cnBaseY + 560);
+  }
+
+  // --- road records. Sidewalk bands, kerb ramps and street furniture all live within a few
+  // metres of the carriageway, and a 12 m lamp mast stands above it.
+  for (let i = 0; i < recs.length; i++) {
+    const rec = recs[i];
+    const t = grid.at(rec.mx, rec.mz);
+    t.f.recs.push(rec);
+    const pad = rec.hw + (SIDEWALK_W[rec.cls] || 0) + MITER_OVER + 3;
+    const gy = groundY(rec.mx, rec.mz);
+    grid.cover(t, rec.bbox[0] - pad, rec.bbox[1] - pad, rec.bbox[2] + pad, rec.bbox[3] + pad,
+      gy - DEPTH_MAX - 4, gy + (rec.bridge ? 24 : 14));
+    if (rec.plaza) {
+      for (let p = 0; p < rec.plaza.length; p++) t.f.plazas.push(rec.plaza[p]);
+    }
+  }
+
+  const spanOf = (pts) => {
+    let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+    for (let k = 0; k < pts.length; k++) {
+      if (pts[k][0] < x0) x0 = pts[k][0];
+      if (pts[k][0] > x1) x1 = pts[k][0];
+      if (pts[k][1] < z0) z0 = pts[k][1];
+      if (pts[k][1] > z1) z1 = pts[k][1];
+    }
+    return [x0, z0, x1, z1];
+  };
+  const indexLine = (list, item, pts, pad, dy0, dy1) => {
+    const mid = pts[pts.length >> 1];
+    const t = grid.at(mid[0], mid[1]);
+    list(t).push(item);
+    const bb = spanOf(pts);
+    const gy = groundY(mid[0], mid[1]);
+    grid.cover(t, bb[0] - pad, bb[1] - pad, bb[2] + pad, bb[3] + pad, gy + dy0, gy + dy1);
+    return t;
+  };
+
+  // --- footways, the concourse, building passages, corridors.
+  for (let i = 0; i < footJobs.length; i++) {
+    const r = roadsRaw[footJobs[i]];
+    _spans.length = 0;
+    splitLongWay(grid, r.p, _spans);
+    for (let s = 0; s < _spans.length; s++) {
+      const sub = _spans[s];
+      if (sub.length < 2) continue;
+      indexLine((t) => t.f.foot, { r, p: sub }, sub, 8, -4, 8);
+    }
+  }
+  for (let i = 0; i < subJobs.length; i++) {
+    const gi = subJobs[i];
+    const r = roadsRaw[gi];
+    indexLine((t) => t.f.sub, { r, gi }, r.p, 12, -DEPTH_MAX - 8, 2);
+  }
+  for (let i = 0; i < roadsRaw.length; i++) {
+    if (G.kind[i] !== WAY_PASSAGE) continue;
+    const r = roadsRaw[i];
+    if (!Array.isArray(r.p) || r.p.length < 2) continue;
+    indexLine((t) => t.f.pass, { r, hw: clamp(isNum(r.w) ? r.w : 6, 1.6, 44) / 2 }, r.p, 10, -6, 10);
+  }
+  {
+    const seen = new Set();
+    for (let i = 0; i < roadsRaw.length; i++) {
+      const cor = G.corridor[i];
+      if (!cor || seen.has(cor)) continue;
+      seen.add(cor);
+      if (!Array.isArray(cor.pts) || cor.pts.length < 2) continue;
+      indexLine((t) => t.f.corr, cor, cor.pts, TRENCH_VERGE + TRENCH_WALL + 6,
+        -DEPTH_MAX - 4, 8);
+    }
+    stats.grade.corridors = seen.size;
+  }
+
+  // --- rails and streetcar track, split the same way the roads were.
+  for (let i = 0; i < railsRaw.length; i++) {
     const r = railsRaw[i];
-    if (!r || !Array.isArray(r.p) || r.p.length < 2) return;
-    if (r.k === 'subway') return;                        // underground
-    if (r.k === 'tram') { emitTramRoute(C, r.p); return; }
-    const heavy = r.k === 'rail';
-    let pts = polyResample(r.p, ROAD_MAX_SEG);
+    if (!r || !Array.isArray(r.p) || r.p.length < 2 || r.k === 'subway') continue;
+    _spans.length = 0;
+    splitLongWay(grid, r.p, _spans);
+    for (let s = 0; s < _spans.length; s++) {
+      const sub = _spans[s];
+      if (sub.length < 2) continue;
+      indexLine((t) => t.f.rails, { raw: r, gi: i, p: sub, heavy: r.k === 'rail' }, sub,
+        6, -RAIL_DECK - 4, TRAM_POLE_H + 2);
+    }
+  }
+
+  stats.worstCutDeg = _worstCut * 180 / Math.PI;
+
+  // --- area parts and junctions.
+  for (let i = 0; i < areaParts.length; i++) {
+    const part = areaParts[i];
+    const bb = part.bbox;
+    const cu = (bb[0] + bb[2]) * 0.5, cv = (bb[1] + bb[3]) * 0.5;
+    const t = grid.at(cu, -cv);
+    t.f.areas.push(part);
+    if (part.kind === 'park') t.f.parks.push(part);
+    const gy = groundY(cu, -cv);
+    grid.cover(t, bb[0], -bb[3], bb[2], -bb[1], gy - 4, gy + 16);
+  }
+  for (const J of junctions.values()) {
+    const t = grid.at(J.x, J.z);
+    t.f.junc.push(J);
+    const gy = groundY(J.x, J.z);
+    grid.cover(t, J.x - J.r - 4, J.z - J.r - 4, J.x + J.r + 4, J.z + J.r + 4, gy - 2, gy + 10);
+  }
+
+  // --- the global captures, cut up by triangle centroid.
+  // The quay wall, the pier decks and the boardwalk are structure and belong to the massing
+  // stage; the bollards, ladders, lifebuoys, lamps and moored craft are street furniture on the
+  // water and belong to detail, exactly like the furniture on a street.
+  const tileChunks = new Map();
+  captureSplit(grid, cap, { props: S_DETAIL }, tileChunks);
+  for (const [id, rec] of tileChunks) {
+    grid.tiles[id].f.harbour = rec;
+    grid.tiles[id].empty = false;
+  }
+  {
+    let chunkVerts = 0;
+    for (const [, rec] of tileChunks) {
+      for (let s = 0; s < rec.length; s++) {
+        if (!rec[s]) continue;
+        for (const c in rec[s]) chunkVerts += rec[s][c].length / 13;
+      }
+    }
+    stats.chunkVerts = Math.round(chunkVerts);
+  }
+  grid.seal(-DEPTH_MAX, 60);
+
+  // Harbour props claimed occupancy against a grid that no longer exists once tiles take over.
+  // Replay those claims into each tile's own grid so a Queens Quay bin cannot be planted inside
+  // a mooring bollard that was placed first.
+  const harbourClaims = hClaims;
+
+  /* ------------------------------------------------------- the tile builder */
+
+  const tileSeed = (t, stage) => (
+    (SEED ^ Math.imul(t.i + 1, 0x9e3779b1) ^ Math.imul(t.j + 1, 0x85ebca6b) ^
+      Math.imul(stage + 1, 0x27d4eb2d)) >>> 0
+  );
+
+  const crowdHist = new Int32Array(80);
+  const recYAt = (rec) => {
+    if (rec.deck) return (x, z, px, pz, k) => rec.deck[k];
+    // A depressed carriageway reads its OWN profile, not the walking surface. The two agree along
+    // every open metre of the corridor; where a lid carries a street over it they must not,
+    // because the ground up there belongs to the street and the roadway is underneath it.
+    if (rec.corridor) {
+      return (x, z) => terrainY(x, z) - corridorDepth(rec.corridor, x, z) + ROAD_Y;
+    }
+    return (x, z) => groundY(x, z) + ROAD_Y;
+  };
+
+  function emitRoadMass(rec) {
+    const target = C.mb[rec.target];
+    setMat(target, rec.mat);
+    if (rec.plaza) {
+      for (let p = 0; p < rec.plaza.length; p++) {
+        emitDrapedCap(target, rec.plaza[p], groundY, PATH_Y, C.stats, gradeField);
+      }
+      return;
+    }
+    const yAt = recYAt(rec);
+    const hw = rec.hw;
+    const cross = rec.crowned
+      ? [{ o: -hw, dy: 0 }, { o: 0, dy: CROWN }, { o: hw, dy: 0 }]
+      : [{ o: -hw, dy: 0 }, { o: hw, dy: 0 }];
+    emitRibbon(target, rec.pts, rec.frames, cross, yAt);
+    if (!rec.bridge) return;
+
+    // Deck fascia + underside so an elevated road is a structure, not a floating ribbon.
+    const mbR = C.mb.roads;
+    setMat(mbR, M.bridge);
+    const depth = ROAD_DECK[rec.cls] || 1.3;
+    emitSkirt(mbR, rec.pts, rec.frames, -hw, yAt, depth, -1);
+    emitSkirt(mbR, rec.pts, rec.frames, hw, yAt, depth, 1);
+    const under = (x, z, px, pz, k) => yAt(x, z, px, pz, k) - depth;
+    emitRibbon(mbR, rec.pts, rec.frames, [{ o: -hw, dy: 0 }, { o: hw, dy: 0 }], under, true);
+    // Piers under the span, and an abutment at each end where the deck comes back to ground.
+    const pts = rec.pts;
+    let acc = 1e9;
+    for (let k = 1; k < pts.length; k++) {
+      acc += Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]);
+      if (acc < (rec.cls === 'motorway' ? 32 : 40)) continue;
+      acc = 0;
+      const x = pts[k][0], z = pts[k][1];
+      const top = yAt(x, z, x, z, k) - depth;
+      const g = terrainY(x, z);
+      if (top - g < 3) continue;
+      mbR.box(x, (g + top) * 0.5, z, 2.6, top - g, 2.6, 0);
+    }
+    for (const k of [0, pts.length - 1]) {
+      const x = pts[k][0], z = pts[k][1];
+      const top = rec.deck[k] - depth;
+      const g = terrainY(x, z);
+      if (top - g < 1.0) continue;
+      const sx = rec.frames[k * 3], sz = rec.frames[k * 3 + 1];
+      const tx = -sz * 0.85, tz = sx * 0.85;
+      boxAA(mbR, x, z, tx, tz, sx * (hw + 0.5), sz * (hw + 0.5), g - 0.6, top);
+      C.stats.grade.abutments++;
+    }
+  }
+
+  function emitBuildingMass(b) {
+    if (!b.parts || !b.walls || b.landmark === 'cn' || b.buried) return;
+    const wall = b.glass ? C.mb.glass : C.mb.buildings;
+    setMat(wall, b.mat);
+    for (let k = 0; k < b.walls.length; k++) emitWallFace(wall, b.walls[k], C.stats);
+    // Roofs are never glass and never windowed: gravel/mechanical deck, profile 0, faintly
+    // tinted by the facade below so the roofscape is not one flat sheet of grey.
+    const y1 = b.y + b.h;
+    setMat(C.mb.buildings, roofMaterial(b.mat, _roofMat));
+    for (let p = 0; p < b.parts.length; p++) {
+      const part = b.parts[p];
+      if (!part.capBuried) emitCap(C.mb.buildings, part, y1 - part.capDrop, C.stats);
+    }
+    if (b.h > 118) {
+      setMat(C.mb.props, M.beacon);
+      C.mb.props.box(b.cx, y1 + 1.4, b.cz, 1.1, 1.1, 1.1, 0);
+    }
+  }
+
+  function emitHeavyRail(run) {
+    const r = run.raw;
+    const heavy = run.heavy;
+    let pts = polyResample(run.p, ROAD_MAX_SEG);
     if (pts.length < 2) return;
     const reach = heavy ? 2.3 : TRACK_SLAB_HW;
     pts = pruneSpikes(pts, reach);
     if (pts.length < 2) return;
     const frames = polyFrames(pts, reach);
+    const mbRail = C.mb.rails;
     // Track is laid on the NATURAL ground plus whatever the grade solve says this stretch of
     // corridor has to rise to clear the streets ducking under it. Reading the walking surface
     // here instead would drop the railway straight into the trench it is supposed to bridge.
-    const lift = G.railRise[i];
+    // The lift profile is read from the WHOLE way, never from this run, so two runs of one
+    // embankment cannot disagree about how high it is at the vertex they share.
+    const lift = G.railRise[run.gi];
     const liftAt = lift ? (x, z) => corridorDepth({ pts: r.p, dep: lift }, x, z) : () => 0;
     const yBed = (x, z) => terrainY(x, z) + liftAt(x, z) + (heavy ? RAIL_BED : 0.03);
     let len = 0;
     for (let k = 1; k < pts.length; k++) {
       len += Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]);
     }
-    stats.ground.railMetres += len;
+    C.stats.ground.railMetres += len;
     if (heavy) {
-      setMat(mb.rails, M.ballast);
-      emitRibbon(mb.rails, pts, frames, [{ o: -2.3, dy: 0 }, { o: 0, dy: 0.05 }, { o: 2.3, dy: 0 }], yBed);
-      setMat(mb.rails, M.tie);
+      setMat(mbRail, M.ballast);
+      emitRibbon(mbRail, pts, frames,
+        [{ o: -2.3, dy: 0 }, { o: 0, dy: 0.05 }, { o: 2.3, dy: 0 }], yBed);
+      setMat(mbRail, M.tie);
       let acc = 0;
       for (let k = 1; k < pts.length; k++) {
         const dx = pts[k][0] - pts[k - 1][0], dz = pts[k][1] - pts[k - 1][1];
@@ -6978,29 +7708,31 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         const x = pts[k][0], z = pts[k][1], y = yBed(x, z) + 0.09;
         const hu = sx * 1.45, hv = sz * 1.45;
         const tu = -sz * 0.14, tv = sx * 0.14;
-        mb.rails.tri(x - hu - tu, y, z - hv - tv, x + hu - tu, y, z + hv - tv, x + hu + tu, y, z + hv + tv);
-        mb.rails.tri(x - hu - tu, y, z - hv - tv, x + hu + tu, y, z + hv + tv, x - hu + tu, y, z - hv + tv);
+        mbRail.tri(x - hu - tu, y, z - hv - tv, x + hu - tu, y, z + hv - tv,
+          x + hu + tu, y, z + hv + tv);
+        mbRail.tri(x - hu - tu, y, z - hv - tv, x + hu + tu, y, z + hv + tv,
+          x - hu + tu, y, z - hv + tv);
       }
     }
-    setMat(mb.rails, M.rail);
+    setMat(mbRail, M.rail);
     const gauge = 0.7175;
     const railY = (x, z) => yBed(x, z) + (heavy ? 0.20 : 0.03);
     for (const side of [-1, 1]) {
       const c = gauge * side;
-      emitRibbon(mb.rails, pts, frames, [{ o: c - 0.04, dy: 0 }, { o: c + 0.04, dy: 0 }], railY);
+      emitRibbon(mbRail, pts, frames, [{ o: c - 0.04, dy: 0 }, { o: c + 0.04, dy: 0 }], railY);
       if (heavy) {
-        emitSkirt(mb.rails, pts, frames, c - 0.04, railY, 0.11, -1);
-        emitSkirt(mb.rails, pts, frames, c + 0.04, railY, 0.11, 1);
+        emitSkirt(mbRail, pts, frames, c - 0.04, railY, 0.11, -1);
+        emitSkirt(mbRail, pts, frames, c + 0.04, railY, 0.11, 1);
       }
     }
+    if (!heavy) return;
 
     // Where the track stands clear of the ground — because it was raised to clear an underpass,
     // or because the ground under it has been cut away entirely — it needs a structure. Fascia
     // walls down each side and a soffit between them: an embankment where the drop is small, a
     // bridge deck where the trench runs beneath. Without this the corridor floats over its own
     // underpass, which is exactly the thing a pedestrian standing in the underpass looks up at.
-    if (!heavy) return;
-    setMat(mb.rails, M.bridge);
+    setMat(mbRail, M.bridge);
     let deckLen = 0;
     let runStart = -1;
     const needsDeck = (k) => {
@@ -7016,161 +7748,307 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         const fr = polyFrames(seg, 2.3);
         const top = (x, z) => yBed(x, z) - 0.02;
         const bot = (x, z) => Math.min(terrainY(x, z) - 0.35, yBed(x, z) - RAIL_DECK);
-        emitWallStrip(mb.rails, seg, fr, -2.3, top, bot, -1);
-        emitWallStrip(mb.rails, seg, fr, 2.3, top, bot, 1);
-        emitRibbon(mb.rails, seg, fr, [{ o: -2.3, dy: 0 }, { o: 2.3, dy: 0 }], bot, true);
+        emitWallStrip(mbRail, seg, fr, -2.3, top, bot, -1);
+        emitWallStrip(mbRail, seg, fr, 2.3, top, bot, 1);
+        emitRibbon(mbRail, seg, fr, [{ o: -2.3, dy: 0 }, { o: 2.3, dy: 0 }], bot, true);
         for (let m = 1; m < seg.length; m++) {
           deckLen += Math.hypot(seg[m][0] - seg[m - 1][0], seg[m][1] - seg[m - 1][1]);
         }
-        stats.grade.railDecks++;
+        C.stats.grade.railDecks++;
       }
       runStart = -1;
     }
-    stats.grade.railDeckMetres += deckLen;
-  }, (f) => report(0.80 + f * 0.04, 'laying track'));
-
-  for (let i = 0; i < railsRaw.length; i++) {
-    const r = railsRaw[i];
-    if (r && r.k === 'tram' && Array.isArray(r.p) && r.p.length >= 4) placeTramStops(C, r.p);
+    C.stats.grade.railDeckMetres += deckLen;
   }
 
-  /* ---------------------------------------------------------------- facades */
-  report(0.84, 'building ground floors');
-  await chunked(prepped.length, 500, (i) => {
-    const b = prepped[i];
-    if (b.parts && !b.buried && b.landmark !== 'cn') buildFacade(C, b);
-  }, (f) => report(0.84 + f * 0.05, 'building ground floors'));
-
-  /* -------------------------------------------------------- street furniture */
-  report(0.89, 'street furniture');
-  await chunked(recs.length, 200, (i) => {
-    placeFurniture(C, recs[i]);
-    placeServiceProps(C, recs[i]);
-    placeScaffold(C, recs[i]);
-  }, (f) => report(0.89 + f * 0.04, 'street furniture'));
-
-  report(0.93, 'parking the cars');
-  await chunked(recs.length, 300, (i) => placeKerbCars(C, recs[i]),
-    (f) => report(0.93 + f * 0.015, 'parking the cars'));
-
-  /* ----------------------------------------------------------------- people */
-  report(0.945, 'the people');
-  placePedestrians(C, recs, parkParts);
-  {
-    const counts = [...C.crowd.values()].sort((a, b) => a - b);
-    stats.people.cells = counts.length;
-    stats.people.medianCell = counts.length ? counts[counts.length >> 1] : 0;
+  function beginTile(tile, stage) {
+    const first = !tile.built[stage];
+    C.stats = first ? stats : scrap;
+    _audit = C.stats;
+    C.mb = null;                       // set by the caller
+    C.rng = makeRng(tileSeed(tile, stage));
+    C.pedSeed = (PED_SEED ^ tileSeed(tile, 7)) >>> 0;
+    C.tilePeople = 0;
+    const ox = tile.bx0 - 24, oz = tile.bz0 - 24;
+    const onx = Math.ceil((tile.bx1 - tile.bx0 + 48) / 5) + 1;
+    const onz = Math.ceil((tile.bz1 - tile.bz0 + 48) / 5) + 1;
+    C.occ = makeOccupancy(5.0, ox, oz, onx, onz);
+    for (let i = 0; i < harbourClaims.length; i += 3) {
+      const x = harbourClaims[i], z = harbourClaims[i + 1];
+      if (x < ox || z < oz || x > tile.bx1 + 24 || z > tile.bz1 + 24) continue;
+      C.occ.claim(x, z, harbourClaims[i + 2]);
+    }
+    C.stations.length = 0;
+    C.corners.length = 0;
+    C.benches.length = 0;
+    C.walks.length = 0;
+    C.retail.length = 0;
+    C.plazas = [];
     C.crowd.clear();
+    C.audit.length = 0;
+    C.auditRoad.length = 0;
+    C.auditDeck.length = 0;
+    C.auditPed.length = 0;
+    return first;
   }
-  await frame();
 
-  /* --------------------------------------------------------------- roofscape */
-  report(0.95, 'rooftop plant');
-  await chunked(prepped.length, 800, (i) => {
-    const b = prepped[i];
-    if (b.parts && !b.buried && b.landmark !== 'cn' && b.frontLen > 0) placeRoofscape(C, b);
-  }, (f) => report(0.95 + f * 0.012, 'rooftop plant'));
+  function endTile(tile, stage, first) {
+    if (first) {
+      // Re-checks the placement invariants against the finished index rather than trusting the
+      // filters that produced them. Every one of these must come out zero.
+      for (let i = 0; i < C.audit.length; i += 2) {
+        if (inFootprint(C, C.audit[i], C.audit[i + 1], 0)) stats.propsInFootprint++;
+        if (onCarriageway(C, C.audit[i], C.audit[i + 1], 0)) stats.propsOnRoad++;
+      }
+      for (let i = 0; i < C.auditRoad.length; i += 2) {
+        if (inFootprint(C, C.auditRoad[i], C.auditRoad[i + 1], 0)) stats.propsInFootprint++;
+      }
+      for (let i = 0; i < C.auditPed.length; i += 4) {
+        const x = C.auditPed[i], z = C.auditPed[i + 1], y = C.auditPed[i + 2];
+        if (inFootprint(C, x, z, 0)) stats.people.inFootprint++;
+        if (!C.auditPed[i + 3] && onCarriageway(C, x, z, 0)) stats.people.onCarriageway++;
+        const g = groundY(x, z);
+        if (y < g - 0.02 || y > g + ROAD_Y + CURB + 0.06) stats.people.sunk++;
+      }
+      for (let i = 0; i < C.auditDeck.length; i += 4) {
+        const x = C.auditDeck[i], z = C.auditDeck[i + 1];
+        const y = C.auditDeck[i + 2], h = C.auditDeck[i + 3];
+        if (deckSoffitAbove(C, x, z, y + 0.25) - y < h) stats.deck.propsThroughDeck++;
+      }
+      for (const n of C.crowd.values()) {
+        crowdHist[Math.min(crowdHist.length - 1, n)]++;
+        stats.people.cells++;
+      }
+      let half = stats.people.cells >> 1;
+      for (let i = 0; i < crowdHist.length; i++) {
+        half -= crowdHist[i];
+        if (half <= 0) { stats.people.medianCell = i; break; }
+      }
+      // Facade detail: the smallest offset from a wall plane any detail face was emitted at.
+      // facades.js clamps its own faces, so this is a measurement, not a promise — and it is
+      // only meaningful once tiles have actually been built, which is why it lives here rather
+      // than at the end of the load.
+      const fa = facadeAudit();
+      stats.coplanar.facadeProudMin = fa.minProud;
+      stats.coplanar.facadeFaces = fa.faces;
+      stats.coplanar.facadeClamped = fa.clamped;
+      tile.built[stage] = true;
+    }
+    C.audit.length = 0;
+    C.auditRoad.length = 0;
+    C.auditDeck.length = 0;
+    C.auditPed.length = 0;
+    C.stats = stats;
+    _audit = stats;
+  }
 
-  // Tower-crown signage on the handful of Financial District towers that carry it, and a few
-  // cranes on the biggest open sites. Both are deliberately rare: they identify the skyline.
-  {
-    const tall = [];
-    for (let i = 0; i < prepped.length; i++) {
-      const b = prepped[i];
-      if (!b.parts || b.buried || b.landmark === 'cn' || b.h < 108 || b.frontLen < 7) continue;
-      tall.push(b);
-    }
-    tall.sort((p, q) => q.h - p.h);
-    for (let i = 0; i < Math.min(MAX_TOWER_SIGNS, tall.length); i++) {
-      const b = tall[i];
-      appendTowerSign(mb.props, rng, b.frontX, b.y + b.h - 7.5, b.frontZ, b.frontYaw,
-        clamp(b.frontLen * 0.5, 4, 18), 2.8, (i * 0.37) % 1);
-      noteProp(C, 'towerSign');
-    }
-    let cranes = 0;
-    for (let i = 0; i < lotParts.length && cranes < MAX_CRANES; i++) {
-      const part = lotParts[i];
-      if (Math.abs(planArea(part.outer)) < 2200) continue;
-      const bb = part.bbox;
-      const u = (bb[0] + bb[2]) * 0.5, v = (bb[1] + bb[3]) * 0.5;
-      if (!partContains(part, u, v)) continue;
-      const x = u, z = -v;
-      if (inFootprint(C, x, z, 4) || !C.occ.claim(x, z, 6)) continue;
-      if (!deckFits(C, x, z, groundY(x, z) + 0.06, PROP_H.crane)) continue;
-      appendConstructionCrane(mb.props, rng, x, groundY(x, z) + 0.06, z,
-        rng() * TAU - Math.PI, 46 + rng() * 46);
-      noteProp(C, 'crane');
-      cranes++;
-    }
-    for (let i = 0; i < railsRaw.length; i++) {
-      const r = railsRaw[i];
-      if (r && r.k === 'rail' && Array.isArray(r.p) && r.p.length >= 3) {
-        placeRailCars(C, r.p, G.railRise[i]);
+  /**
+   * Build one stage of one tile. A generator, so tiles.js can stop between passes and hand the
+   * frame back: a dense downtown tile is twenty partial frames rather than one 60 ms stall.
+   */
+  function* buildTile(tile, stage, builders) {
+    const F = tile.f;
+    const first = beginTile(tile, stage);
+    C.mb = builders;
+    C.plazas = F.plazas;
+
+    if (stage === S_MASS) {
+      emitTerrainRange(builders.terrain, T, gradeField, F.i0, F.i1, F.j0, F.j1);
+      yield;
+      for (let i = 0; i < F.areas.length; i++) {
+        const part = F.areas[i];
+        if (!part.drape) continue;
+        const gy = part.kind === 'pier' ? (x, z) => Math.max(terrainY(x, z), 0.9) : terrainY;
+        setMat(builders[part.target], part.mat);
+        emitDrapedCap(builders[part.target], part, gy, part.dy, C.stats, gradeField);
+        if ((i & 15) === 15) yield;
+      }
+      yield;
+      // Retaining walls, verge, ceiling and portals for every corridor the grade solve depressed.
+      for (let i = 0; i < F.corr.length; i++) {
+        emitTrench(C, F.corr[i]);
+        if ((i & 7) === 7) yield;
+      }
+      for (let i = 0; i < F.pass.length; i++) emitPassage(C, F.pass[i].r, F.pass[i].hw);
+      yield;
+      for (let i = 0; i < F.b.length; i++) {
+        emitBuildingMass(F.b[i]);
+        if ((i & 63) === 63) yield;
+      }
+      if (F.cn) emitCNTower(builders.buildings, builders.glass, builders.props, cnX, cnZ, cnBaseY);
+      yield;
+      for (let i = 0; i < F.recs.length; i++) {
+        emitRoadMass(F.recs[i]);
+        if ((i & 31) === 31) yield;
+      }
+      yield;
+      for (let i = 0; i < F.rails.length; i++) {
+        if (F.rails[i].heavy) emitHeavyRail(F.rails[i]);
+        if ((i & 7) === 7) yield;
+      }
+      if (F.harbour && F.harbour[S_MASS]) {
+        const chunk = F.harbour[S_MASS];
+        for (const c in chunk) appendChunk(builders[c], chunk[c]);
+      }
+    } else {
+      /* --------------------------------------------------------- ground plane */
+      for (let i = 0; i < F.recs.length; i++) {
+        emitSidewalkBands(C, F.recs[i]);
+        if ((i & 31) === 31) yield;
+      }
+      yield;
+      for (let i = 0; i < F.recs.length; i++) {
+        emitRoadMarkings(C, F.recs[i]);
+        if ((i & 15) === 15) yield;
+      }
+      yield;
+      // Kerb ramps and the signal heads go in before any furniture, so they win the corners.
+      for (let i = 0; i < F.junc.length; i++) {
+        emitJunctionKerbs(C, F.junc[i]);
+        placeJunctionProps(C, F.junc[i]);
+        if ((i & 15) === 15) yield;
+      }
+      yield;
+      for (let i = 0; i < F.foot.length; i++) {
+        buildFootway(C, { p: F.foot[i].p, w: F.foot[i].r.w, c: 'foot' });
+        if ((i & 31) === 31) yield;
+      }
+      yield;
+      // The PATH: a real second level with a floor, walls and a ceiling, which nobody can see
+      // from the surface, so it is detail rather than massing.
+      for (let i = 0; i < F.sub.length; i++) {
+        emitSubway(C, F.sub[i].r, F.sub[i].gi, G);
+        if ((i & 31) === 31) yield;
+      }
+      yield;
+      /* ---------------------------------------------------------- streetcar */
+      for (let i = 0; i < F.rails.length; i++) {
+        const run = F.rails[i];
+        if (run.heavy) continue;
+        emitTramRoute(C, run.p);
+        placeTramStops(C, run.p);
+        if ((i & 3) === 3) yield;
+      }
+      yield;
+      /* ------------------------------------------------------------ facades */
+      for (let i = 0; i < F.b.length; i++) {
+        const b = F.b[i];
+        if (b.landmark !== 'cn') buildFacade(C, b);
+        if ((i & 31) === 31) yield;
+      }
+      yield;
+      /* -------------------------------------------------- street furniture */
+      for (let i = 0; i < F.recs.length; i++) {
+        const rec = F.recs[i];
+        placeFurniture(C, rec);
+        placeServiceProps(C, rec);
+        placeScaffold(C, rec);
+        if ((i & 15) === 15) yield;
+      }
+      yield;
+      for (let i = 0; i < F.recs.length; i++) {
+        placeKerbCars(C, F.recs[i]);
+        if ((i & 31) === 31) yield;
+      }
+      yield;
+      /* --------------------------------------------------- lots, parks, water */
+      {
+        let lotCars = 0;
+        for (let i = 0; i < F.areas.length; i++) {
+          const part = F.areas[i];
+          if (part.kind !== 'parking' || lotCars >= MAX_LOT_CARS_TILE) continue;
+          if (Math.abs(planArea(part.outer)) < 260) continue;
+          lotCars += placeLotCars(C, part,
+            Math.min(MAX_LOT_CARS_EACH, MAX_LOT_CARS_TILE - lotCars));
+        }
+      }
+      yield;
+      for (let i = 0; i < F.areas.length; i++) {
+        const part = F.areas[i];
+        if (part.kind !== 'park' || part.treeCap <= 0) continue;
+        const bb = part.bbox;
+        let own = 0;
+        for (let v = bb[1]; v <= bb[3] && own < part.treeCap; v += PARK_TREE_SPACING) {
+          for (let u = bb[0]; u <= bb[2] && own < part.treeCap; u += PARK_TREE_SPACING) {
+            const ju = u + (C.rng() - 0.5) * PARK_TREE_SPACING * 0.7;
+            const jv = v + (C.rng() - 0.5) * PARK_TREE_SPACING * 0.7;
+            if (!partContains(part, ju, jv)) continue;
+            const x = ju, z = -jv;
+            const tree = C.rng() < 0.74;
+            const y = reserve(C, tree ? 'parkTree' : 'shrub', x, z, tree ? 2.1 : 0.9, 0.6);
+            if (!isNum(y)) continue;
+            own++;
+            if (tree) appendParkTree(builders.props, C.rng, x, y + 0.08, z, 0.9 + C.rng() * 0.7);
+            else appendShrub(builders.props, C.rng, x, y + 0.06, z, 0.9 + C.rng() * 0.6);
+          }
+        }
+        yield;
+      }
+      for (let i = 0; i < F.areas.length; i++) {
+        const part = F.areas[i];
+        if (part.kind !== 'pier') continue;
+        if (part.berth) placeQuayBerth(C, part);
+        if (part.boats > 0) placeHarbourCraft(C, part, part.boats);
+      }
+      yield;
+      /* ----------------------------------------------------------- people */
+      placePedestrians(C, F.recs, F.parks);
+      yield;
+      /* --------------------------------------------------------- roofscape */
+      for (let i = 0; i < F.b.length; i++) {
+        const b = F.b[i];
+        if (b.landmark !== 'cn' && b.frontLen > 0) placeRoofscape(C, b);
+        if (b.towerSign >= 0 && b.frontLen >= 7) {
+          appendTowerSign(builders.props, C.rng, b.frontX, b.y + b.h - 7.5, b.frontZ, b.frontYaw,
+            clamp(b.frontLen * 0.5, 4, 18), 2.8, (b.towerSign * 0.37) % 1);
+          noteProp(C, 'towerSign');
+        }
+        if ((i & 63) === 63) yield;
+      }
+      yield;
+      for (let i = 0; i < F.areas.length; i++) {
+        const part = F.areas[i];
+        if (!part.crane) continue;
+        const bb = part.bbox;
+        const u = (bb[0] + bb[2]) * 0.5, v = (bb[1] + bb[3]) * 0.5;
+        if (!partContains(part, u, v)) continue;
+        const x = u, z = -v;
+        if (inFootprint(C, x, z, 4) || !C.occ.claim(x, z, 6)) continue;
+        if (!deckFits(C, x, z, groundY(x, z) + 0.06, PROP_H.crane)) continue;
+        appendConstructionCrane(builders.props, C.rng, x, groundY(x, z) + 0.06, z,
+          C.rng() * TAU - Math.PI, 46 + C.rng() * 46);
+        noteProp(C, 'crane');
+      }
+      for (let i = 0; i < F.rails.length; i++) {
+        const run = F.rails[i];
+        if (!run.heavy || run.p.length < 3) continue;
+        placeRailCars(C, run.p, G.railRise[run.gi], run.raw.p);
+      }
+      if (F.harbour && F.harbour[S_DETAIL]) {
+        const chunk = F.harbour[S_DETAIL];
+        for (const c in chunk) appendChunk(builders[c], chunk[c]);
       }
     }
+
+    endTile(tile, stage, first);
   }
 
-  /* ------------------------------------------------------------ harbourfront */
-  // CONTRACT §8.3. Everything on the water: the quay wall and its apron, the piers and their pile
-  // structure, the rubble mounds, the marina floats, the ferry terminal slips, the boardwalk and
-  // the trail, and the furniture that stands on all of it. Last, so it claims its ground against
-  // a finished occupancy index and nothing already placed is displaced.
-  if (HARBOUR) {
-    report(0.962, 'building the quay');
-    appendHarbour(HARBOUR, {
-      mb,
-      data,
-      claim: (x, z, r) => C.occ.claim(x, z, r),
-      note: (kind) => noteProp(C, kind),
-    });
-    await frame();
-  }
+  const tiles = new TileManager({
+    gl,
+    grid,
+    classes: MESH_CLASSES,
+    stages: [
+      { name: 'massing', range: MASS_RANGE, drop: MASS_DROP },
+      { name: 'detail', range: DETAIL_RANGE, drop: DETAIL_DROP },
+    ],
+    build: buildTile,
+    vertexCap: VERTEX_CAP,
+    budgetMs: TILE_BUDGET_MS,
+    evictMs: TILE_EVICT_MS,
+  });
 
-  /* -------------------------------------------------------------- self-audit */
-  // Re-checks the two placement invariants against the finished index rather than trusting the
-  // filters that produced them. Both must come out zero.
-  report(0.965, 'checking placement');
-  for (let i = 0; i < C.audit.length; i += 2) {
-    if (inFootprint(C, C.audit[i], C.audit[i + 1], 0)) stats.propsInFootprint++;
-    if (onCarriageway(C, C.audit[i], C.audit[i + 1], 0)) stats.propsOnRoad++;
-  }
-  for (let i = 0; i < C.auditRoad.length; i += 2) {
-    if (inFootprint(C, C.auditRoad[i], C.auditRoad[i + 1], 0)) stats.propsInFootprint++;
-  }
-  // People, re-measured: nobody inside a footprint, nobody on a carriageway they should not be on,
-  // nobody floating over the pavement or sunk into it. Cyclists and the figures on a crossing are
-  // excluded from the carriageway test by being recorded on the road audit list instead.
-  for (let i = 0; i < C.auditPed.length; i += 4) {
-    const x = C.auditPed[i], z = C.auditPed[i + 1], y = C.auditPed[i + 2];
-    if (inFootprint(C, x, z, 0)) stats.people.inFootprint++;
-    if (!C.auditPed[i + 3] && onCarriageway(C, x, z, 0)) stats.people.onCarriageway++;
-    // Every seat is the terrain plus one of the ground-plane rungs, so the whole legal band is
-    // 0 .. kerb height. Outside it the figure is standing on nothing or buried in the pavement.
-    const g = groundY(x, z);
-    if (y < g - 0.02 || y > g + ROAD_Y + CURB + 0.06) stats.people.sunk++;
-  }
-
-  // Deck clearance, re-measured against the finished index rather than trusting the filters that
-  // produced it: (x, z, seat height, standing height) for every prop that stands up at all.
-  for (let i = 0; i < C.auditDeck.length; i += 4) {
-    const x = C.auditDeck[i], z = C.auditDeck[i + 1];
-    const y = C.auditDeck[i + 2], h = C.auditDeck[i + 3];
-    if (deckSoffitAbove(C, x, z, y + 0.25) - y < h) stats.deck.propsThroughDeck++;
-  }
-  C.audit.length = 0;
-  C.auditRoad.length = 0;
-  C.auditDeck.length = 0;
-  C.auditPed.length = 0;
-  await frame();
-
-  // Facade detail: the smallest offset from a wall plane any detail face was emitted at. The
-  // module clamps its own faces, so this is a measurement, not a promise.
-  {
-    const fa = facadeAudit();
-    stats.coplanar.facadeProudMin = fa.minProud;
-    stats.coplanar.facadeFaces = fa.faces;
-    stats.coplanar.facadeClamped = fa.clamped;
-  }
+  /* ------------------------------------------------------------- self-audit */
+  report(0.86, 'checking the ground plane');
   // Ground plane: the tightest gap between two rungs of the ladder that can overlap, with the
   // duplicate stagger at its worst in both directions. Anything below GROUND_RUNG is a flicker
   // waiting for a distant camera.
@@ -7192,19 +8070,15 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   }
 
   /* ----------------------------------------------------------- gpu upload -- */
-  report(0.97, 'uploading geometry');
-  const meshes = {};
-  const names = ['terrain', 'buildings', 'glass', 'roads', 'sidewalks', 'water', 'rails', 'props'];
-  for (let i = 0; i < names.length; i++) {
-    const n = names[i];
-    const count = mb[n].count;
-    stats.meshes[n] = count;
-    stats.verts += count;
-    meshes[n] = new Mesh(gl, mb[n].data());
-    mb[n].reset();
-  }
-  stats.tris = (stats.verts / 3) | 0;
+  report(0.92, 'uploading the lake');
+  const meshes = { water: new Mesh(gl, waterMB.data()) };
+  stats.meshes.water = waterMB.count;
+  waterMB.reset();
   stats.seconds = (now() - t0) / 1000;
+  stats.yields = _yields;
+  stats.tileSize = TILE_SIZE;
+  stats.tileCount = grid.count;
+  stats.vertexCap = VERTEX_CAP;
 
   /* ---------------------------------------------------------- query surface */
 
@@ -7232,6 +8106,10 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
    * cut through (the same portal `punchCorridorPortals` took out of the geometry, from the same
    * field, so what you can see through is exactly what you can walk through). Called with three
    * arguments, as every prop and pedestrian pass does, it behaves exactly as it always has.
+   *
+   * Note that collision reads `parts`, which is prepared for EVERY building at load and never
+   * evicted: the player must not be able to walk through a tower merely because its geometry is
+   * not resident.
    */
   function collide(x, z, r, feetY) {
     const out = { x, z, hit: false };
@@ -7352,31 +8230,42 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     return name;
   }
 
-  report(1, 'ready');
-  if (typeof console !== 'undefined' && console.log) {
+  /* -------------------------------------------------------------- reporting */
+
+  let logged = false;
+  function logSummary() {
+    if (logged || typeof console === 'undefined' || !console.log) return;
+    logged = true;
+    const TS = tiles.stats;
     console.log('[city] ' + stats.buildings + ' buildings, ' + stats.rings + ' rings, ' +
-      stats.roads + ' road ways, ' + stats.verts.toLocaleString() + ' verts / ' +
-      stats.tris.toLocaleString() + ' tris in ' + stats.seconds.toFixed(2) + ' s',
-      stats.meshes);
+      stats.roads + ' road ways in ' + stats.recs + ' records (' + stats.splitWays +
+      ' split at a tile edge, worst cut ' + stats.worstCutDeg.toFixed(2) + ' deg); ' +
+      grid.count + ' tiles of ' + TILE_SIZE + ' m; analysis ' + stats.seconds.toFixed(2) + ' s; ' +
+      'resident ' + TS.residentVerts.toLocaleString() + ' verts over ' + TS.residentTiles +
+      ' tiles, cap ' + (VERTEX_CAP / 1e6).toFixed(1) + ' M', stats.meshes);
+    console.log('[city] data: ' + stats.source + ', ' +
+      (stats.bytes ? (stats.bytes / 1048576).toFixed(2) + ' MB decoded' : 'JSON') +
+      '; captured global geometry ' + stats.chunkVerts.toLocaleString() + ' verts (harbour + ' +
+      'walkability) held as ' + (stats.chunkVerts * 13 * 4 / 1048576).toFixed(1) + ' MB of ' +
+      'per-tile chunks');
     console.log('[city] facades: ' + stats.surveyedColour + ' surveyed colours, materials',
       stats.materials, 'lighting profiles [envelope, office, residential, retail, parking, civic]',
       stats.profiles);
-    const G = stats.ground;
-    console.log('[city] ground: ' + G.junctions + ' junctions (' + G.signalised + ' signalised), ' +
-      G.markings.toLocaleString() + ' paint quads, ' + G.crosswalks + ' crossings, ' +
-      G.kerbRamps + ' kerb ramps, ' + Math.round(G.footwayMetres).toLocaleString() +
-      ' m of walkway, ' + Math.round(G.kerbMetres).toLocaleString() + ' m of kerb');
-    console.log('[city] track: ' + Math.round(G.tramMetres).toLocaleString() + ' m of streetcar, ' +
-      G.tramPoles + ' catenary poles, ' + Math.round(G.wireMetres).toLocaleString() +
-      ' m of overhead wire, ' + Math.round(G.railMetres).toLocaleString() + ' m of railway');
-    // Ground-plane geometry audit. Every one of these is a class of street-level artifact that no
-    // vertex count can show: paint swallowed by the street it crosses, ribbon quads turned inside
-    // out at a corner, pavement laid across a carriageway, zero-area ears shipped to the GPU.
-    console.log('[city] ground audit: ' + stats.markingsUnderCross + ' markings under a crossing ' +
-      'street, ' + stats.markingsBelowRoad + ' below their own, ' + stats.ribbonFolds +
-      ' folded ribbon triangles dropped, ' + stats.capDegenerate + ' degenerate cap ears dropped, ' +
-      G.plazas + ' pedestrian rings filled as plazas (' + Math.round(G.plazaArea).toLocaleString() +
-      ' m2), ' + stats.pavementOverRoad + ' pavement stations cut back off a carriageway');
+    const GR = stats.grade;
+    console.log('[city] grade separation: ' + GR.under + ' depressed corridors (' +
+      Math.round(GR.cutMetres).toLocaleString() + ' m open cut, deepest ' + GR.deepest.toFixed(2) +
+      ' m), ' + GR.sub + ' underground concourse ways, ' + GR.over + ' carried over, ' +
+      GR.passage + ' building passages; ' + GR.crossings.toLocaleString() +
+      ' real crossings resolved, ' + GR.violations + ' short of ' + UNDER_CLEAR + ' m headroom, ' +
+      GR.wallPortals + ' portals cut through a facade');
+    const WK = stats.walk;
+    console.log('[city] walkability: ' + (WK.fraction * 100).toFixed(2) + '% of ' +
+      Math.round(WK.metres).toLocaleString() + ' walkable m in the largest component, ' +
+      WK.components + ' components, ' + WK.islands + ' islands over 50 m holding ' +
+      Math.round(WK.islandMetres).toLocaleString() + ' m; ' + WK.cliffs + ' cliffs left (' +
+      WK.flights + ' flights of steps built, ' + WK.stitched + ' gaps stitched over ' +
+      Math.round(WK.stitchMetres) + ' m); groundY finite over ' + WK.groundHoles + ' holes, ' +
+      WK.groundMin.toFixed(2) + '..' + WK.groundMax.toFixed(2) + ' m');
     const CP = stats.coplanar;
     console.log('[city] coplanar audit: ' + CP.wallPairs.toLocaleString() + ' duplicated wall ' +
       'faces found (' + Math.round(CP.wallMetres).toLocaleString() + ' m), ' +
@@ -7384,84 +8273,71 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       ' clipped, ' + CP.capsBuried + ' buried roof caps deleted / ' + CP.capsStepped +
       ' stepped down, ' + CP.buriedRecords + ' whole records dropped, ' + CP.wallPairsLeft +
       ' wall + ' + CP.capPairsLeft + ' cap fights left; ground rung ' +
-      CP.groundRungMin.toFixed(3) + ' m (carriageway ' + CP.groundRungMinMicro.toFixed(3) +
-      ' m), facade detail ' + CP.facadeProudMin.toFixed(3) + ' m proud');
-    const DK = stats.deck;
-    console.log('[city] elevated decks: ' + DK.segments.toLocaleString() + ' deck segments, ' +
-      DK.deckLamps + ' lamps on the carriageway above, ' + DK.propsShortened +
-      ' props shortened to fit underneath, ' + DK.propsSkipped + ' refused, ' +
-      DK.propsThroughDeck + ' still intersecting a deck');
+      CP.groundRungMin.toFixed(3) + ' m (carriageway ' + CP.groundRungMinMicro.toFixed(3) + ' m)');
     const HB = HARBOUR ? harbourStats(HARBOUR) : null;
     if (HB) {
       console.log('[city] harbourfront: ' + Math.round(HB.shoreMetres).toLocaleString() +
-        ' m of surveyed shoreline in ' + HB.runs + ' runs (' + HB.quayStations + ' quay ' +
-        'stations, apron ' + HB.apronMinW.toFixed(1) + '-' + HB.apronMaxW.toFixed(1) + ' m), ' +
-        HB.piers + ' piers, ' + HB.fingers + ' finger berths, ' + HB.mounds + ' rubble mounds, ' +
-        HB.marinas + ' marinas, ' + HB.basins + ' basins, ' + HB.terminals +
-        ' ferry terminals, ' + HB.walls + ' waterside walls (' + HB.inlandWallsSkipped +
-        ' inland walls left alone), ' + HB.crossings + ' walkways carried over the water; ' +
-        HB.lakeCells + ' terrain cells taken down to the lake, ' + HB.pondsDropped +
-        ' ponds absorbed, ' + HB.folds + ' folded quay quads');
-    }
-    const GR = stats.grade;
-    console.log('[city] grade separation: ' + GR.under + ' depressed corridors (' +
-      Math.round(GR.cutMetres).toLocaleString() + ' m open cut, ' + Math.round(GR.roofedMetres) +
-      ' m under a lid, deepest ' + GR.deepest.toFixed(2) + ' m), ' + GR.sub +
-      ' underground concourse ways (' + Math.round(GR.subMetres).toLocaleString() + ' m), ' +
-      GR.over + ' carried over, ' + GR.passage + ' building passages; ' + GR.portals +
-      ' portals, ' + GR.abutments + ' abutments, ' + GR.railDecks + ' rail decks over ' +
-      Math.round(GR.railDeckMetres).toLocaleString() + ' m; ' + GR.crossings.toLocaleString() +
-      ' real crossings resolved, ' + GR.violations + ' short of ' + UNDER_CLEAR + ' m headroom, ' +
-      GR.lidSteps + ' places where the ground plane steps onto a lid; ' + GR.wallPortals +
-      ' portals cut through a facade over ' + Math.round(GR.wallPortalMetres).toLocaleString() +
-      ' m of wall, ' + Math.round(GR.coveredMetres).toLocaleString() +
-      ' m of corridor ceiled under a building through ' + GR.coverPortals + ' mouths lit by ' +
-      GR.tunnelLamps + ' battens');
-    const WK = stats.walk;
-    console.log('[city] walkability: ' + (WK.fraction * 100).toFixed(2) + '% of ' +
-      Math.round(WK.metres).toLocaleString() + ' walkable m in the largest component, ' +
-      WK.components + ' components, ' + WK.islands + ' islands over 50 m holding ' +
-      Math.round(WK.islandMetres).toLocaleString() + ' m; ' + WK.cliffs + ' cliffs left (' +
-      WK.flights + ' flights of steps built, ' + WK.stitched + ' gaps stitched over ' +
-      Math.round(WK.stitchMetres) + ' m); ' + Math.round(WK.blockedMetres).toLocaleString() +
-      ' m runs through a building, ' + Math.round(WK.severedMetres).toLocaleString() +
-      ' m severed by a wall; groundY finite over ' + WK.groundHoles + ' holes, ' +
-      WK.groundMin.toFixed(2) + '..' + WK.groundMax.toFixed(2) + ' m');
-    if (WK.worstIslands.length) {
-      console.log('[city] walkable islands: ' + WK.worstIslands.map((i) =>
-        i.m + ' m at (' + i.x + ', ' + i.z + ')' + (i.name ? ' ' + i.name : '')).join('; '));
-    }
-    if (WK.worstCliffs.length) {
-      console.log('[city] cliffs left: ' + WK.worstCliffs.map((i) =>
-        i.m + ' m at (' + i.x + ', ' + i.z + ')').join('; '));
-    }
-    console.log('[city] people', stats.people);
-    console.log('[city] street furniture', stats.props);
-    console.log('[city] facade detail', stats.facades);
-    if (stats.capFail) console.log('[city] ' + stats.capFail + ' ring caps could not be triangulated');
-    const bad = stats.propsInFootprint + stats.propsOnRoad + stats.markingsBelowRoad +
-      stats.facadesFacingIn + stats.boomsMisaimed + stats.wireOffTrack;
-    if (bad) {
-      console.warn('[city] PLACEMENT AUDIT FAILED: ' + stats.propsInFootprint +
-        ' props inside a footprint, ' + stats.propsOnRoad + ' on a carriageway, ' +
-        stats.markingsBelowRoad + ' markings at or below the asphalt, ' +
-        stats.facadesFacingIn + ' facades facing inward, ' + stats.boomsMisaimed +
-        ' lamp booms misaimed, ' + stats.wireOffTrack + ' wire attachments off the track');
+        ' m of surveyed shoreline in ' + HB.runs + ' runs, ' + HB.piers + ' piers, ' +
+        HB.marinas + ' marinas, ' + HB.terminals + ' ferry terminals, ' + HB.crossings +
+        ' walkways carried over the water; ' + HB.folds + ' folded quay quads');
     }
   }
+
+  /**
+   * Everything the frame loop owes the city: level of detail, culling, the geometry budget and
+   * eviction. Call once per frame, before drawing.
+   */
+  function update(camera, nowMs, budgetMs) {
+    tiles.frame(camera, nowMs, budgetMs);
+    const TS = tiles.stats;
+    stats.verts = TS.residentVerts + (meshes.water ? meshes.water.vertexCount : 0);
+    stats.tris = (stats.verts / 3) | 0;
+    return tiles;
+  }
+
+  /**
+   * Build what is visible from `camera` before the first frame, so the world is not empty when
+   * the title screen lifts. Everything past this point is built by the frame loop.
+   */
+  async function warm(camera, maxMs, onFrac) {
+    const deadline = now() + (isNum(maxMs) ? maxMs : 2500);
+    let total = 0;
+    for (let guard = 0; guard < 2048; guard++) {
+      tiles.frame(camera, now(), 0);
+      const pending = tiles.pending;
+      if (pending > total) total = pending;
+      if (!pending) break;
+      tiles.pump(12);
+      if (typeof onFrac === 'function') onFrac(total ? 1 - pending / total : 1);
+      if (now() > deadline) break;
+      await frame();
+    }
+    update(camera, now(), 0);
+    logSummary();
+    if (typeof onFrac === 'function') onFrac(1);
+    return stats;
+  }
+
+  report(1, 'ready');
 
   return {
     meta,
     extent,
     terrain: T,
     meshes,
+    tiles,
+    grid,
+    classes: MESH_CLASSES,
     stats,
     groundY,
     buildingAt,
     collide,
     streetNameAt,
+    update,
+    warm,
     dispose() {
-      for (let i = 0; i < names.length; i++) if (meshes[names[i]]) meshes[names[i]].dispose();
+      tiles.dispose();
+      if (meshes.water) meshes.water.dispose();
     },
   };
 }

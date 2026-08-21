@@ -22,7 +22,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RAW = os.path.join(HERE, '..', 'data', 'raw')
 SHP = os.path.join(RAW, 'massing2025', '3DMassingShapefile_2025_WGS84')
 
-BBOX = dict(west=-79.4080, east=-79.3690, south=43.6340, north=43.6540)
+# Expanded 2026-08-20: roughly 2x on the north/east/west sides, and stretched south to take in
+# the whole Toronto Islands chain (Hanlan's/Centre/Ward's, south shore at 43.6116) and Billy
+# Bishop airport, with a margin of open lake beyond. 6.8 x 6.4 km, about 43 km2.
+BBOX = dict(west=-79.4290, east=-79.3450, south=43.6060, north=43.6640)
 
 # SURF_ELEV uses 0.0 for "missing" and 130.1 as a fill value; real downtown ground is 74.6-105 m MSL.
 ELEV_MIN, ELEV_MAX = 74.0, 115.0
@@ -131,7 +134,7 @@ def read_buildings(proj, bbox):
 
 # ---------------------------------------------------------------- terrain
 
-def build_terrain(samples, ext, cell):
+def build_terrain(samples, ext, cell, default=None):
     """Inverse-distance interpolation from trustworthy elevation samples, then smoothed."""
     nx = int(ext['x'] / cell) + 1
     nz = int(ext['z'] / cell) + 1
@@ -156,7 +159,9 @@ def build_terrain(samples, ext, cell):
                         for s in grid.get((gi + di, gj + dj), ())]
                 rad += 1
             if not near:
-                field[j * nx + i] = 0.0
+                # No sample in range: open water, or beyond the built-up edge. Fall back to the
+                # datum rather than 0 m MSL, which would sink the cell ~74 m below lake level.
+                field[j * nx + i] = default
                 continue
             near.sort(key=lambda s: (s[0] - wx) ** 2 + (s[1] - wz) ** 2)
             num = den = 0.0
@@ -354,7 +359,7 @@ def main():
     print(f'  {len(samples)} trustworthy elevation samples, lake datum {lake:.1f} m MSL')
 
     print('terrain:')
-    nx, nz, field = build_terrain(samples, ext, TERRAIN_CELL)
+    nx, nz, field = build_terrain(samples, ext, TERRAIN_CELL, default=lake)
     field = [round(v - lake, 3) for v in field]         # relative to lake level
     print(f'  {nx}x{nz} grid @ {TERRAIN_CELL} m, range '
           f'{min(field):.1f}..{max(field):.1f} m above lake')

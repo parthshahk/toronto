@@ -107,18 +107,26 @@ const QUALITY_PRESETS = [
 // Places worth standing. Local metres, and a compass bearing rather than a raw yaw because that is
 // how the coordinates were checked against the real street grid. Positions are re-grounded and
 // pushed out of any footprint on arrival, so they cannot strand the camera inside a wall.
+//
+// RE-PROJECTED for the expanded extent. These were authored against the old bounding box, whose
+// origin was (-79.38850, 43.64400); the extract now originates at (-79.38700, 43.63500), which
+// moves every local coordinate by (-120.9, -1002.0) m. The framings are unchanged — each one was
+// carried back through the old projector to lon/lat and forward through the new one, and every
+// walking viewpoint was re-checked against streetNameAt(): Front Street West, Bay Street, King
+// Street West, Bremner Boulevard, Waterfront Recreational Trail. Left alone they land a kilometre
+// out in the harbour.
 const VIEWPOINTS = [
   // THE START: out over the Inner Harbour in fly mode, looking north at the skyline. This is the
   // postcard angle -- the CN Tower against the Financial District with the water in front -- and it
   // shows what the project is in one frame. 'R' returns here.
-  { name: 'The skyline from the lake', x: 300, y: 300, z: 1520, bearing: 350, pitch: -7, mode: 'fly' },
-  { name: 'Over the harbour', x: 330, y: 340, z: 1180, bearing: 349, pitch: -9, mode: 'fly' },
-  { name: 'Front St W at The Well', x: -628.4, z: 212.1, bearing: 70, pitch: 6, mode: 'walk' },
-  { name: 'Front St W at Simcoe', x: 300, z: -90, bearing: 79, pitch: 5, mode: 'walk' },
-  { name: 'Bay St at Wellington', x: 708.9, z: -371, bearing: 343, pitch: 24, mode: 'walk' },
-  { name: 'King St W at Bay', x: 652.8, z: -515, bearing: 253, pitch: 12, mode: 'walk' },
-  { name: 'Bremner Blvd, CN Tower', x: 169, z: 241.7, bearing: 340, pitch: 34, mode: 'walk' },
-  { name: 'Harbourfront, York Quay', x: 455, z: 512, bearing: 333, pitch: 15, mode: 'walk' },
+  { name: 'The skyline from the lake', x: 179.2, y: 300, z: 518.3, bearing: 350, pitch: -7, mode: 'fly' },
+  { name: 'Over the harbour', x: 209.2, y: 340, z: 178.2, bearing: 349, pitch: -9, mode: 'fly' },
+  { name: 'Front St W at The Well', x: -749.3, z: -789.8, bearing: 70, pitch: 6, mode: 'walk' },
+  { name: 'Front St W at Simcoe', x: 179.2, z: -1092.0, bearing: 79, pitch: 5, mode: 'walk' },
+  { name: 'Bay St at Wellington', x: 588.2, z: -1373.0, bearing: 343, pitch: 24, mode: 'walk' },
+  { name: 'King St W at Bay', x: 532.0, z: -1517.0, bearing: 253, pitch: 12, mode: 'walk' },
+  { name: 'Bremner Blvd, CN Tower', x: 48.2, z: -760.2, bearing: 340, pitch: 34, mode: 'walk' },
+  { name: 'Harbourfront, York Quay', x: 334.2, z: -489.9, bearing: 333, pitch: 15, mode: 'walk' },
 ];
 
 /* ================================================================== shell === */
@@ -193,6 +201,7 @@ const G = {
   fps: 0,
   dt: 0,
   frames: 0,
+  bootMs: 0,          // page load to the first interactive frame, filled in by boot()
   showHelp: false,
   showDebug: false,
   dpr: 1,
@@ -977,11 +986,16 @@ function drawHud(input) {
     const cs = G.city.stats || {};
     const q = G.renderer ? G.renderer._q : null;
     const inside = G.city.buildingAt(player.x, player.z);
+    const ts = G.city.tiles.stats;
     const dbg = [
       'draws ' + (st ? st.draws : 0) + '  tris ' + (st ? st.tris.toLocaleString() : 0) +
         '  shadow ' + (st ? st.shadowDraws : 0) + '  post ' + (st ? st.postPasses : 0),
       'city ' + (cs.buildings || 0) + ' bldgs  ' + (cs.roads || 0) + ' ways  ' +
         ((cs.verts || 0)).toLocaleString() + ' verts  ' + (cs.seconds || 0).toFixed(2) + ' s',
+      'tiles ' + ts.residentTiles + ' resident / ' + ts.visibleTiles + ' drawn / ' +
+        (cs.tileCount || 0) + '  queue ' + ts.queued + '  build ' +
+        ts.lastBuildMs.toFixed(1) + ' ms  evicted ' + ts.evicted +
+        ' (' + (ts.evictedVerts / 1e6).toFixed(1) + ' M verts)',
       q ? ('shadows ' + q.shadows + '  ssao ' + (q.ssao ? 'on' : 'off') + '  ssr ' +
         (q.ssr ? 'on' : 'off') + '  bloom ' + (q.bloom ? 'on' : 'off') + '  fxaa ' +
         (q.fxaa ? 'on' : 'off')) : 'renderer quality unavailable',
@@ -1008,18 +1022,30 @@ let lastMs = 0;
 let fpsAccum = 0;
 let fpsFrames = 0;
 
+// Material classes in draw order. Opaque ground first, then the vertical stuff, then the
+// glazing: the same order the single merged meshes were drawn in, so the depth buffer sees the
+// same sequence and nothing about z-fighting or early-z changes.
+const DRAW_ORDER = ['terrain', 'roads', 'sidewalks', 'rails', 'buildings', 'glass', 'props'];
+
+// Shadow casters, from the tiles inside the cascade's reach. Towers, their glazing and the
+// street furniture cast; the ground plane and the ribbons only receive. `props` belongs in this
+// list: it carries the street trees, lamps, parked cars, signals, catenary poles and every
+// shelter and planter in the city, and in daylight every one of those throws a hard shadow onto
+// the pavement. Leaving it out was most of why the daylight street read flat.
+const CASTER_CLASSES = ['buildings', 'glass', 'props'];
+
+const _drawMesh = (m) => G.renderer.drawMesh(m);
+
 function renderScene() {
   const r = G.renderer;
-  const m = G.city.meshes;
+  const city = G.city;
+  // Whatever the cascades cover, plus a tile diagonal so a caster whose ORIGIN is outside the
+  // range but whose geometry reaches in still casts.
+  const shadowR = (r.shadow ? r.shadow.distance : 1250) + city.tiles.grid.size * 1.5;
+  r.setShadowCasters(city.tiles.casters(shadowR, CASTER_CLASSES).slice());
   r.beginFrame(G.camera);
-  r.drawMesh(m.terrain);
-  r.drawMesh(m.roads);
-  r.drawMesh(m.sidewalks);
-  r.drawMesh(m.rails);
-  r.drawMesh(m.buildings);
-  r.drawMesh(m.glass);
-  r.drawMesh(m.props);
-  r.drawWater(m.water, G.camera);
+  for (let i = 0; i < DRAW_ORDER.length; i++) city.tiles.forEachMesh(DRAW_ORDER[i], _drawMesh);
+  r.drawWater(city.meshes.water, G.camera);
   r.endFrame();
 }
 
@@ -1046,6 +1072,9 @@ function frame(tMs) {
   try {
     updatePlayer(input, dt);
     updateCamera(dt);
+
+    // Level of detail, culling, the geometry budget and eviction, before anything is drawn.
+    G.city.update(G.camera, t);
 
     if (!G.renderer.contextLost) {
       G.renderer.env.time = (G.renderer.env.time + dt) % 100000;
@@ -1116,30 +1145,21 @@ async function boot() {
   await nextFrame();
 
   G.city = await loadCity(gl, './data/toronto.json', (frac, label) => {
-    SHELL.setProgress(0.05 + clamp(fin(frac, 0), 0, 1) * 0.93, label || 'building the city');
+    SHELL.setProgress(0.05 + clamp(fin(frac, 0), 0, 1) * 0.72, label || 'building the city');
   });
   unproject = makeUnprojector(G.city.meta && G.city.meta.origin);
-
-  // Towers, their glazing and the street furniture cast; the ground plane and the ribbons only
-  // receive. `props` belongs in this list: it carries the 982 street trees, 2,062 lamps, 1,612
-  // parked cars, 360 signals, 1,110 catenary poles and every shelter and planter in the city, and
-  // at 15:20 with the sun 48 degrees up every one of those throws a hard shadow onto the pavement.
-  // Leaving it out was most of why the daylight street read flat: measured at Bathurst & Queen the
-  // carriageway came back 3.6 luma brighter and completely unbroken, with no tree or pole shadow
-  // anywhere in the frame. Adding it newly shadows 3.4-5.3% of a sunlit street.
-  //
-  // It is safe for the benchmark. The shadow factor only ever scales the DIRECT key term, and at
-  // blue hour and at night the key is a weak dusk fill that the props barely occlude: measured
-  // per band at three vantages, blue hour moves at most 0.11 luma and night at most 0.16, against
-  // the 3.6 the daylight roadway moves. Cost is one extra draw per cascade (~2.7 ms at 1440x900
-  // on an M1 Pro, which leaves the frame well clear of the 60 fps floor in CONTRACT section 4).
-  G.renderer.setShadowCasters([
-    G.city.meshes.buildings, G.city.meshes.glass, G.city.meshes.props,
-  ]);
 
   goToViewpoint(0);
   updateCamera(0.016);
   sizeCanvases();
+
+  // The camera has to exist before the tiles can: what gets built is a function of where the
+  // player is standing. Everything outside this first ring arrives while the title screen is up
+  // and, after that, a few milliseconds at a time inside the frame loop.
+  await G.city.warm(G.camera, 2600, (f) => {
+    SHELL.setProgress(0.77 + clamp(fin(f, 0), 0, 1) * 0.21, 'building the city around you');
+  });
+  G.city.update(G.camera, nowMs());
 
   // One frame before the title screen appears, so the overlay sits over the real skyline.
   if (!G.renderer.contextLost) renderScene();
@@ -1147,6 +1167,10 @@ async function boot() {
   SHELL.setProgress(1, 'ready');
   await nextFrame(20);
 
+  // Page load to the first interactive frame, measured from navigation start. Reported because
+  // it is the number that actually changed when the city became tiled, and the only honest place
+  // to take it is here, in the real page, in a visible tab.
+  G.bootMs = nowMs();
   G.ready = true;
   SHELL.hideLoading();
   SHELL.showTitle();
@@ -1179,8 +1203,9 @@ async function boot() {
   G.running = true;
   scheduleFrame();
 
-  console.log('[toronto] ready — ' + G.city.stats.buildings + ' buildings, ' +
-    G.city.stats.verts.toLocaleString() + ' vertices. window.G is live.');
+  console.log('[toronto] ready in ' + (G.bootMs / 1000).toFixed(2) + ' s — ' +
+    G.city.stats.buildings + ' buildings over ' + G.city.stats.tileCount + ' tiles, ' +
+    G.city.stats.verts.toLocaleString() + ' vertices resident. window.G is live.');
 }
 
 boot().catch((err) => {

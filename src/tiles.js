@@ -1,0 +1,616 @@
+// src/tiles.js — the spatial tile grid, the lazy per-tile geometry cache and its scheduler.
+//
+// WHY THIS EXISTS. The city used to be one merged mesh per material class: 18 draw calls, and
+// every footprint triangulated before the first frame. That works at 7 km2. At the current 43 km2
+// it is 21.5 M vertices — 1.1 GB of vertex data in eight buffers, several seconds of blocking
+// generation, and a shadow pass that redraws the whole city three times per frame. At the full
+// city (~428,000 buildings, about 23x this) it is not close.
+//
+// So geometry is partitioned into a fixed grid of square tiles and built on demand:
+//
+//   * a feature is indexed into exactly ONE tile — the one holding its anchor — and the tile's
+//     draw box grows to contain it. Nothing is clipped, nothing is duplicated, so there is no
+//     seam to get wrong. Linear features longer than a tile are cut into per-tile runs upstream
+//     (see city.js splitRuns) before they ever reach this file.
+//   * each tile builds in STAGES, cheapest first. Stage 0 is massing — the silhouette and the
+//     ground, what a tower two kilometres away actually contributes. Stage 1 is everything you
+//     can only see from the pavement. A tile that drops out of detail range frees stage 1 and
+//     keeps stage 0, so walking away from a block costs nothing to walk back into.
+//   * builds run as GENERATORS pumped against a per-frame millisecond budget, so a dense tile
+//     costs several partial frames instead of one 60 ms hitch.
+//   * geometry is evicted by least-recently-drawn once the resident vertex count passes a cap,
+//     and the GL buffers really are deleted.
+//
+// Determinism is the tiling contract: a tile's content must not depend on which of its
+// neighbours happen to be resident, or on the order tiles were built in. city.js keys every
+// procedural hash on world position and seeds each tile's RNG from the tile's own coordinates,
+// so a tile built alone is byte-identical to the same tile built last.
+//
+// Zero dependencies.
+
+import { MeshBuilder } from './gl.js';
+
+/* ================================================================ constants == */
+
+// Tile edge, metres. Measured choice, not a guess:
+//   * 25 m is the terrain sample pitch, so the edge must be a whole number of terrain cells or
+//     the ground mesh cannot be split without either cracks or double-emitted cells. 625 = 25 x 25.
+//   * bigger tiles mean fewer draw calls but a coarser detail radius: at 1000 m a pedestrian
+//     standing anywhere loads 4 km2 of street furniture.
+//   * smaller tiles mean tighter culling but more draw calls: at 384 m a 3.5 km view is ~190
+//     tiles and, at three populated classes each, ~570 draw calls before any detail.
+//   625 m puts a 3.5 km view at ~30 tiles and a street-level detail set at 4-9 tiles.
+export const TILE_SIZE = 625;
+
+const STATE_EMPTY = 0;
+const STATE_BUILDING = 1;
+const STATE_READY = 2;
+
+// A pooled MeshBuilder that has grown past this is released instead of reused, so one dense
+// downtown tile does not leave 7 oversized scratch buffers pinned for the rest of the session.
+const POOL_MAX_FLOATS = 1 << 21;      // 2 M floats = 8 MB per class
+
+const EPS = 1e-9;
+
+/* ==================================================================== grid == */
+
+/**
+ * A fixed grid over the world. `margin` is how far outside the data extent tiles still exist,
+ * so features that spill past the bounding box (the synthesised surround, a road that leaves
+ * the extract) still land somewhere real.
+ */
+export function makeTileGrid(extent, size = TILE_SIZE, margin = 400) {
+  const ex = (extent && Number.isFinite(extent.x)) ? extent.x : 3141.7;
+  const ez = (extent && Number.isFinite(extent.z)) ? extent.z : 2226.4;
+  const s = Math.max(50, size);
+  const x0 = -ex / 2 - margin;
+  const z0 = -ez / 2 - margin;
+  const nx = Math.max(1, Math.ceil((ex + margin * 2) / s));
+  const nz = Math.max(1, Math.ceil((ez + margin * 2) / s));
+  const tiles = new Array(nx * nz);
+
+  for (let j = 0; j < nz; j++) {
+    for (let i = 0; i < nx; i++) {
+      const id = j * nx + i;
+      tiles[id] = {
+        id, i, j,
+        // Core cell: what the level-of-detail distance is measured against. Deliberately NOT the
+        // draw box — a 1.9 km arterial anchored here must not drag the whole tile's street
+        // furniture into range from the far end of the road.
+        cx0: x0 + i * s, cz0: z0 + j * s,
+        cx1: x0 + (i + 1) * s, cz1: z0 + (j + 1) * s,
+        mx: x0 + (i + 0.5) * s, mz: z0 + (j + 0.5) * s,
+        // Draw box: grown to contain every feature indexed here. Frustum culling uses this.
+        bx0: Infinity, bz0: Infinity, by0: Infinity,
+        bx1: -Infinity, bz1: -Infinity, by1: -Infinity,
+        empty: true,
+        st: null,          // per-stage cache, allocated by the manager
+        dist: 0, visible: false, lastSeen: 0,
+      };
+    }
+  }
+
+  return {
+    size: s, x0, z0, nx, nz, count: nx * nz, tiles,
+    ci(x) {
+      const i = Math.floor((x - x0) / s);
+      return i < 0 ? 0 : (i >= nx ? nx - 1 : i);
+    },
+    cj(z) {
+      const j = Math.floor((z - z0) / s);
+      return j < 0 ? 0 : (j >= nz ? nz - 1 : j);
+    },
+    // The tile that OWNS this point.
+    at(x, z) {
+      const fx = Number.isFinite(x) ? x : 0;
+      const fz = Number.isFinite(z) ? z : 0;
+      return tiles[this.cj(fz) * nx + this.ci(fx)];
+    },
+    idAt(x, z) {
+      const fx = Number.isFinite(x) ? x : 0;
+      const fz = Number.isFinite(z) ? z : 0;
+      return this.cj(fz) * nx + this.ci(fx);
+    },
+    // Grow a tile's draw box. Called once per indexed feature.
+    cover(tile, x0b, z0b, x1b, z1b, y0b, y1b) {
+      if (!tile) return;
+      if (x0b < tile.bx0) tile.bx0 = x0b;
+      if (z0b < tile.bz0) tile.bz0 = z0b;
+      if (x1b > tile.bx1) tile.bx1 = x1b;
+      if (z1b > tile.bz1) tile.bz1 = z1b;
+      if (Number.isFinite(y0b) && y0b < tile.by0) tile.by0 = y0b;
+      if (Number.isFinite(y1b) && y1b > tile.by1) tile.by1 = y1b;
+      tile.empty = false;
+    },
+    // Every tile that has nothing indexed in it still needs a legal box, or the culler compares
+    // against infinities and a NaN quietly makes it visible forever.
+    seal(defaultY0, defaultY1) {
+      for (let k = 0; k < tiles.length; k++) {
+        const t = tiles[k];
+        if (t.bx0 > t.bx1) { t.bx0 = t.cx0; t.bx1 = t.cx1; t.bz0 = t.cz0; t.bz1 = t.cz1; }
+        if (!(t.by0 <= t.by1)) { t.by0 = defaultY0; t.by1 = defaultY1; }
+        // Never let a box be thinner than the cell it sits in: a tile holding one flagpole is
+        // still a square of ground.
+        if (t.bx0 > t.cx0) t.bx0 = t.cx0;
+        if (t.bz0 > t.cz0) t.bz0 = t.cz0;
+        if (t.bx1 < t.cx1) t.bx1 = t.cx1;
+        if (t.bz1 < t.cz1) t.bz1 = t.cz1;
+      }
+    },
+  };
+}
+
+/**
+ * Cut a polyline into runs of consecutive segments that belong to the same tile, so a 1.9 km
+ * arterial is not one indivisible lump of geometry anchored at its midpoint.
+ *
+ * A segment belongs to the tile holding its midpoint; a run is a maximal stretch of segments
+ * with the same owner. The cut lands on a shared vertex, so the two runs meet exactly.
+ * `visit(tileId, k0, k1)` gets the vertex range [k0, k1] (inclusive) of each run.
+ */
+export function splitRuns(grid, pts, visit) {
+  const n = pts ? pts.length : 0;
+  if (n < 2) return 0;
+  let runs = 0;
+  let k0 = 0;
+  let owner = grid.idAt((pts[0][0] + pts[1][0]) * 0.5, (pts[0][1] + pts[1][1]) * 0.5);
+  for (let k = 1; k < n - 1; k++) {
+    const id = grid.idAt((pts[k][0] + pts[k + 1][0]) * 0.5, (pts[k][1] + pts[k + 1][1]) * 0.5);
+    if (id === owner) continue;
+    visit(owner, k0, k);
+    runs++;
+    k0 = k;
+    owner = id;
+  }
+  visit(owner, k0, n - 1);
+  return runs + 1;
+}
+
+/* ============================================================== frustum ==== */
+
+// Six clip planes from a column-major view-projection matrix (Gribb & Hartmann), normalised so
+// the plane test is a real signed distance and the box test can use the box's half-extent.
+function extractPlanes(m, out) {
+  const p = [
+    [m[3] + m[0], m[7] + m[4], m[11] + m[8], m[15] + m[12]],   // left
+    [m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]],   // right
+    [m[3] + m[1], m[7] + m[5], m[11] + m[9], m[15] + m[13]],   // bottom
+    [m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]],   // top
+    [m[3] + m[2], m[7] + m[6], m[11] + m[10], m[15] + m[14]],  // near
+    [m[3] - m[2], m[7] - m[6], m[11] - m[10], m[15] - m[14]],  // far
+  ];
+  for (let i = 0; i < 6; i++) {
+    const a = p[i][0], b = p[i][1], c = p[i][2];
+    const l = Math.sqrt(a * a + b * b + c * c);
+    const inv = l > EPS ? 1 / l : 0;
+    out[i * 4] = a * inv;
+    out[i * 4 + 1] = b * inv;
+    out[i * 4 + 2] = c * inv;
+    out[i * 4 + 3] = p[i][3] * inv;
+  }
+  return out;
+}
+
+function boxOutside(pl, x0, y0, z0, x1, y1, z1) {
+  for (let i = 0; i < 24; i += 4) {
+    const a = pl[i], b = pl[i + 1], c = pl[i + 2], d = pl[i + 3];
+    // Farthest corner along the plane normal. If even that is behind, the box is outside.
+    const px = a >= 0 ? x1 : x0;
+    const py = b >= 0 ? y1 : y0;
+    const pz = c >= 0 ? z1 : z0;
+    if (a * px + b * py + c * pz + d < 0) return true;
+  }
+  return false;
+}
+
+function boxDist(px, py, pz, x0, y0, z0, x1, y1, z1) {
+  const dx = px < x0 ? x0 - px : (px > x1 ? px - x1 : 0);
+  const dy = py < y0 ? y0 - py : (py > y1 ? py - y1 : 0);
+  const dz = pz < z0 ? z0 - pz : (pz > z1 ? pz - z1 : 0);
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+/* ============================================================== manager ==== */
+
+/**
+ * Owns every tile's GPU geometry: what is built, what is being built, what is drawn and what is
+ * thrown away.
+ *
+ * opts:
+ *   gl          WebGL2 context
+ *   grid        makeTileGrid() result
+ *   classes     material-class names, in draw order — one merged mesh per class PER TILE
+ *   stages      [{ name, range, drop }] cheapest first; `range` is the metres from the camera at
+ *               which the stage is wanted and `drop` (> range) where it is released
+ *   build       function* (tile, stageIndex, mb) — city.js's per-tile generator
+ *   vertexCap   resident-vertex ceiling; eviction runs until the total is back under it
+ *   budgetMs    milliseconds per frame the scheduler may spend generating geometry
+ *   evictMs     how long a tile may go undrawn before its geometry is released anyway
+ */
+export class TileManager {
+  constructor(opts) {
+    const o = opts || {};
+    this.gl = o.gl;
+    this.grid = o.grid;
+    this.classes = (o.classes || []).slice();
+    this.stages = (o.stages || []).map((s) => ({
+      name: s.name || 'stage',
+      range: Number.isFinite(s.range) ? s.range : 1000,
+      drop: Number.isFinite(s.drop) ? s.drop : (Number.isFinite(s.range) ? s.range * 1.3 : 1300),
+    }));
+    this.build = typeof o.build === 'function' ? o.build : null;
+    this.vertexCap = Number.isFinite(o.vertexCap) ? o.vertexCap : 9000000;
+    this.budgetMs = Number.isFinite(o.budgetMs) ? o.budgetMs : 4.0;
+    this.evictMs = Number.isFinite(o.evictMs) ? o.evictMs : 12000;
+    this.maxQueue = Number.isFinite(o.maxQueue) ? o.maxQueue : 512;
+
+    const nStage = this.stages.length;
+    const tiles = this.grid.tiles;
+    for (let k = 0; k < tiles.length; k++) {
+      const st = new Array(nStage);
+      for (let s = 0; s < nStage; s++) {
+        st[s] = { state: STATE_EMPTY, meshes: {}, verts: 0, lastWant: 0 };
+      }
+      tiles[k].st = st;
+    }
+
+    this._planes = new Float32Array(24);
+    this._pool = null;
+    this._job = null;
+    this._queue = [];
+    this._visible = [];
+    this._casters = [];
+    this._now = 0;
+
+    this.stats = {
+      residentVerts: 0, residentTiles: 0, visibleTiles: 0, drawMeshes: 0,
+      built: 0, evicted: 0, evictedVerts: 0, queued: 0, buildMs: 0, lastBuildMs: 0,
+      peakResidentVerts: 0, uploads: 0, freed: 0,
+    };
+  }
+
+  get visibleTiles() { return this._visible; }
+
+  /** Tile stages wanted but not yet built, as of the last frame(). */
+  get pending() { return this._queue.length + (this._job ? 1 : 0); }
+
+  /** Spend `ms` generating geometry right now. The loader uses this; the frame loop does not. */
+  pump(ms) {
+    const clock = (typeof performance !== 'undefined' && performance.now)
+      ? () => performance.now() : () => Date.now();
+    return this._pump(Math.max(0, ms), clock);
+  }
+
+  /* ------------------------------------------------------------- builders */
+
+  _builders() {
+    if (!this._pool) {
+      this._pool = {};
+      for (let i = 0; i < this.classes.length; i++) this._pool[this.classes[i]] = new MeshBuilder();
+    }
+    const mb = this._pool;
+    for (let i = 0; i < this.classes.length; i++) mb[this.classes[i]].reset();
+    return mb;
+  }
+
+  _recyclePool() {
+    const mb = this._pool;
+    if (!mb) return;
+    for (let i = 0; i < this.classes.length; i++) {
+      const c = this.classes[i];
+      // A builder that grew for one dense tile keeps that buffer forever otherwise.
+      if (mb[c]._data.length > POOL_MAX_FLOATS) mb[c] = new MeshBuilder();
+    }
+  }
+
+  /* ------------------------------------------------------------ residency */
+
+  _release(tile, stage) {
+    const rec = tile.st[stage];
+    if (rec.state === STATE_EMPTY) return 0;
+    let freed = 0;
+    for (const name in rec.meshes) {
+      const m = rec.meshes[name];
+      if (!m) continue;
+      freed += m.vertexCount | 0;
+      m.dispose();                  // deletes the VAO and the VBO; nothing else holds either
+      this.stats.freed++;
+    }
+    rec.meshes = {};
+    rec.verts = 0;
+    rec.state = STATE_EMPTY;
+    this.stats.residentVerts -= freed;
+    if (this.stats.residentVerts < 0) this.stats.residentVerts = 0;
+    return freed;
+  }
+
+  /** Drop every stage of a tile. Returns the vertices freed. */
+  releaseTile(tile) {
+    let freed = 0;
+    for (let s = 0; s < tile.st.length; s++) freed += this._release(tile, s);
+    return freed;
+  }
+
+  /* ---------------------------------------------------------------- build */
+
+  _wantStage(tile, s) {
+    // Stage 0 gates every later one: massing is what a tile IS, and detail proud of a wall that
+    // was never emitted would float in space.
+    for (let k = 0; k <= s; k++) {
+      if (tile.dist > this.stages[k].range) return false;
+    }
+    return !tile.empty;
+  }
+
+  _keepStage(tile, s) {
+    for (let k = 0; k <= s; k++) {
+      if (tile.dist > this.stages[k].drop) return false;
+    }
+    return true;
+  }
+
+  _startJob(tile, stage) {
+    const mb = this._builders();
+    let it = null;
+    try {
+      it = this.build(tile, stage, mb);
+    } catch (err) {
+      tile.st[stage].state = STATE_READY;   // a tile that throws must not be retried forever
+      console.error('[tiles] build ' + tile.i + ',' + tile.j + ' stage ' + stage + ' threw', err);
+      return null;
+    }
+    tile.st[stage].state = STATE_BUILDING;
+    return { tile, stage, mb, it, t0: 0 };
+  }
+
+  _finishJob(job) {
+    const gl = this.gl;
+    const rec = job.tile.st[job.stage];
+    const mb = job.mb;
+    let verts = 0;
+    for (let i = 0; i < this.classes.length; i++) {
+      const c = this.classes[i];
+      const n = mb[c].count;
+      if (n <= 0) continue;
+      rec.meshes[c] = mb[c].build(gl);
+      verts += n;
+      this.stats.uploads++;
+    }
+    rec.verts = verts;
+    rec.state = STATE_READY;
+    this.stats.residentVerts += verts;
+    if (this.stats.residentVerts > this.stats.peakResidentVerts) {
+      this.stats.peakResidentVerts = this.stats.residentVerts;
+    }
+    this.stats.built++;
+    this._recyclePool();
+  }
+
+  /** Pump the current job (and start new ones) until `budget` ms are spent. */
+  _pump(budget, clock) {
+    const t0 = clock();
+    let spent = 0;
+    let guard = 0;
+    while (spent < budget && guard++ < 4096) {
+      if (!this._job) {
+        if (!this._queue.length || !this.build) break;
+        const next = this._queue.shift();
+        const rec = next.tile.st[next.stage];
+        if (rec.state !== STATE_EMPTY) continue;
+        // The queue is built from last frame's distances; a tile that has since fallen out of
+        // range must not be built just because it was queued.
+        if (!this._wantStage(next.tile, next.stage)) continue;
+        this._job = this._startJob(next.tile, next.stage);
+        if (!this._job) continue;
+      }
+      const job = this._job;
+      let done = false;
+      try {
+        done = job.it.next().done === true;
+      } catch (err) {
+        console.error('[tiles] build ' + job.tile.i + ',' + job.tile.j + ' threw', err);
+        done = true;
+      }
+      if (done) {
+        this._finishJob(job);
+        this._job = null;
+      }
+      spent = clock() - t0;
+    }
+    this.stats.lastBuildMs = spent;
+    this.stats.buildMs += spent;
+    return spent;
+  }
+
+  /* ------------------------------------------------------------- eviction */
+
+  /**
+   * Two rules, in order.
+   *
+   *  1. A stage that has been OUT OF RANGE for longer than `evictMs` goes, always. The grace
+   *     period is what makes turning round on the spot free — and it has to be measured against
+   *     when the stage was last *wanted*, not when the tile was last *drawn*. Measuring it
+   *     against drawing looks right and is a churn machine: a tile directly behind the camera is
+   *     in range, so it is queued and built, but never in the frustum, so it goes stale and is
+   *     thrown away — measured at 120 builds and 120 evictions a second with the camera
+   *     standing still.
+   *  2. If the resident total is over the cap, the FURTHEST stages go until it is back under,
+   *     detail before massing. Distance is the right key here and staleness is not: everything
+   *     still in range was wanted this frame, so they all share one timestamp.
+   */
+  _evict(needVerts) {
+    const tiles = this.grid.tiles;
+    let freed = 0;
+    const over = [];
+    for (let k = 0; k < tiles.length; k++) {
+      const t = tiles[k];
+      for (let s = t.st.length - 1; s >= 0; s--) {
+        const rec = t.st[s];
+        if (rec.state !== STATE_READY) continue;
+        if (!this._keepStage(t, s)) {
+          if (this._now - rec.lastWant > this.evictMs) {
+            const n = this._release(t, s);
+            freed += n;
+            this.stats.evicted++;
+            this.stats.evictedVerts += n;
+            continue;
+          }
+        }
+        // Ranked by DISTANCE first — the furthest geometry is the least useful — with the stage
+        // only breaking ties, so memory pressure never strips the detail off the block the
+        // player is standing on while a tile five kilometres away keeps its massing.
+        if (needVerts > 0) over.push(t, s, t.dist * 4 + s);
+      }
+    }
+    if (needVerts <= 0 || freed >= needVerts) return freed;
+    const idx = [];
+    for (let i = 0; i < over.length; i += 3) idx.push(i);
+    idx.sort((a, b) => over[b + 2] - over[a + 2]);
+    for (let i = 0; i < idx.length && freed < needVerts; i++) {
+      const k = idx[i];
+      const rec = over[k].st[over[k + 1]];
+      if (rec.state !== STATE_READY) continue;
+      const n = this._release(over[k], over[k + 1]);
+      freed += n;
+      this.stats.evicted++;
+      this.stats.evictedVerts += n;
+    }
+    return freed;
+  }
+
+  /* ----------------------------------------------------------------- frame */
+
+  /**
+   * One frame of housekeeping: distances, culling, stage decisions, the build budget and
+   * eviction. Call before drawing. `budgetMs` overrides the constructor budget (the loader
+   * passes a large one).
+   */
+  frame(camera, nowMs, budgetMs) {
+    const clock = (typeof performance !== 'undefined' && performance.now)
+      ? () => performance.now() : () => Date.now();
+    this._now = Number.isFinite(nowMs) ? nowMs : clock();
+    const cam = camera;
+    const pos = cam ? cam.pos : null;
+    const px = pos ? pos[0] : 0, py = pos ? pos[1] : 0, pz = pos ? pos[2] : 0;
+    const pl = this._planes;
+    if (cam && cam.viewProj) extractPlanes(cam.viewProj, pl);
+
+    const tiles = this.grid.tiles;
+    const vis = this._visible;
+    vis.length = 0;
+    this._queue.length = 0;
+    let resident = 0;
+    let meshes = 0;
+
+    const maxRange = this.stages.length ? this.stages[0].drop : 0;
+    for (let k = 0; k < tiles.length; k++) {
+      const t = tiles[k];
+      // Level of detail is measured against the CORE cell (plus the tile's real height range),
+      // not the draw box, so one long feature cannot pull a whole tile into detail range.
+      t.dist = boxDist(px, py, pz, t.cx0, t.by0, t.cz0, t.cx1, t.by1, t.cz1);
+      let ready = false;
+      for (let s = 0; s < t.st.length; s++) {
+        if (t.st[s].state === STATE_READY) { resident += t.st[s].verts; ready = true; }
+      }
+      const inRange = t.dist <= maxRange;
+      const shown = ready && inRange && !boxOutside(pl, t.bx0, t.by0, t.bz0, t.bx1, t.by1, t.bz1);
+      t.visible = shown;
+      if (shown) {
+        t.lastSeen = this._now;
+        vis.push(t);
+        for (let s = 0; s < t.st.length; s++) {
+          const rec = t.st[s];
+          if (rec.state !== STATE_READY) continue;
+          for (const c in rec.meshes) if (rec.meshes[c]) meshes++;
+        }
+      }
+      if (!inRange || t.empty) continue;
+      for (let s = 0; s < t.st.length; s++) {
+        const rec = t.st[s];
+        // Stamped whether or not the stage is resident yet: this is "when was this wanted",
+        // which is what the eviction grace period has to be measured against.
+        if (this._keepStage(t, s)) rec.lastWant = this._now;
+        if (rec.state !== STATE_EMPTY) continue;
+        if (!this._wantStage(t, s)) continue;
+        this._queue.push({ tile: t, stage: s, key: t.dist + s * 100000 });
+      }
+    }
+
+    this.stats.residentVerts = resident;
+    this.stats.visibleTiles = vis.length;
+    this.stats.drawMeshes = meshes;
+    this.stats.queued = this._queue.length;
+
+    // Nearest first, and massing before detail so a tile always has a silhouette before it
+    // grows shopfronts.
+    vis.sort((a, b) => a.dist - b.dist);
+    if (this._queue.length > 1) this._queue.sort((a, b) => a.key - b.key);
+    if (this._queue.length > this.maxQueue) this._queue.length = this.maxQueue;
+
+    const budget = Number.isFinite(budgetMs) ? budgetMs : this.budgetMs;
+    if (budget > 0) this._pump(budget, clock);
+
+    let over = this.stats.residentVerts - this.vertexCap;
+    if (over > 0) this._evict(over);
+    else this._evict(0);           // still retire anything past evictMs, so memory comes back
+
+    let residentTiles = 0;
+    for (let k = 0; k < tiles.length; k++) {
+      const t = tiles[k];
+      for (let s = 0; s < t.st.length; s++) {
+        if (t.st[s].state === STATE_READY) { residentTiles++; break; }
+      }
+    }
+    this.stats.residentTiles = residentTiles;
+    return this;
+  }
+
+  /**
+   * Meshes that should cast shadows this frame: the named classes of every visible tile inside
+   * `radius`. The cascades only cover renderer.shadow.distance metres, so casting from the whole
+   * resident city is pure waste — and at 43 km2 it is three extra passes over 6 M vertices.
+   */
+  casters(radius, classNames) {
+    const out = this._casters;
+    out.length = 0;
+    const vis = this._visible;
+    for (let i = 0; i < vis.length; i++) {
+      const t = vis[i];
+      if (t.dist > radius) break;               // sorted nearest-first
+      for (let s = 0; s < t.st.length; s++) {
+        const rec = t.st[s];
+        if (rec.state !== STATE_READY) continue;
+        for (let c = 0; c < classNames.length; c++) {
+          const m = rec.meshes[classNames[c]];
+          if (m && m.vertexCount > 0) out.push(m);
+        }
+      }
+    }
+    return out;
+  }
+
+  /** Every resident mesh of one class on the visible tiles, nearest first. */
+  forEachMesh(cls, fn) {
+    const vis = this._visible;
+    for (let i = 0; i < vis.length; i++) {
+      const t = vis[i];
+      for (let s = 0; s < t.st.length; s++) {
+        const rec = t.st[s];
+        if (rec.state !== STATE_READY) continue;
+        const m = rec.meshes[cls];
+        if (m && m.vertexCount > 0) fn(m, t, s);
+      }
+    }
+  }
+
+  dispose() {
+    const tiles = this.grid.tiles;
+    for (let k = 0; k < tiles.length; k++) this.releaseTile(tiles[k]);
+    this._job = null;
+    this._queue.length = 0;
+    this._visible.length = 0;
+    this._pool = null;
+  }
+}
+
+export default { TILE_SIZE, makeTileGrid, splitRuns, TileManager };

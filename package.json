@@ -7,6 +7,7 @@
   "scripts": {
     "start": "python3 -m http.server 8123",
     "check": "for f in src/*.js; do node --check \"$f\" || exit 1; done && echo 'all modules parse'",
-    "build:city": "python3 tools/build_city.py && python3 tools/match_osm.py"
+    "build:city": "python3 tools/build_city.py && python3 tools/match_osm.py && python3 tools/pack_city.py",
+    "pack:city": "python3 tools/pack_city.py"
   }
 }

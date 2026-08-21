@@ -35,6 +35,9 @@ globalThis.fetch = async (url) => {
     headers: { get: (k) => (k.toLowerCase() === 'content-length' ? String(buf.length) : null) },
     body: null,
     async text() { return buf.toString('utf8'); },
+    async arrayBuffer() {
+      return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    },
   };
 };
 
@@ -49,7 +52,11 @@ const glStub = new Proxy({
   createBuffer: () => ({ id: nextId++ }),
   bindVertexArray: () => {},
   bindBuffer: () => {},
-  bufferData: (_t, data) => { uploads.push(data instanceof Float32Array ? data : new Float32Array(0)); },
+  // COPY. Real gl.bufferData copies immediately; the tile builder recycles one MeshBuilder per
+  // material class across every tile, so holding the subarray would alias the next tile's data.
+  bufferData: (_t, data) => {
+    uploads.push(data instanceof Float32Array ? new Float32Array(data) : new Float32Array(0));
+  },
   enableVertexAttribArray: () => {},
   vertexAttribPointer: () => {},
   deleteVertexArray: () => {},
@@ -100,14 +107,51 @@ const city = await loadCity(glStub, './data/toronto.json', (f, label) => {
 });
 const wallMs = Date.now() - t0;
 
-const names = Object.keys(city.meshes);
+// The city is TILED: loadCity() emits only the lake, and every other vertex is built on demand
+// by tiles.js. Build the whole map, every stage of every tile, so the audit sees the same
+// geometry a player would eventually see — and release each tile as it is measured, so the
+// harness does not have to hold 23 M vertices at once.
+const perClass = new Map();
+const feed = (name, data) => {
+  let a = perClass.get(name);
+  if (!a) { a = []; perClass.set(name, a); }
+  a.push(data);
+};
+feed('water', uploads[0] || new Float32Array(0));
+{
+  const tiles = city.tiles;
+  for (const t of tiles.grid.tiles) {
+    for (let s = 0; s < t.st.length; s++) {
+      if (t.st[s].state !== 0) continue;
+      const before = uploads.length;
+      const job = tiles._startJob(t, s);
+      if (!job) continue;
+      tiles._job = job;
+      for (let g = 0; g < 500000; g++) if (job.it.next().done) break;
+      tiles._finishJob(job);
+      tiles._job = null;
+      const created = Object.keys(t.st[s].meshes);
+      for (let i = 0; i < created.length; i++) feed(created[i], uploads[before + i]);
+      tiles._release(t, s);
+      uploads.length = before;
+    }
+  }
+}
+const names = [...perClass.keys()];
 const audits = [];
 let total = 0;
 for (let i = 0; i < names.length; i++) {
-  const a = auditMesh(names[i], uploads[i] || new Float32Array(0));
+  const parts = perClass.get(names[i]);
+  let n = 0;
+  for (const p of parts) n += p ? p.length : 0;
+  const merged = new Float32Array(n);
+  let o = 0;
+  for (const p of parts) { if (p) { merged.set(p, o); o += p.length; } }
+  const a = auditMesh(names[i], merged);
   audits.push(a);
   total += a.verts;
 }
+perClass.clear();
 
 const S = city.stats;
 const P = S.props || {};
@@ -126,9 +170,12 @@ check(audits.every((a) => a.badNormal === 0),
 check(audits.every((a) => a.badEmissive === 0),
   'profile-0 emissive in (0, 0.5) on ' + audits.filter((a) => a.badEmissive).map((a) => a.name + ':' + a.badEmissive).join(','));
 check(audits.every((a) => a.tinted === 0), 'tintable != 0 on static city geometry');
-// CONTRACT section 6.4 set this at ~6M for the street-detail pass; the people pass raised the
-// ceiling to ~7M, which is where it stays.
-check(total <= 7_000_000, 'vertex budget blown: ' + fmt(total));
+// The budget that matters is now RESIDENT vertices, not total vertices: the city is tiled and
+// streamed, so `total` above is every vertex the whole 43 km2 map can produce and no frame ever
+// holds more than tiles.js's cap. The cap is what has to hold.
+check(S.vertexCap > 0 && S.vertexCap <= 12_000_000,
+  'resident vertex cap is ' + fmt(S.vertexCap || 0) + ', expected <= 12M');
+soft(total <= 26_000_000, 'whole-map geometry is ' + fmt(total) + ' vertices');
 
 // The CN Tower tip and the tallest landmarks must be untouched.
 // The tower stands at local (114.2, +159.0) — SOUTH of the bbox centre, because 43.6426 N is

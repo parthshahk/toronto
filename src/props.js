@@ -148,6 +148,50 @@ const M = {
   navRed: [1.000, 0.140, 0.090, 0.80, 0, 0.35, 0],      // port-hand navigation light
   navGreen: [0.140, 1.000, 0.360, 0.80, 0, 0.35, 0],    // starboard-hand navigation light
   quayLamp: [1.000, 0.900, 0.740, 0.80, 0, 0.55, 0],    // lifebuoy-station lamp
+
+  // --- the islands and the airfield (the south half of the map) ------------
+  // The Toronto Islands are parkland and the airfield is mown grass and asphalt, so this set is
+  // deliberately warmer and greener than the downtown palette above. Same rules throughout:
+  // albedo and roughness only, profile 0, emissive 0 unless the surface is a real lamp.
+  sandDry: [0.148, 0.132, 0.101, 0, 0, 0.95, 0],        // dry beach sand, backshore
+  sandWet: [0.056, 0.050, 0.041, 0, 0, 0.58, 0],        // the swash zone, still wet
+  duneGrass: [0.048, 0.058, 0.032, 0, 0, 0.96, 0],      // marram on the back of the beach
+  hedgeLeaf: [0.024, 0.044, 0.026, 0, 0, 0.96, 0],      // clipped privet, denser than a canopy
+  bloomWarm: [0.190, 0.086, 0.034, 0, 0, 0.94, 0],      // bedding plants, the one warm accent
+  bloomCool: [0.078, 0.056, 0.140, 0, 0, 0.94, 0],
+  bloomPale: [0.185, 0.176, 0.150, 0, 0, 0.94, 0],
+  bedSoil: [0.030, 0.024, 0.019, 0, 0, 0.96, 0],        // turned bed, darker than path soil
+
+  aircraftWhite: [0.228, 0.231, 0.238, 0, 0, 0.32, 0],  // painted airframe
+  aircraftGrey: [0.116, 0.120, 0.127, 0, 0, 0.34, 0],   // unpainted panel, radome, nacelle
+  aircraftTrim: [0.020, 0.031, 0.056, 0, 0, 0.30, 0],   // cheatline and fin
+  cabinGlass: [0.015, 0.019, 0.025, 0, 0, 0.05, 0],
+  propBlade: [0.024, 0.025, 0.027, 0, 0, 0.28, 0],
+  hangarClad: [0.126, 0.129, 0.136, 0, 0, 0.50, 0],     // profiled steel sheet
+  hangarDoor: [0.094, 0.096, 0.102, 0, 0, 0.46, 0],
+  chainLink: [0.070, 0.073, 0.077, 0, 0, 0.62, 0],
+  windsockFlag: [0.310, 0.140, 0.021, 0, 0, 0.92, 0],
+
+  lightStone: [0.150, 0.147, 0.138, 0, 0, 0.86, 0],     // Gibraltar Point: limewashed rubble
+  lightTrim: [0.118, 0.030, 0.026, 0, 0, 0.58, 0],
+  ferryHull: [0.024, 0.038, 0.066, 0, 0, 0.42, 0],
+  ferryHouse: [0.212, 0.215, 0.221, 0, 0, 0.54, 0],
+  ferryDeck: [0.056, 0.058, 0.062, 0, 0, 0.74, 0],
+  rideRed: [0.215, 0.038, 0.032, 0, 0, 0.62, 0],        // Centreville fairground paint
+  rideCream: [0.205, 0.190, 0.150, 0, 0, 0.64, 0],
+  rideGold: [0.190, 0.145, 0.038, 0, 0, 0.40, 0],
+  shingle: [0.048, 0.044, 0.042, 0, 0, 0.92, 0],        // asphalt shingle on an island cottage
+  boardRail: [0.086, 0.062, 0.041, 0, 0, 0.88, 0],      // boardwalk handrail timber
+
+  // --- aeronautical and navigation emitters (emissive >= 0.50) ------------
+  // Amendment 7: these are the only new light sources in the south half. A runway edge light, a
+  // threshold bar and a lighthouse lantern are all genuine lamps; the renderer decides when.
+  runwayEdge: [1.000, 0.958, 0.880, 0.95, 0, 0.34, 0],
+  runwayGreen: [0.120, 1.000, 0.340, 0.92, 0, 0.34, 0], // threshold
+  runwayRed: [1.000, 0.120, 0.088, 0.92, 0, 0.34, 0],   // runway end
+  taxiBlue: [0.170, 0.350, 1.000, 0.85, 0, 0.34, 0],    // taxiway edge
+  approachLamp: [1.000, 0.972, 0.930, 1.00, 0, 0.28, 0],
+  lanternLight: [1.000, 0.902, 0.715, 1.00, 0, 0.18, 0],
 };
 
 const NEWSBOX_COLOURS = [
@@ -3039,4 +3083,831 @@ export function appendDolphin(mb, rng, x, y, z, r) {
     torusY(mb, px, by, pz, rad + 0.17, 0.052, 8, 3, a0);
   }
   if (typeof rng === 'function') rnd(rng);
+}
+
+/* ================================================ islands, airfield, ferry = */
+//
+// The south half of the map — the Toronto Islands, Billy Bishop and the harbour gaps — is a
+// different place from downtown and needs its own vocabulary: mature parkland trees rather than
+// street trees in pits, hedgerows and bedding, beach grass, boardwalk rails, the amusement park,
+// the lighthouse, aircraft, and the ferries that are the only way onto the islands.
+//
+// Amendment 7 still governs. The ONLY emitters below are genuine light sources: runway edge,
+// threshold and end lights, taxiway edge lights, the approach bars out over the Western Gap, and
+// the lighthouse lantern. Aircraft, hangars, hedges, sand and boats carry emissive 0.
+
+// Trunk plus a two-stage taper, taller and thicker than the street version. Shared by every
+// island tree species.
+function boughs(mb, rng, px, py, pz, sc, a, spread, rise, n) {
+  setMat(mb, rnd(rng) < 0.4 ? M.barkPale : M.bark);
+  for (let i = 0; i < n; i++) {
+    const ang = a + (i / n) * TAU + rr(rng, -0.42, 0.42);
+    beam(mb, px, py, pz,
+      px + Math.cos(ang) * spread * sc, py + rise * sc, pz + Math.sin(ang) * spread * sc,
+      0.062 * sc, 0.062 * sc, F_SIDES);
+  }
+}
+
+/**
+ * Mature parkland tree. `species`: 0 broadleaf (maple, oak — round crown), 1 cottonwood (tall,
+ * narrow, the island shelterbelts), 2 weeping willow (short bole, wide drooping crown).
+ *
+ * Bigger than appendParkTree and built for DISTANCE: these carry the islands' silhouette from
+ * two kilometres out, so the crown gets the vertices and the bole does not.
+ */
+export function appendCanopyTree(mb, rng, x, y, z, scale, species) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const sc = clamp(fin(scale, 1), 0.5, 3.4);
+  const sp = ((fin(species, 0) | 0) % 3 + 3) % 3;
+  const a = rr(rng, 0, TAU);
+  const leaf = rnd(rng) < 0.42 ? M.foliageWarm : (rnd(rng) < 0.52 ? M.foliageCool : M.foliage);
+
+  if (sp === 1) {
+    // Cottonwood / Lombardy poplar: a column. One tall bole and a narrow stack of clumps.
+    const h0 = 3.2 * sc, h1 = 4.4 * sc;
+    trunk(mb, rng, px, py, pz, 0.26 * sc, 0.19 * sc, 0.10 * sc, h0, h1);
+    setMat(mb, leaf);
+    for (let i = 0; i < 3; i++) {
+      const cy = py + h0 + h1 * (0.18 + i * 0.34);
+      const r = (1.05 - i * 0.22) * sc;
+      blob(mb, rng, px + rr(rng, -0.22, 0.22) * sc, cy, pz + rr(rng, -0.22, 0.22) * sc,
+        r, 1.35 * sc, r, 7);
+    }
+    return;
+  }
+  if (sp === 2) {
+    // Willow: a short heavy bole, then a wide crown whose clumps hang BELOW their attachment so
+    // the canopy sweeps down toward the water it always stands beside.
+    const h0 = 1.55 * sc, h1 = 1.30 * sc;
+    trunk(mb, rng, px, py, pz, 0.42 * sc, 0.30 * sc, 0.20 * sc, h0, h1);
+    boughs(mb, rng, px, py + h0 + h1 * 0.6, pz, sc, a, 1.05, 0.95, 3);
+    setMat(mb, leaf);
+    const cy = py + h0 + h1 + 0.55 * sc;
+    blob(mb, rng, px, cy, pz, 1.65 * sc, 1.05 * sc, 1.65 * sc, 8);
+    for (let i = 0; i < 4; i++) {
+      const ang = a + (i / 4) * TAU + rr(rng, -0.35, 0.35);
+      const off = rr(rng, 1.20, 1.95) * sc;
+      blob(mb, rng, px + Math.cos(ang) * off, cy - rr(rng, 0.55, 1.15) * sc,
+        pz + Math.sin(ang) * off,
+        rr(rng, 0.85, 1.25) * sc, rr(rng, 0.95, 1.45) * sc, rr(rng, 0.85, 1.25) * sc, 7);
+    }
+    return;
+  }
+  // Broadleaf: the default island canopy.
+  const h0 = 2.35 * sc, h1 = 2.55 * sc;
+  trunk(mb, rng, px, py, pz, 0.40 * sc, 0.27 * sc, 0.165 * sc, h0, h1);
+  boughs(mb, rng, px, py + h0 + h1 * 0.55, pz, sc, a, 1.15, 1.25, 2);
+  setMat(mb, leaf);
+  const cy = py + h0 + h1 + 0.60 * sc;
+  blob(mb, rng, px, cy + 0.35 * sc, pz, 1.95 * sc, 1.40 * sc, 1.95 * sc, 8);
+  for (let i = 0; i < 3; i++) {
+    const ang = a + (i / 3) * TAU + rr(rng, -0.40, 0.40);
+    const off = rr(rng, 1.10, 1.85) * sc;
+    blob(mb, rng, px + Math.cos(ang) * off, cy + rr(rng, -0.45, 0.85) * sc,
+      pz + Math.sin(ang) * off,
+      rr(rng, 1.05, 1.60) * sc, rr(rng, 0.80, 1.25) * sc, rr(rng, 1.05, 1.60) * sc, 7);
+  }
+}
+
+/**
+ * A run of clipped hedge along local Z. Built as a chain of overlapping lobes rather than one
+ * long box, because a hedge read end-on is a silhouette of bumps and a box is a wall.
+ * `len` is the run length, `h` the trimmed height, `w` the width.
+ */
+export function appendHedgeRun(mb, rng, x, y, z, yaw, len, h, w) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const L = clamp(fin(len, 6), 0.6, 90);
+  const H = clamp(fin(h, 1.35), 0.4, 3.4);
+  const W = clamp(fin(w, 0.85), 0.25, 3.0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const n = Math.max(1, Math.round(L / Math.max(0.9, W * 1.35)));
+
+  setMat(mb, M.hedgeLeaf);
+  for (let i = 0; i < n; i++) {
+    const lz = -L * 0.5 + L * ((i + 0.5) / n);
+    const bx = px + lz * s, bz = pz + lz * c;
+    const jitter = 0.88 + 0.24 * hash2(bx, bz);
+    blob(mb, rng, bx, py + H * 0.52 * jitter, bz,
+      W * 0.55, H * 0.54 * jitter, L / n * 0.78, 6);
+  }
+}
+
+/** A planted bed: turned soil, a low kerb of edging brick, and clumps of bedding in three hues. */
+export function appendFlowerBed(mb, rng, x, y, z, yaw, w, d) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const W = clamp(fin(w, 3), 0.5, 26);
+  const D = clamp(fin(d, 2), 0.5, 26);
+  const c = Math.cos(a), s = Math.sin(a);
+  const hw = W * 0.5, hd = D * 0.5;
+
+  setMat(mb, M.granite);
+  boxL(mb, px, py, pz, c, s, -hw, 0, -hd, hw, 0.11, hd, F_NOBOT);
+  setMat(mb, M.bedSoil);
+  quadUp(mb, px, py, pz, c, s, -hw + 0.10, -hd + 0.10, hw - 0.10, hd - 0.10, 0.14);
+
+  const n = clamp(Math.round(W * D * 0.55), 2, 18);
+  for (let i = 0; i < n; i++) {
+    const lx = rr(rng, -hw + 0.22, hw - 0.22);
+    const lz = rr(rng, -hd + 0.22, hd - 0.22);
+    const bx = px + lx * c + lz * s, bz = pz - lx * s + lz * c;
+    const u = rnd(rng);
+    setMat(mb, u < 0.42 ? M.bloomWarm : (u < 0.72 ? M.bloomCool : M.bloomPale));
+    blob(mb, rng, bx, py + 0.24, bz, 0.30, 0.16, 0.30, 5);
+  }
+}
+
+/** Marram tuft on the back of a beach. Cheap: three flat blades, no stem. */
+export function appendBeachGrass(mb, rng, x, y, z, scale) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const sc = clamp(fin(scale, 1), 0.3, 3.0);
+  setMat(mb, M.duneGrass);
+  const n = rnd(rng) < 0.5 ? 3 : 2;
+  for (let i = 0; i < n; i++) {
+    const ang = rr(rng, 0, TAU);
+    const lean = rr(rng, 0.18, 0.46) * sc;
+    beam(mb, px, py, pz,
+      px + Math.cos(ang) * lean, py + rr(rng, 0.44, 0.86) * sc, pz + Math.sin(ang) * lean,
+      0.085 * sc, 0.012, F_PLATEZ | F_PX | F_NX);
+  }
+}
+
+/** Timber picnic table with attached benches. Long axis along local Z. */
+export function appendPicnicTable(mb, rng, x, y, z, yaw) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const hl = rr(rng, 0.85, 1.05);
+
+  setMat(mb, M.woodSlat);
+  boxL(mb, px, py, pz, c, s, -0.38, 0.71, -hl, 0.38, 0.76, hl, F_NOBOT);
+  for (let k = 0; k < 2; k++) {
+    const sx = (k === 0 ? -1 : 1) * 0.62;
+    boxL(mb, px, py, pz, c, s, sx - 0.14, 0.43, -hl, sx + 0.14, 0.475, hl, F_NOBOT);
+  }
+  setMat(mb, M.galv);
+  for (let k = 0; k < 2; k++) {
+    const lz = (k === 0 ? -1 : 1) * (hl - 0.22);
+    beamL(mb, px, py, pz, c, s, -0.76, 0.0, lz, 0.34, 0.72, lz, 0.035, 0.035, F_ALL);
+    beamL(mb, px, py, pz, c, s, 0.76, 0.0, lz, -0.34, 0.72, lz, 0.035, 0.035, F_ALL);
+  }
+}
+
+/** Lifeguard chair: a tall timber seat on splayed legs, facing local +X (out to the water). */
+export function appendLifeguardChair(mb, x, y, z, yaw) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+
+  setMat(mb, M.woodSlat);
+  for (let i = 0; i < 4; i++) {
+    const sx = (i & 1) ? 0.42 : -0.42, sz = (i & 2) ? 0.42 : -0.42;
+    beamL(mb, px, py, pz, c, s, sx * 1.55, 0, sz * 1.55, sx, 1.72, sz, 0.045, 0.045, F_ALL);
+  }
+  boxL(mb, px, py, pz, c, s, -0.46, 1.72, -0.46, 0.46, 1.80, 0.46, F_NOBOT);
+  boxL(mb, px, py, pz, c, s, -0.50, 1.80, -0.46, -0.42, 2.52, 0.46, F_NOBOT);
+  setMat(mb, M.galv);
+  for (let k = 0; k < 2; k++) {
+    const sz = (k === 0 ? -1 : 1) * 0.46;
+    beamL(mb, px, py, pz, c, s, -0.46, 2.18, sz, 0.46, 2.18, sz, 0.026, 0.026, F_ALL);
+  }
+}
+
+/**
+ * Gibraltar Point Lighthouse: a tapered hexagonal rubble tower, a gallery, and a lantern that IS
+ * a light (Amendment 7 — a navigation light is a real emitter). `h` is the tower height to the
+ * gallery floor.
+ */
+export function appendLighthouse(mb, x, y, z, h) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const H = clamp(fin(h, 15.0), 5.0, 42.0);
+  const a = hash2(px, pz) * TAU;
+
+  setMat(mb, M.lightStone);
+  mb.cylinder(px, py - 0.30, pz, 3.05, 2.72, 1.10, 6, a, false);
+  mb.cylinder(px, py + 0.80, pz, 2.72, 1.62, H - 0.80, 6, a, false);
+  // Gallery: a corbelled deck ring, then the balustrade.
+  setMat(mb, M.granite);
+  mb.cylinder(px, py + H, pz, 1.72, 2.16, 0.42, 6, a, false);
+  discY(mb, px, py + H + 0.42, pz, 2.16, 6, a, true);
+  setMat(mb, M.lightTrim);
+  mb.cylinder(px, py + H + 0.42, pz, 2.10, 2.10, 0.86, 6, a, false);
+  // Lantern room: a glazed drum under a conical cap, with the light inside it.
+  setMat(mb, M.galv);
+  mb.cylinder(px, py + H + 1.28, pz, 1.44, 1.44, 0.16, 6, a, false);
+  setMat(mb, M.lanternLight);
+  mb.cylinder(px, py + H + 1.44, pz, 1.30, 1.30, 1.70, 6, a, false);
+  setMat(mb, M.lightTrim);
+  mb.cylinder(px, py + H + 3.14, pz, 1.52, 0.10, 1.15, 6, a, false);
+  mb.cylinder(px, py + H + 4.29, pz, 0.06, 0.03, 0.85, 4, a, false);
+}
+
+/**
+ * One airfield light on its frangible base. `kind`: 0 runway edge (white), 1 threshold (green),
+ * 2 runway end (red), 3 taxiway edge (blue). Genuine emitters, all four.
+ */
+export function appendRunwayLight(mb, x, y, z, kind) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const k = (fin(kind, 0) | 0);
+  const lens = k === 1 ? M.runwayGreen : (k === 2 ? M.runwayRed
+    : (k === 3 ? M.taxiBlue : M.runwayEdge));
+
+  setMat(mb, M.galv);
+  mb.cylinder(px, py, pz, 0.115, 0.075, 0.20, 4, 0.4, false);
+  setMat(mb, lens);
+  mb.cylinder(px, py + 0.20, pz, 0.085, 0.070, 0.135, 4, 0.4, false);
+  discY(mb, px, py + 0.335, pz, 0.070, 4, 0.4, true);
+}
+
+/**
+ * One bar of the approach lighting system, out over the water off a runway threshold. A frangible
+ * lattice mast carrying a crossbar of five lamps, at the height the bar has to be to stay level
+ * with the runway as the ground falls away under it.
+ */
+export function appendApproachMast(mb, x, y, z, yaw, h, lamps) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const H = clamp(fin(h, 3.0), 0.6, 22.0);
+  const n = clamp(fin(lamps, 5) | 0, 1, 9);
+  const c = Math.cos(a), s = Math.sin(a);
+
+  setMat(mb, M.galv);
+  mb.cylinder(px, py - 1.2, pz, 0.16, 0.11, H + 1.2, 5, a, false);
+  boxL(mb, px, py, pz, c, s, -0.07, H, -(n * 0.72) * 0.5, 0.07, H + 0.11, (n * 0.72) * 0.5,
+    F_NOBOT);
+  setMat(mb, M.approachLamp);
+  for (let i = 0; i < n; i++) {
+    const lz = (n === 1) ? 0 : (-(n - 1) * 0.36 + i * 0.72);
+    boxL(mb, px, py, pz, c, s, -0.11, H + 0.11, lz - 0.13, 0.11, H + 0.36, lz + 0.13, F_NOBOT);
+  }
+}
+
+/** Windsock on a mast. The sock hangs off local +X and tapers away from the mast. */
+export function appendWindsock(mb, x, y, z, yaw) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+
+  setMat(mb, M.galv);
+  mb.cylinder(px, py, pz, 0.13, 0.085, 6.4, 6, a, false);
+  boxL(mb, px, py, pz, c, s, -0.05, 6.20, -0.05, 0.72, 6.30, 0.05, F_NOBOT);
+  ringXY(mb, px, py, pz, c, s, 0.72, 5.90, 0, 0.42, 0.030, 6);
+  // Five bands: three orange, two white, tapering to the tail.
+  for (let i = 0; i < 5; i++) {
+    const x0 = 0.72 + i * 0.62, x1 = x0 + 0.62;
+    const r0 = 0.42 - i * 0.055, r1 = 0.42 - (i + 1) * 0.055;
+    setMat(mb, (i & 1) ? M.flagWhite : M.windsockFlag);
+    setL(0, x0, 5.90 - r0, -r0); setL(1, x1, 5.90 - r1, -r1);
+    setL(2, x0, 5.90 + r0, -r0); setL(3, x1, 5.90 + r1, -r1);
+    setL(4, x0, 5.90 - r0, r0); setL(5, x1, 5.90 - r1, r1);
+    setL(6, x0, 5.90 + r0, r0); setL(7, x1, 5.90 + r1, r1);
+    hullL(mb, px, py, pz, c, s, F_SIDES | F_PY | F_NY);
+  }
+}
+
+/**
+ * Aircraft hangar: a portal-framed steel shed with a shallow curved roof and a full-width sliding
+ * door on local -X. `w` is the door span, `d` the depth, `h` the eaves height.
+ */
+export function appendHangar(mb, rng, x, y, z, yaw, w, d, h) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const W = clamp(fin(w, 34), 6, 140);
+  const D = clamp(fin(d, 30), 6, 140);
+  const H = clamp(fin(h, 9.5), 3.5, 26);
+  const c = Math.cos(a), s = Math.sin(a);
+  const hw = W * 0.5, hd = D * 0.5;
+  const rise = clamp(H * 0.30, 1.2, 5.0);
+
+  // Walls to the eaves, open at the top so the roof can arch over them.
+  setMat(mb, M.hangarClad);
+  boxL(mb, px, py, pz, c, s, -hw, 0, -hd, hw, H, hd, F_PX | F_PZ | F_NZ);
+  // Curved roof, as a fan of quads across local Z with the crown over the middle.
+  const seg = 6;
+  const roofY = (t) => H + rise * Math.sin(Math.PI * clamp(t, 0, 1));
+  for (let i = 0; i < seg; i++) {
+    const t0 = i / seg, t1 = (i + 1) / seg;
+    const z0 = -hd + D * t0, z1 = -hd + D * t1;
+    quadL(mb, px, py, pz, c, s,
+      -hw, roofY(t1), z1, hw, roofY(t1), z1, hw, roofY(t0), z0, -hw, roofY(t0), z0);
+  }
+  // Gable infill above the eaves at each end.
+  for (let k = 0; k < 2; k++) {
+    const sx = (k === 0 ? -1 : 1) * hw;
+    for (let i = 0; i < seg; i++) {
+      const t0 = i / seg, t1 = (i + 1) / seg;
+      const z0 = -hd + D * t0, z1 = -hd + D * t1;
+      if (k === 0) {
+        quadL(mb, px, py, pz, c, s, sx, H, z0, sx, H, z1, sx, roofY(t1), z1, sx, roofY(t0), z0);
+      } else {
+        quadL(mb, px, py, pz, c, s, sx, H, z1, sx, H, z0, sx, roofY(t0), z0, sx, roofY(t1), z1);
+      }
+    }
+  }
+  // The door: a sliding leaf set, recessed a little so the head beam reads.
+  setMat(mb, M.hangarDoor);
+  const dh = H * 0.86;
+  quadNX(mb, px, py, pz, c, s, -hw + 0.14, 0.0, -hd + 0.35, dh, hd - 0.35);
+  setMat(mb, M.hangarClad);
+  quadNX(mb, px, py, pz, c, s, -hw, 0.0, -hd, H, -hd + 0.35);
+  quadNX(mb, px, py, pz, c, s, -hw, 0.0, hd - 0.35, H, hd);
+  quadNX(mb, px, py, pz, c, s, -hw, dh, -hd, H, hd);
+  // Door leaf joints, and the track above them.
+  setMat(mb, M.galv);
+  const leaves = Math.max(2, Math.round(W / 9));
+  for (let i = 1; i < leaves; i++) {
+    const lz = -hd + 0.35 + (D - 0.70) * (i / leaves);
+    boxL(mb, px, py, pz, c, s, -hw + 0.10, 0.0, lz - 0.055, -hw + 0.18, dh, lz + 0.055,
+      F_NX | F_PZ | F_NZ);
+  }
+  boxL(mb, px, py, pz, c, s, -hw + 0.02, dh, -hd, -hw + 0.24, dh + 0.24, hd, F_NOBOT);
+  if (typeof rng === 'function') rnd(rng);
+}
+
+/**
+ * Regional turboprop on the apron — the aircraft Billy Bishop is known for. High wing, T-tail,
+ * two nacelles with six-blade props. `len` is the fuselage length; the span follows from it.
+ * Origin is the nose-wheel contact point at the pavement, nose along local +X.
+ */
+export function appendAirliner(mb, rng, x, y, z, yaw, len) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const L = clamp(fin(len, 32.8), 12, 60);
+  const c = Math.cos(a), s = Math.sin(a);
+  const r = L * 0.041;                 // fuselage radius
+  const fy = L * 0.098;                // fuselage centreline above the pavement
+  const span = L * 0.87;
+
+  // Fuselage: four hull sections along local X, nose at +X.
+  const sect = (x0, x1, r0, r1, y0, y1, mat) => {
+    setMat(mb, mat);
+    setL(0, x0, y0 - r0, -r0); setL(1, x1, y1 - r1, -r1);
+    setL(2, x0, y0 + r0, -r0 * 0.92); setL(3, x1, y1 + r1, -r1 * 0.92);
+    setL(4, x0, y0 - r0, r0); setL(5, x1, y1 - r1, r1);
+    setL(6, x0, y0 + r0, r0 * 0.92); setL(7, x1, y1 + r1, r1 * 0.92);
+    hullL(mb, px, py, pz, c, s, F_SIDES | F_PY | F_NY);
+  };
+  sect(L * 0.44, L * 0.50, r * 0.78, r * 0.20, fy, fy + r * 0.16, M.aircraftGrey);   // radome
+  sect(L * 0.20, L * 0.44, r, r * 0.78, fy, fy, M.aircraftWhite);
+  sect(-L * 0.20, L * 0.20, r, r, fy, fy, M.aircraftWhite);
+  sect(-L * 0.42, -L * 0.20, r * 0.86, r, fy + r * 0.10, fy, M.aircraftWhite);
+  sect(-L * 0.50, -L * 0.42, r * 0.20, r * 0.86, fy + r * 0.55, fy + r * 0.10, M.aircraftWhite);
+
+  // Cheatline and cabin windows: one dark band each side, flush with the skin.
+  setMat(mb, M.cabinGlass);
+  quadPZ(mb, px, py, pz, c, s, r * 0.995, -L * 0.20, fy + r * 0.30, L * 0.34, fy + r * 0.56);
+  quadNZ(mb, px, py, pz, c, s, -r * 0.995, -L * 0.20, fy + r * 0.30, L * 0.34, fy + r * 0.56);
+  quadPZ(mb, px, py, pz, c, s, r * 0.72, L * 0.36, fy + r * 0.34, L * 0.45, fy + r * 0.70);
+  quadNZ(mb, px, py, pz, c, s, -r * 0.72, L * 0.36, fy + r * 0.34, L * 0.45, fy + r * 0.70);
+  setMat(mb, M.aircraftTrim);
+  quadPZ(mb, px, py, pz, c, s, r * 1.0, -L * 0.46, fy - r * 0.26, L * 0.44, fy - r * 0.10);
+  quadNZ(mb, px, py, pz, c, s, -r * 1.0, -L * 0.46, fy - r * 0.26, L * 0.44, fy - r * 0.10);
+
+  // High wing, one hull per side: swept a touch, tapered, with dihedral.
+  const wy = fy + r * 0.86;
+  setMat(mb, M.aircraftWhite);
+  for (let k = 0; k < 2; k++) {
+    const sg = k === 0 ? -1 : 1;
+    const tipZ = sg * span * 0.5;
+    setL(0, L * 0.10, wy - r * 0.13, 0); setL(1, -L * 0.10, wy - r * 0.13, 0);
+    setL(2, L * 0.10, wy + r * 0.13, 0); setL(3, -L * 0.10, wy + r * 0.13, 0);
+    setL(4, L * 0.055, wy + r * 0.22, tipZ); setL(5, -L * 0.035, wy + r * 0.22, tipZ);
+    setL(6, L * 0.055, wy + r * 0.36, tipZ); setL(7, -L * 0.035, wy + r * 0.36, tipZ);
+    hullL(mb, px, py, pz, c, s, k === 0 ? (F_ALL & ~F_PZ) : (F_ALL & ~F_NZ));
+  }
+
+  // Nacelles, spinners and props.
+  for (let k = 0; k < 2; k++) {
+    const sg = k === 0 ? -1 : 1;
+    const nz = sg * span * 0.175;
+    setMat(mb, M.aircraftGrey);
+    setL(0, -L * 0.13, wy - r * 0.46, nz - r * 0.34); setL(1, L * 0.16, wy - r * 0.30, nz - r * 0.30);
+    setL(2, -L * 0.13, wy + r * 0.16, nz - r * 0.34); setL(3, L * 0.16, wy + r * 0.22, nz - r * 0.30);
+    setL(4, -L * 0.13, wy - r * 0.46, nz + r * 0.34); setL(5, L * 0.16, wy - r * 0.30, nz + r * 0.30);
+    setL(6, -L * 0.13, wy + r * 0.16, nz + r * 0.34); setL(7, L * 0.16, wy + r * 0.22, nz + r * 0.30);
+    hullL(mb, px, py, pz, c, s, F_ALL);
+    const sx = L * 0.16, sy = wy - r * 0.04;
+    setMat(mb, M.aircraftTrim);
+    for (let i = 0; i < 3; i++) {
+      const th = hash2(px + nz, pz + i) * TAU + (i / 3) * TAU;
+      const bl = span * 0.115;
+      setMat(mb, M.propBlade);
+      beamL(mb, px, py, pz, c, s,
+        sx + 0.10, sy, nz,
+        sx + 0.10, sy + Math.cos(th) * bl, nz + Math.sin(th) * bl, 0.055, 0.16, F_ALL);
+      beamL(mb, px, py, pz, c, s,
+        sx + 0.10, sy, nz,
+        sx + 0.10, sy - Math.cos(th) * bl, nz - Math.sin(th) * bl, 0.055, 0.16, F_ALL);
+    }
+    setMat(mb, M.aircraftGrey);
+    setL(0, sx, sy - r * 0.24, nz - r * 0.24); setL(1, sx + L * 0.030, sy - r * 0.05, nz - r * 0.05);
+    setL(2, sx, sy + r * 0.24, nz - r * 0.24); setL(3, sx + L * 0.030, sy + r * 0.05, nz - r * 0.05);
+    setL(4, sx, sy - r * 0.24, nz + r * 0.24); setL(5, sx + L * 0.030, sy - r * 0.05, nz + r * 0.05);
+    setL(6, sx, sy + r * 0.24, nz + r * 0.24); setL(7, sx + L * 0.030, sy + r * 0.05, nz + r * 0.05);
+    hullL(mb, px, py, pz, c, s, F_ALL);
+  }
+
+  // T-tail: fin off the tail cone, stabiliser across the top of it.
+  const finTop = fy + r * 0.55 + L * 0.235;
+  setMat(mb, M.aircraftTrim);
+  setL(0, -L * 0.30, fy + r * 0.55, -r * 0.14); setL(1, -L * 0.47, fy + r * 0.55, -r * 0.14);
+  setL(2, -L * 0.40, finTop, -r * 0.08); setL(3, -L * 0.49, finTop, -r * 0.08);
+  setL(4, -L * 0.30, fy + r * 0.55, r * 0.14); setL(5, -L * 0.47, fy + r * 0.55, r * 0.14);
+  setL(6, -L * 0.40, finTop, r * 0.08); setL(7, -L * 0.49, finTop, r * 0.08);
+  hullL(mb, px, py, pz, c, s, F_ALL);
+  setMat(mb, M.aircraftWhite);
+  setL(0, -L * 0.385, finTop, 0); setL(1, -L * 0.495, finTop, 0);
+  setL(2, -L * 0.385, finTop + r * 0.16, 0); setL(3, -L * 0.495, finTop + r * 0.16, 0);
+  setL(4, -L * 0.405, finTop + r * 0.03, span * 0.145); setL(5, -L * 0.485, finTop + r * 0.03, span * 0.145);
+  setL(6, -L * 0.405, finTop + r * 0.15, span * 0.145); setL(7, -L * 0.485, finTop + r * 0.15, span * 0.145);
+  hullL(mb, px, py, pz, c, s, F_ALL);
+  setL(4, -L * 0.405, finTop + r * 0.03, -span * 0.145); setL(5, -L * 0.485, finTop + r * 0.03, -span * 0.145);
+  setL(6, -L * 0.405, finTop + r * 0.15, -span * 0.145); setL(7, -L * 0.485, finTop + r * 0.15, -span * 0.145);
+  hullL(mb, px, py, pz, c, s, F_ALL);
+
+  // Undercarriage: nose leg at the origin, main legs in the nacelles.
+  setMat(mb, M.chrome);
+  mb.cylinder(px + L * 0.40 * c, py + 0.30, pz - L * 0.40 * s, 0.075, 0.075, fy - r - 0.30, 4, a,
+    false);
+  setMat(mb, M.tyre);
+  discZ(mb, px + L * 0.40 * c, py, pz - L * 0.40 * s, c, s, 0, 0, 0.30, 0.30, 6);
+  for (let k = 0; k < 2; k++) {
+    const nz = (k === 0 ? -1 : 1) * span * 0.175;
+    const gx = -L * 0.02;
+    setMat(mb, M.chrome);
+    beamL(mb, px, py, pz, c, s, gx, wy - r * 0.40, nz, gx, 0.42, nz, 0.075, 0.075, F_ALL);
+    setMat(mb, M.tyre);
+    for (let w = 0; w < 2; w++) {
+      const wz = nz + (w ? 0.30 : -0.30);
+      discZ(mb, px + gx * c + wz * s, py, pz - gx * s + wz * c, c, s, 0, 0, 0.42, 0.42, 6);
+    }
+  }
+  if (typeof rng === 'function') rnd(rng);
+}
+
+/** Single-engine light aircraft on the general-aviation apron. Nose along local +X. */
+export function appendLightPlane(mb, rng, x, y, z, yaw) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const fy = 1.02;
+
+  setMat(mb, M.aircraftWhite);
+  setL(0, 2.10, fy - 0.52, -0.52); setL(1, -1.30, fy - 0.46, -0.44);
+  setL(2, 2.10, fy + 0.52, -0.46); setL(3, -1.30, fy + 0.46, -0.40);
+  setL(4, 2.10, fy - 0.52, 0.52); setL(5, -1.30, fy - 0.46, 0.44);
+  setL(6, 2.10, fy + 0.52, 0.46); setL(7, -1.30, fy + 0.46, 0.40);
+  hullL(mb, px, py, pz, c, s, F_ALL);
+  setL(0, -1.30, fy - 0.46, -0.44); setL(1, -4.05, fy - 0.02, -0.13);
+  setL(2, -1.30, fy + 0.46, -0.40); setL(3, -4.05, fy + 0.30, -0.13);
+  setL(4, -1.30, fy - 0.46, 0.44); setL(5, -4.05, fy - 0.02, 0.13);
+  setL(6, -1.30, fy + 0.46, 0.40); setL(7, -4.05, fy + 0.30, 0.13);
+  hullL(mb, px, py, pz, c, s, F_ALL);
+  setMat(mb, M.cabinGlass);
+  quadPZ(mb, px, py, pz, c, s, 0.525, 0.30, fy + 0.02, 1.70, fy + 0.50);
+  quadNZ(mb, px, py, pz, c, s, -0.525, 0.30, fy + 0.02, 1.70, fy + 0.50);
+  quadPX(mb, px, py, pz, c, s, 2.11, fy + 0.05, -0.42, fy + 0.50, 0.42);
+
+  // High wing with struts.
+  setMat(mb, M.aircraftWhite);
+  setL(0, 1.20, fy + 0.52, -5.50); setL(1, 0.10, fy + 0.52, -5.50);
+  setL(2, 1.20, fy + 0.68, -5.50); setL(3, 0.10, fy + 0.68, -5.50);
+  setL(4, 1.35, fy + 0.52, 5.50); setL(5, 0.05, fy + 0.52, 5.50);
+  setL(6, 1.35, fy + 0.68, 5.50); setL(7, 0.05, fy + 0.68, 5.50);
+  hullL(mb, px, py, pz, c, s, F_ALL);
+  setMat(mb, M.chrome);
+  for (let k = 0; k < 2; k++) {
+    const sg = k === 0 ? -1 : 1;
+    beamL(mb, px, py, pz, c, s, 0.40, fy - 0.42, sg * 0.42, 0.55, fy + 0.52, sg * 2.60,
+      0.035, 0.035, F_ALL);
+  }
+  // Fin and tailplane.
+  setMat(mb, M.aircraftTrim);
+  setL(0, -3.10, fy + 0.28, -0.06); setL(1, -4.05, fy + 0.30, -0.06);
+  setL(2, -3.60, fy + 1.55, -0.05); setL(3, -4.12, fy + 1.55, -0.05);
+  setL(4, -3.10, fy + 0.28, 0.06); setL(5, -4.05, fy + 0.30, 0.06);
+  setL(6, -3.60, fy + 1.55, 0.05); setL(7, -4.12, fy + 1.55, 0.05);
+  hullL(mb, px, py, pz, c, s, F_ALL);
+  setMat(mb, M.aircraftWhite);
+  boxL(mb, px, py, pz, c, s, -3.95, fy + 0.24, -1.70, -3.25, fy + 0.32, 1.70, F_ALL);
+  // Spinner, prop and gear.
+  setMat(mb, M.aircraftTrim);
+  mb.cylinder(px + 2.10 * c, py + fy, pz - 2.10 * s, 0.22, 0.06, 0.34, 5, a, false);
+  setMat(mb, M.propBlade);
+  const th = hash2(px, pz) * TAU;
+  for (let i = 0; i < 2; i++) {
+    const b = th + i * Math.PI;
+    beamL(mb, px, py, pz, c, s, 2.26, fy, 0, 2.26, fy + Math.cos(b) * 0.92,
+      Math.sin(b) * 0.92, 0.048, 0.11, F_ALL);
+  }
+  setMat(mb, M.chrome);
+  for (let k = 0; k < 2; k++) {
+    const sg = k === 0 ? -1 : 1;
+    beamL(mb, px, py, pz, c, s, 0.35, fy - 0.48, 0, 0.35, 0.26, sg * 1.15, 0.045, 0.045, F_ALL);
+  }
+  setMat(mb, M.tyre);
+  for (let k = 0; k < 2; k++) {
+    const wz = (k === 0 ? -1 : 1) * 1.15;
+    discZ(mb, px + 0.35 * c + wz * s, py, pz - 0.35 * s + wz * c, c, s, 0, 0, 0.26, 0.26, 6);
+  }
+  discZ(mb, px + 2.02 * c, py, pz - 2.02 * s, c, s, 0, 0, 0.20, 0.20, 5);
+  if (typeof rng === 'function') rnd(rng);
+}
+
+/**
+ * Chain-link perimeter fence along local Z: posts, a top rail, and the mesh as a single thin
+ * plate. `len` is the run, `h` the height. Long runs should be tiled rather than stretched.
+ */
+export function appendChainFence(mb, x, y, z, yaw, len, h) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const L = clamp(fin(len, 12), 0.5, 120);
+  const H = clamp(fin(h, 2.4), 0.6, 5.0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const hl = L * 0.5;
+
+  setMat(mb, M.chainLink);
+  boxL(mb, px, py, pz, c, s, -0.018, 0.06, -hl, 0.018, H - 0.10, hl, F_PLATEX);
+  boxL(mb, px, py, pz, c, s, -0.028, H - 0.10, -hl, 0.028, H - 0.042, hl, F_NOBOT);
+  setMat(mb, M.galv);
+  const n = Math.max(1, Math.round(L / 3.0));
+  for (let i = 0; i <= n; i++) {
+    const lz = -hl + L * (i / n);
+    mb.cylinder(px + lz * s, py, pz + lz * c, 0.048, 0.044, H, 4, a, false);
+  }
+  // Three strands of barbed wire on an outward-canted arm, which is what makes it read as an
+  // airfield boundary rather than a garden fence.
+  for (let i = 0; i < 3; i++) {
+    boxL(mb, px, py, pz, c, s, 0.06 + i * 0.085, H - 0.02 + i * 0.085, -hl,
+      0.078 + i * 0.085, H + 0.0 + i * 0.085, hl, F_PLATEX);
+  }
+}
+
+/**
+ * The island ferry. Double-ended, an open car deck forward, a passenger house amidships and a
+ * wheelhouse at each end — the shape of the Ongiara and the Sam McBride. Origin is the waterline
+ * at the hull centre, bow along local +Z.
+ */
+export function appendIslandFerry(mb, rng, x, y, z, yaw, len) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const L = clamp(fin(len, 45), 14, 90);
+  const c = Math.cos(a), s = Math.sin(a);
+  const hl = L * 0.5, bw = L * 0.185, draft = L * 0.048, fb = L * 0.075;
+
+  // Hull: a box amidships raked in at both ends, because she is double-ended.
+  setMat(mb, M.ferryHull);
+  setL(0, -bw * 0.62, -draft, -hl); setL(1, bw * 0.62, -draft, -hl);
+  setL(2, -bw * 0.80, fb, -hl); setL(3, bw * 0.80, fb, -hl);
+  setL(4, -bw * 0.62, -draft, -hl * 0.62); setL(5, bw * 0.62, -draft, -hl * 0.62);
+  setL(6, -bw, fb, -hl * 0.62); setL(7, bw, fb, -hl * 0.62);
+  hullL(mb, px, py, pz, c, s, F_ALL & ~F_PY);
+  setL(0, -bw * 0.62, -draft, -hl * 0.62); setL(1, bw * 0.62, -draft, -hl * 0.62);
+  setL(2, -bw, fb, -hl * 0.62); setL(3, bw, fb, -hl * 0.62);
+  setL(4, -bw * 0.62, -draft, hl * 0.62); setL(5, bw * 0.62, -draft, hl * 0.62);
+  setL(6, -bw, fb, hl * 0.62); setL(7, bw, fb, hl * 0.62);
+  hullL(mb, px, py, pz, c, s, F_ALL & ~F_PY);
+  setL(0, -bw * 0.62, -draft, hl * 0.62); setL(1, bw * 0.62, -draft, hl * 0.62);
+  setL(2, -bw, fb, hl * 0.62); setL(3, bw, fb, hl * 0.62);
+  setL(4, -bw * 0.62, -draft, hl); setL(5, bw * 0.62, -draft, hl);
+  setL(6, -bw * 0.80, fb, hl); setL(7, bw * 0.80, fb, hl);
+  hullL(mb, px, py, pz, c, s, F_ALL & ~F_PY);
+
+  // Main deck, then the passenger house on it.
+  setMat(mb, M.ferryDeck);
+  quadUp(mb, px, py, pz, c, s, -bw, -hl, bw, hl, fb);
+  const hy = fb + L * 0.072;
+  setMat(mb, M.ferryHouse);
+  boxL(mb, px, py, pz, c, s, -bw * 0.78, fb, -hl * 0.50, bw * 0.78, hy, hl * 0.30, F_NOBOT);
+  setMat(mb, M.cabinGlass);
+  quadPX(mb, px, py, pz, c, s, bw * 0.785, fb + L * 0.020, -hl * 0.46, hy - L * 0.014, hl * 0.26);
+  quadNX(mb, px, py, pz, c, s, -bw * 0.785, fb + L * 0.020, -hl * 0.46, hy - L * 0.014, hl * 0.26);
+  // Upper deck over the house, with a rail round it.
+  setMat(mb, M.ferryDeck);
+  boxL(mb, px, py, pz, c, s, -bw * 0.82, hy, -hl * 0.54, bw * 0.82, hy + L * 0.006, hl * 0.34,
+    F_NOBOT);
+  setMat(mb, M.galv);
+  for (let k = 0; k < 2; k++) {
+    const sx = (k === 0 ? -1 : 1) * bw * 0.80;
+    boxL(mb, px, py, pz, c, s, sx - 0.03, hy + L * 0.006, -hl * 0.54,
+      sx + 0.03, hy + L * 0.026, hl * 0.34, F_BLADEX);
+    boxL(mb, px, py, pz, c, s, sx - 0.03, fb + L * 0.020, -hl, sx + 0.03, fb + L * 0.040, hl,
+      F_BLADEX);
+  }
+  // A wheelhouse at each end and a single funnel.
+  setMat(mb, M.ferryHouse);
+  for (let k = 0; k < 2; k++) {
+    const sg = k === 0 ? -1 : 1;
+    const wz = sg * hl * 0.44;
+    boxL(mb, px, py, pz, c, s, -bw * 0.34, hy + L * 0.006, wz - L * 0.038,
+      bw * 0.34, hy + L * 0.058, wz + L * 0.038, F_NOBOT);
+    setMat(mb, M.cabinGlass);
+    quadPZ(mb, px, py, pz, c, s, wz + L * 0.0385, -bw * 0.30, hy + L * 0.024,
+      bw * 0.30, hy + L * 0.050);
+    quadNZ(mb, px, py, pz, c, s, wz - L * 0.0385, -bw * 0.30, hy + L * 0.024,
+      bw * 0.30, hy + L * 0.050);
+    setMat(mb, M.ferryHouse);
+  }
+  setMat(mb, M.ferryHull);
+  mb.cylinder(px, py + hy + L * 0.006, pz, L * 0.026, L * 0.022, L * 0.075, 6, a, false);
+  if (typeof rng === 'function') rnd(rng);
+}
+
+/**
+ * The Centreville carousel: a raised timber platform, a centre pole, a twelve-sided canopy with
+ * a scalloped valance, and a ring of mounts on brass poles. `r` is the platform radius.
+ */
+export function appendCarousel(mb, rng, x, y, z, r) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const R = clamp(fin(r, 9.0), 2.5, 20.0);
+  const a = hash2(px, pz) * TAU;
+
+  setMat(mb, M.granite);
+  mb.cylinder(px, py, pz, R + 0.55, R + 0.55, 0.34, 12, a, false);
+  discY(mb, px, py + 0.34, pz, R + 0.55, 12, a, true);
+  setMat(mb, M.woodSlat);
+  mb.cylinder(px, py + 0.34, pz, R, R, 0.22, 12, a, false);
+  discY(mb, px, py + 0.56, pz, R, 12, a, true);
+
+  setMat(mb, M.rideGold);
+  mb.cylinder(px, py + 0.56, pz, R * 0.085, R * 0.070, R * 0.70, 8, a, false);
+  // Canopy: a cone from the hub out to the eaves, with a red valance hanging off the rim.
+  setMat(mb, M.rideRed);
+  mb.cylinder(px, py + 0.56 + R * 0.52, pz, R * 1.02, R * 0.14, R * 0.30, 12, a, false);
+  setMat(mb, M.rideCream);
+  mb.cylinder(px, py + 0.56 + R * 0.40, pz, R * 1.05, R * 1.02, R * 0.12, 12, a, false);
+  discY(mb, px, py + 0.56 + R * 0.40, pz, R * 1.05, 12, a, false);
+
+  // Mounts: two rings of horses, each a body block on a brass pole.
+  for (let ring = 0; ring < 2; ring++) {
+    const rr0 = R * (ring === 0 ? 0.52 : 0.82);
+    const n = ring === 0 ? 8 : 12;
+    for (let i = 0; i < n; i++) {
+      const th = a + (i / n) * TAU + (ring ? 0.26 : 0);
+      const cx = px + Math.cos(th) * rr0, cz = pz + Math.sin(th) * rr0;
+      const bob = 0.20 + 0.34 * hash2(cx, cz);
+      setMat(mb, M.rideGold);
+      mb.cylinder(cx, py + 0.56, cz, 0.038, 0.038, R * 0.40, 4, th, false);
+      const c2 = Math.cos(th), s2 = Math.sin(th);
+      setMat(mb, rnd(rng) < 0.5 ? M.rideCream : M.rideRed);
+      boxL(mb, cx, py + 0.56 + bob, cz, c2, s2, -0.62, 0.42, -0.20, 0.62, 0.96, 0.20, F_NOBOT);
+      boxL(mb, cx, py + 0.56 + bob, cz, c2, s2, 0.36, 0.86, -0.14, 0.74, 1.38, 0.14, F_NOBOT);
+    }
+  }
+}
+
+/**
+ * Generic fairground ride structure, for the Centreville attractions the extract names but does
+ * not describe: a fenced pad, a machinery house, and a frame whose shape follows `kind`
+ * (0 flat ride, 1 track ride, 2 water ride).
+ */
+export function appendRidePad(mb, rng, x, y, z, yaw, w, d, kind) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const W = clamp(fin(w, 10), 2, 70);
+  const D = clamp(fin(d, 10), 2, 70);
+  const k = (fin(kind, 0) | 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const hw = W * 0.5, hd = D * 0.5;
+
+  setMat(mb, M.concrete);
+  boxL(mb, px, py, pz, c, s, -hw, 0, -hd, hw, 0.12, hd, F_NOBOT);
+  // Perimeter rail.
+  setMat(mb, M.railGreen);
+  for (let side = 0; side < 4; side++) {
+    const along = side < 2 ? hw : hd;
+    const off = side < 2 ? hd : hw;
+    const sg = (side & 1) ? 1 : -1;
+    for (let i = 0; i < 2; i++) {
+      const yy = 0.42 + i * 0.46;
+      if (side < 2) {
+        boxL(mb, px, py, pz, c, s, -along, yy, sg * off - 0.03, along, yy + 0.06, sg * off + 0.03,
+          F_NOBOT);
+      } else {
+        boxL(mb, px, py, pz, c, s, sg * off - 0.03, yy, -along, sg * off + 0.03, yy + 0.06, along,
+          F_NOBOT);
+      }
+    }
+  }
+  // Machinery / ticket house in one corner.
+  setMat(mb, M.rideCream);
+  boxL(mb, px, py, pz, c, s, hw - Math.min(3.4, W * 0.34), 0.12, hd - Math.min(2.8, D * 0.30),
+    hw - 0.35, 2.85, hd - 0.35, F_NOBOT);
+  setMat(mb, M.rideRed);
+  boxL(mb, px, py, pz, c, s, hw - Math.min(3.6, W * 0.36), 2.85, hd - Math.min(3.0, D * 0.32),
+    hw - 0.20, 3.10, hd - 0.20, F_NOBOT);
+
+  if (k === 1) {
+    // Track ride: a raised loop on trestles, cut into eight chords round the pad.
+    setMat(mb, M.galv);
+    const rx = hw * 0.72, rz = hd * 0.72;
+    for (let i = 0; i < 8; i++) {
+      const t0 = (i / 8) * TAU, t1 = ((i + 1) / 8) * TAU;
+      const y0 = 1.20 + 1.35 * (0.5 + 0.5 * Math.sin(t0 * 2));
+      const y1 = 1.20 + 1.35 * (0.5 + 0.5 * Math.sin(t1 * 2));
+      beamL(mb, px, py, pz, c, s, Math.cos(t0) * rx, y0, Math.sin(t0) * rz,
+        Math.cos(t1) * rx, y1, Math.sin(t1) * rz, 0.42, 0.09, F_ALL);
+      beamL(mb, px, py, pz, c, s, Math.cos(t0) * rx, 0.12, Math.sin(t0) * rz,
+        Math.cos(t0) * rx, y0, Math.sin(t0) * rz, 0.09, 0.09, F_ALL);
+    }
+  } else if (k === 2) {
+    // Water ride: a flume trough on piers, running the length of the pad and back.
+    setMat(mb, M.rideCream);
+    for (let lane = 0; lane < 2; lane++) {
+      const lz = (lane === 0 ? -1 : 1) * hd * 0.45;
+      beamL(mb, px, py, pz, c, s, -hw * 0.86, 1.35 + lane * 1.6, lz,
+        hw * 0.86, 1.35 + (1 - lane) * 1.6, lz, 0.85, 0.20, F_ALL);
+      setMat(mb, M.galv);
+      for (let i = 0; i < 4; i++) {
+        const lx = -hw * 0.80 + hw * 1.60 * (i / 3);
+        beamL(mb, px, py, pz, c, s, lx, 0.12, lz, lx, 1.35 + 1.6 * (lane ? i / 3 : 1 - i / 3), lz,
+          0.11, 0.11, F_ALL);
+      }
+      setMat(mb, M.rideCream);
+    }
+  } else {
+    // Flat ride: a central hub and a canopy of swept arms.
+    setMat(mb, M.rideGold);
+    const hr = Math.min(hw, hd) * 0.80;
+    mb.cylinder(px, py + 0.12, pz, hr * 0.20, hr * 0.14, 3.30, 8, a, false);
+    setMat(mb, M.rideRed);
+    for (let i = 0; i < 6; i++) {
+      const th = a + (i / 6) * TAU;
+      beamL(mb, px, py, pz, c, s, 0, 3.10, 0,
+        Math.cos(th - a) * hr, 2.35, Math.sin(th - a) * hr, 0.16, 0.10, F_ALL);
+    }
+  }
+  if (typeof rng === 'function') rnd(rng);
+}
+
+/** Timber handrail along a boardwalk. Runs along local Z; posts every ~2 m. */
+export function appendTimberRail(mb, x, y, z, yaw, len) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const L = clamp(fin(len, 8), 0.6, 80);
+  const c = Math.cos(a), s = Math.sin(a);
+  const hl = L * 0.5;
+
+  setMat(mb, M.boardRail);
+  boxL(mb, px, py, pz, c, s, -0.045, 0.94, -hl, 0.045, 1.02, hl, F_NOBOT);
+  boxL(mb, px, py, pz, c, s, -0.035, 0.50, -hl, 0.035, 0.56, hl, F_NOBOT);
+  const n = Math.max(1, Math.round(L / 2.0));
+  for (let i = 0; i <= n; i++) {
+    const lz = -hl + L * (i / n);
+    boxL(mb, px, py, pz, c, s, -0.055, 0.0, lz - 0.055, 0.055, 0.94, lz + 0.055, F_NOBOT);
+  }
+}
+
+/**
+ * Gable roof for an island cottage. The massing extract has no roof pitch, and the Ward's and
+ * Algonquin houses are all pitched; without this every one of them is a flat-topped box.
+ * `w` runs along local X, `d` along local Z, and the ridge runs along local Z.
+ */
+export function appendGableRoof(mb, rng, x, y, z, yaw, w, d, h) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const W = clamp(fin(w, 7), 1.5, 26);
+  const D = clamp(fin(d, 9), 1.5, 34);
+  const H = clamp(fin(h, 2.2), 0.5, 7.0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const hw = W * 0.5 + 0.32, hd = D * 0.5 + 0.32;
+
+  setMat(mb, M.shingle);
+  // Two pitches meeting at a ridge over local x = 0.
+  quadL(mb, px, py, pz, c, s, -hw, 0, hd, 0, H, hd, 0, H, -hd, -hw, 0, -hd);
+  quadL(mb, px, py, pz, c, s, 0, H, hd, hw, 0, hd, hw, 0, -hd, 0, H, -hd);
+  // Gable ends, and a fascia band so the eaves are not a paper edge.
+  triL(mb, px, py, pz, c, s, -hw, 0, hd, hw, 0, hd, 0, H, hd);
+  triL(mb, px, py, pz, c, s, hw, 0, -hd, -hw, 0, -hd, 0, H, -hd);
+  setMat(mb, M.chalk);
+  boxL(mb, px, py, pz, c, s, -hw, -0.22, -hd, hw, 0.0, hd, F_SIDES);
+  if (typeof rng === 'function') rnd(rng);
+}
+
+/** Concrete boat slipway running down into the water. Local +X is down the slope. */
+export function appendSlipway(mb, x, y, z, yaw, w, len, drop) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const W = clamp(fin(w, 6), 1.5, 30);
+  const L = clamp(fin(len, 12), 2, 60);
+  const dr = clamp(fin(drop, 1.6), 0.2, 6.0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const hw = W * 0.5;
+
+  setMat(mb, M.concrete);
+  setL(0, 0, -0.35, -hw); setL(1, L, -0.35 - dr, -hw);
+  setL(2, 0, 0.0, -hw); setL(3, L, -dr, -hw);
+  setL(4, 0, -0.35, hw); setL(5, L, -0.35 - dr, hw);
+  setL(6, 0, 0.0, hw); setL(7, L, -dr, hw);
+  hullL(mb, px, py, pz, c, s, F_ALL & ~F_NX);
+  setMat(mb, M.granite);
+  for (let k = 0; k < 2; k++) {
+    const sz = (k === 0 ? -1 : 1) * hw;
+    setL(0, 0, 0.0, sz - 0.14); setL(1, L, -dr, sz - 0.14);
+    setL(2, 0, 0.22, sz - 0.14); setL(3, L, 0.22 - dr, sz - 0.14);
+    setL(4, 0, 0.0, sz + 0.14); setL(5, L, -dr, sz + 0.14);
+    setL(6, 0, 0.22, sz + 0.14); setL(7, L, 0.22 - dr, sz + 0.14);
+    hullL(mb, px, py, pz, c, s, F_NOBOT);
+  }
 }

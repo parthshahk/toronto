@@ -70,7 +70,43 @@ const BLEND_MULTIPLY = 2;
 const BLOOM_LEVELS = 3;
 
 // Cascaded shadow maps: the shader declares arrays of this size and loops over uCsmCount.
-const MAX_CASCADES = 3;
+//
+// FOUR, not three. Every cascade is fitted to the bounding sphere of its frustum slice and then
+// snapped to its own texel grid, which makes one shadow texel almost exactly one screen pixel at
+// the FAR edge of that slice, whatever the split — the interesting number is therefore not the
+// texel size but the RATIO between consecutive splits, because that is how many pixels a texel
+// covers at the NEAR edge, where a cascade is at its worst. Over a fixed reach, n cascades give
+// a best-case ratio of (reach / firstSplit)^(1/(n-1)):
+//
+//     reach 2,860 m, first split 157 m      3 cascades -> 4.3x      4 cascades -> 2.6x
+//
+// On a 3 km map the far cascade only had to reach 2.4 km and three tiles did it at 4.1x. At the
+// new sight lines three tiles cost either a soft mid-field or a near cascade coarser than the one
+// the build already ships, and neither is acceptable — so the atlas grows a tile instead. It is
+// 8192 x 2048 of DEPTH_COMPONENT24 (67 MB, against 50), _ensureShadowTargets already lays out
+// any count over any number of rows, and the shader was already written as a loop to MAX_CASCADES
+// with no unrolled special case. Measured cost of the fourth pass: see _fitCascades.
+const MAX_CASCADES = 4;
+
+// --- cascade splits -------------------------------------------------------------------------
+// The classic practical split (Zhang et al.) interpolates a logarithmic series with a uniform
+// one, and its logarithmic half is anchored at the camera NEAR plane. That anchor is what breaks
+// here: main.js drives the near plane from measured clearance and it sits at 0.30-1.60 m, so the
+// log series starts at a distance nothing is ever drawn at, and the uniform half — which is a
+// terrible split — ends up carrying the result. Fitting from a STREET anchor instead is the
+// standard remedy and it is what these three numbers are:
+//
+//   the first split lands at CSM_SPLIT_FRAC of the reach, held inside [MIN, MAX] so that a short
+//   reach cannot collapse cascade 0 onto the camera's nose and a long one cannot stretch it past
+//   the block you are standing in;
+//   every split after it is GEOMETRIC from there to the reach, which is the series that minimises
+//   the worst ratio, i.e. the softest texel-to-pixel figure anywhere in the frame.
+//
+// 165 m is a Toronto block plus its intersection. Below it a pedestrian sees cascade 1 across the
+// street; above it cascade 0's texels start to show at arm's length.
+const CSM_SPLIT_FRAC = 0.055;
+const CSM_SPLIT_MIN = 60;
+const CSM_SPLIT_MAX = 165;
 
 // --- daylight -------------------------------------------------------------------------------
 // `env.daylight` (0 = blue hour / night, 1 = full sun) is the single switch between the two
@@ -92,15 +128,21 @@ const DAY_BLOOM_INTENSITY = 0.55;
 // a flare and starts reading as a smear across the image, so daylight nearly closes it.
 const DAY_STREAK_INTENSITY = 0.22;
 // Cascade reach, as a multiple of shadow.distance. The blue-hour key is a low raking skylight and
-// 1250 m of coverage is plenty for a street-level walk, but the shot this build is judged on is
-// the SKYLINE from the harbour — the ferry docks stand 1.2-1.9 km off the Financial District, so
-// at 1250 m every tower in that frame sits past uShadowFar and the cascades fade to nothing
-// before they reach it. That is most of why toggling shadows used to move the frame by one luma.
-// Under a real sun the cast shadow IS the massing cue, so daylight buys the extra reach. The
-// split is logarithmic, so the cost is spread the right way: on the 3x2048 atlas the near
-// cascade goes from about 0.13 m per texel to 0.24 — still well under the width of a kerb — and
-// the far one from 1.4 m to 2.7, which is a tower-scale shadow at a kilometre either way.
-const DAY_SHADOW_DISTANCE = 1.9;
+// a street-level walk needs far less of it than a skyline shot does, so daylight buys extra reach
+// and blue hour keeps a shorter, denser set. Exactly 1x at daylight 0.
+//
+// The base is now 2,200 m (was 1,250) and the multiplier 1.30 (was 1.9), i.e. 2,860 m of daylight
+// reach against 2,375. Two things forced it. The extract is 6.8 x 6.5 km, so the Financial
+// District now stands 2.0-2.7 km off the start viewpoint rather than 1.2-1.9, and at the old
+// reach the whole core sat past uShadowFar and faded to unshadowed. And main.js sizes its caster
+// query as shadow.distance + 1.5 tiles, so the reach and the caster radius have to move together
+// or the far cascade covers ground no caster was submitted for.
+//
+// MEASURED at the start viewpoint, 1440x900, Ultra, four cascades: 1,250 m -> 11.2 ms / 165
+// shadow draws; 1,900 -> 11.7 / 249; 2,600 -> 12.4 / 315; 3,400 -> 12.9 / 411. The cost is in
+// the caster count, not the cascade count, and it is close to linear at 5.7 us per draw. 2,200
+// buys the core for about 0.7 ms of a 16.7 ms budget.
+const DAY_SHADOW_DISTANCE = 1.30;
 // Fog density, as a multiple of the preset's own. Blue hour WANTS the street grid sunk in haze
 // (CONTRACT 3.2 item 7). A clear afternoon does not: at the preset density the aerial term is
 // brighter than most facades, so it lifts every distant tower toward a milky grey and takes the
@@ -134,6 +176,7 @@ const _texel = new Float32Array(2);
 const _texel2 = new Float32Array(2);
 const _dir = new Float32Array(2);
 const _fog = new Float32Array(4);
+const _fogRange = new Float32Array(4);
 const _csmMat = new Float32Array(MAX_CASCADES * 16);
 const _csmTile = new Float32Array(MAX_CASCADES * 4);
 const _csmParam = new Float32Array(MAX_CASCADES * 4);
@@ -199,14 +242,28 @@ export class Camera {
     // camera moves. Precision is inversely proportional to the near plane, so every doubling of
     // it halves the depth resolution and takes a matching bite out of the flicker.
     //
-    // The same algebra says the far plane is worth 0.02% — dropping 6000 to 5600 changes
-    // (far - near) / far from 0.99995 to 0.99971 — so it is set by VISIBILITY, not precision.
-    // 5600 m is the diagonal of the reachable world: main.js clamps the camera to x +/-1891,
-    // y -60..2400, z -1433..2393, the mapped city sits inside x +/-1571, z +/-1125 and rises to
-    // 553 m, and the longest sightline those two boxes admit — the ceiling above the south-east
-    // corner looking at the far north-west ground — is 5,489 m. Anything past that is open lake
-    // (the OSM water polygon runs out to ~12 km) and it fogs into the horizon band well before
-    // the plane cuts it; measured looking due south from 207 m, no cut is visible at all.
+    // The far plane is the OTHER end of the same expression, and the algebra says it is nearly
+    // free: dz = 2^-24 * z^2 / near * (1 - near / far), so moving far from 5,600 m to 16,000 m
+    // changes the (1 - near/far) factor from 0.999821 to 0.999938 — a 0.012% loss. The far plane
+    // is therefore set by VISIBILITY alone, and visibility is what the expanded extract changed.
+    //
+    // 5,600 m was the diagonal of the OLD reachable world. It is now far too short. main.js
+    // clamps the camera to x +/-3,704, z -3,548..+4,508, y -60..2,400; the mapped city fills
+    // x +/-3,384, z +/-3,228 and rises to 553 m; and city.js draws the lake as a flat sheet out
+    // to x +/-8,184 and z -4,428..+10,428, because the harbour has to have a horizon. The
+    // longest sightline that volume admits — the ceiling above the north-west corner looking at
+    // the far south-east corner of the water — is 18,504 m.
+    //
+    // MEASURED, at the default lake viewpoint looking south at three pitches: at 5,600 the plane
+    // cuts the lake in a band ~20 scanlines deep whose worst row differs from the uncut frame by
+    // 117/765 of the RGB range. That is the world visibly ending (CONTRACT §9.4) and it was
+    // already happening before the expansion — the old note measured from 207 m, where the cut
+    // hides in the horizon band, and not from the 300 m the start viewpoint actually uses.
+    //
+    // 16,000 m is where the deep-air term in vhFogAmount below has closed the air to 99.7%, so
+    // the cut lands under one 8-bit code value. The two numbers are a PAIR: raising the plane
+    // without the range fog just moves a visible edge further out, and closing the air without
+    // raising the plane leaves the edge inside the haze where it is dimmer but still there.
     //
     // WebGL2 has no glClipControl, so true reversed-Z is unavailable: the [-1,1] NDC z is
     // computed in float32 before the fixed-function viewport transform, and a reversed far plane
@@ -216,7 +273,7 @@ export class Camera {
     // main.js drives `near` per frame from the clearance actually around the eye (see its
     // cameraNear()); this is the value used before the city exists and if nothing drives it.
     this.near = 1.0;
-    this.far = 5600;
+    this.far = 16000;
 
     this.view = mat4();
     this.proj = mat4();
@@ -250,7 +307,7 @@ export class Camera {
     // that hands it a metre-scale typo would quietly halve the depth buffer's usable range or
     // clip the whole city away.
     const near = clamp(Number.isFinite(this.near) ? this.near : 1.0, 0.05, 64);
-    let far = Number.isFinite(this.far) ? this.far : 5600;
+    let far = Number.isFinite(this.far) ? this.far : 16000;
     if (far <= near + 1e-3) far = near + 1000;
 
     m4lookAt(this.view, p, t, this.up);
@@ -394,11 +451,41 @@ vec3 vhSkyGradient(vec3 dir, vec3 zen, vec3 hor, vec3 west, vec3 sunDir) {
   return max(col, vec3(0.0));
 }
 
-// --- height fog ---------------------------------------------------------------------------
-// Analytic integral of an exponential density field along the view ray, so the street grid sits
-// in haze while the towers rise clear of it. p.x = density, p.y = scale height, p.z = base Y,
-// p.w = maximum opacity (keeps the far skyline from going completely flat).
-float vhFogAmount(vec3 camPos, vec3 world, vec4 p) {
+// --- height fog + deep air ------------------------------------------------------------------
+// TWO layers, because one cannot do both jobs over a 6.8 x 6.5 km map.
+//
+// LAYER 1, the haze deck. An analytic integral of an exponential density field along the view
+// ray, so the street grid sits in haze while the towers rise clear of it (CONTRACT §3.2 item 7).
+// p.x = density, p.y = scale height, p.z = base Y, p.w = maximum opacity.
+//
+// The deck's scale height is 48-120 m across the four presets, which is the point — it is a
+// ground-hugging haze, not an atmosphere. The consequence is that it CANNOT close a horizon:
+// the whole vertical optical depth of the afternoon deck is density * H = 0.0075, so a ray from
+// the 2,400 m ceiling to the far corner of the lake 18.5 km away accumulates 0.058 and comes
+// back 4% fogged. Every edge of the drawn world — the far plane, the rim of the water sheet, the
+// last tile the streamer built — is fully legible from any altitude. On a 3 km map you never got
+// far enough from anything for that to show. On this one you do.
+//
+// LAYER 2, the deep air. What actually hides a horizon is aerial perspective: extinction along
+// the whole sightline, which at these ranges is dominated by scattering out of a column that has
+// no useful vertical structure. Modelling it as a third exponential with a kilometre-scale height
+// would be the physical answer and would also veil the mid-distance, which is exactly what this
+// pass is not allowed to do — the city 1-5 km off the start viewpoint has to stay legible and
+// COLOURED. So the deep air is expressed as optical depth in RANGE only, quadratic in the excess
+// beyond q.x, which makes it identically zero inside q.x and then very steep:
+//
+//   q.x = 4,200 m  range at which it starts     q.y = 1 / 4,900 m  (one unit of depth per span)
+//   q.z, q.w       the window over which the cap is allowed to open from p.w to fully opaque
+//
+// Measured optical depth added: 0 at 4.2 km, 0.026 at 5 km (2.6%), 0.13 at 6 km, 1.34 at 9.9 km,
+// 2.5 at 12 km, 5.7 at 16 km (99.7%). The whole mapped extent is inside 5.2 km of the start
+// viewpoint, so the city loses at most 4% of its contrast to this and the horizon still shuts.
+//
+// p.w (fogMax) is a MID-DISTANCE cap: it exists so a skyline 2 km off keeps some of itself and
+// does not flatten into the fog colour. Applied at 16 km it is the opposite of useful — it would
+// hold the far plane's cut at 28% of full contrast forever. So the cap opens over q.z..q.w and
+// the air is allowed to close completely once there is nothing left out there worth seeing.
+float vhFogAmount(vec3 camPos, vec3 world, vec4 p, vec4 q) {
   vec3 d = world - camPos;
   float len = length(d);
   if (len < 1e-4) return 0.0;
@@ -413,8 +500,14 @@ float vhFogAmount(vec3 camPos, vec3 world, vec4 p) {
   float f;
   if (abs(dy) > 1e-3) f = max(p.x, 0.0) * H * (ec - ew) * (len / dy);
   else f = max(p.x, 0.0) * ec * len;
-  f = clamp(f, 0.0, 60.0);
-  return clamp(1.0 - exp2(-1.442695 * f), 0.0, 1.0) * clamp(p.w, 0.0, 1.0);
+  // Deep air. Exactly zero inside q.x, so every sightline shorter than that is bit-for-bit what
+  // it was before this term existed — which is the whole street-level image at all four presets.
+  float s = max(len - q.x, 0.0) * max(q.y, 0.0);
+  f = clamp(f + s * s, 0.0, 60.0);
+  // The mid-distance cap opens toward fully opaque over q.z..q.w. smoothstep guards itself
+  // against q.z >= q.w, so a caller cannot invert the window into a divide by zero.
+  float cap = mix(clamp(p.w, 0.0, 1.0), 1.0, smoothstep(q.z, max(q.w, q.z + 1.0), len));
+  return clamp(1.0 - exp2(-1.442695 * f), 0.0, 1.0) * cap;
 }
 
 // --- GGX ------------------------------------------------------------------------------------
@@ -1284,6 +1377,7 @@ uniform vec3 uStreetColor;   // sodium/LED wash on the lowest few metres of ever
 uniform vec3 uFogColor;
 uniform vec3 uTint;
 uniform vec4 uFogParams;
+uniform vec4 uFogRange;   // x = deep-air start (m), y = 1/span, zw = cap-opening window
 uniform vec4 uCnTower;       // xy = world XZ of the tower axis, z = base Y, w = mask radius (m)
 uniform float uSkyBounce;    // gain on the directional sky irradiance
 uniform float uNightFactor;
@@ -1585,7 +1679,7 @@ void main() {
   // Per-FRAGMENT view distance. This must not be a varying: the terrain is a handful of large
   // triangles and interpolating distance across them fogs the middle of a plane by the average
   // of its corner distances instead of by what the camera can actually see.
-  float fogAmt = vhFogAmount(uCameraPos, vWorld, uFogParams);
+  float fogAmt = vhFogAmount(uCameraPos, vWorld, uFogParams, uFogRange);
   vec3 viewDir = viewDist > 1e-4 ? -V : vec3(0.0, 0.0, 1.0);
   // vhAerial carries the daylight in-scatter and the de-blueing of the haze; the density that
   // decides HOW MUCH of it lands is thinned on the JS side (DAY_FOG_DENSITY). Both are gated, so
@@ -1806,6 +1900,7 @@ uniform vec3 uAmbientSky;
 uniform vec3 uAmbientGround;
 uniform vec3 uFogColor;
 uniform vec4 uFogParams;
+uniform vec4 uFogRange;   // x = deep-air start (m), y = 1/span, zw = cap-opening window
 uniform float uDaylight;
 uniform float uExposure;
 uniform float uTime;
@@ -1885,7 +1980,7 @@ void main() {
 
   vec3 col = body * (vec3(1.0) - fres) + env * fres + spec;
 
-  float fogAmt = vhFogAmount(uCameraPos, vWorld, uFogParams);
+  float fogAmt = vhFogAmount(uCameraPos, vWorld, uFogParams, uFogRange);
   vec3 viewDir = viewDist > 1e-4 ? -V : vec3(0.0, 0.0, 1.0);
   vec3 aerial = vhAerial(uFogColor, viewDir, uSkyZenith, uSkyHorizon, uSkyWest, uSunDir,
     uKeyColor, uDaylight);
@@ -1955,6 +2050,7 @@ in vec3 vWorld;
 uniform vec3 uCameraPos;
 uniform vec3 uShadowColor;
 uniform vec4 uFogParams;
+uniform vec4 uFogRange;   // x = deep-air start (m), y = 1/span, zw = cap-opening window
 uniform float uAlpha;
 
 layout(location = 0) out vec4 outColor;
@@ -1963,7 +2059,7 @@ ${GLSL_COMMON}
 void main() {
   // A shaped roll-off: flat-topped up close, then falling off steeply so nothing survives out at
   // the fog line and the horizon does not turn into a grey smear of leftover shadow ink.
-  float f = vhFogAmount(uCameraPos, vWorld, uFogParams);
+  float f = vhFogAmount(uCameraPos, vWorld, uFogParams, uFogRange);
   float fade = clamp(1.0 - f * 1.35, 0.0, 1.0);
   float s = clamp(uAlpha, 0.0, 1.0) * fade;
   outColor = vec4(mix(vec3(1.0), uShadowColor, s), 1.0);
@@ -2575,11 +2671,15 @@ void main() {
 
 /* -------------------------------------------------------------------- renderer */
 
-// Views into the packed cascade uniform arrays, so the fit runs without allocating.
-const _csmMatView = [
-  _csmMat.subarray(0, 16), _csmMat.subarray(16, 32), _csmMat.subarray(32, 48),
-];
-const _csmLightVP = [mat4(), mat4(), mat4()];
+// Views into the packed cascade uniform arrays, so the fit runs without allocating. Sized from
+// MAX_CASCADES rather than written out, because the cascade count is a tuning decision and a
+// hand-unrolled list of three is exactly the kind of thing that survives a change to it.
+const _csmMatView = [];
+const _csmLightVP = [];
+for (let i = 0; i < MAX_CASCADES; i++) {
+  _csmMatView.push(_csmMat.subarray(i * 16, i * 16 + 16));
+  _csmLightVP.push(mat4());
+}
 
 export class Renderer {
   constructor(gl) {
@@ -2611,8 +2711,13 @@ export class Renderer {
     this.bloom = { enabled: true, threshold: 0.72, intensity: 0.85, radius: 1.0 };
 
     this.shadow = {
-      distance: 1250,     // metres of camera frustum covered by the cascades
-      lambda: 0.76,       // practical split: 0 = uniform, 1 = logarithmic
+      distance: 2200,     // metres of camera frustum covered by the cascades
+      // Where the first split lands, as a fraction of the reach, and the bracket it is held in.
+      // Defaults are the CSM_SPLIT_* constants; overriding them here is the one knob that trades
+      // near sharpness against mid-field sharpness without touching the reach.
+      splitFrac: CSM_SPLIT_FRAC,
+      splitMin: CSM_SPLIT_MIN,
+      splitMax: CSM_SPLIT_MAX,
       strength: 0.74,     // 1 = fully black shadow (before ambient fills it back in)
       normalOffset: 1.6,  // in shadow texels
       constBias: 0.035,   // metres
@@ -2669,8 +2774,18 @@ export class Renderer {
       ready: false, sig: '', size: 0, count: 0, atlasW: 0, atlasH: 0,
       tex: null, fbo: null, tiles: null,
     };
-    this._shadowFar = 1250;
+    this._shadowFar = 2200;
     this._dummyShadow = null;
+
+    // What _fitCascades actually landed on this frame: the far distance of each cascade, the
+    // world size of one of its shadow texels, the radius of the sphere it was fitted to, and the
+    // worst texel-per-pixel step between consecutive cascades. Read it, do not write it.
+    this.shadowStats = {
+      count: 0, reach: 0, worstRatio: 0,
+      split: new Float64Array(MAX_CASCADES),
+      texel: new Float64Array(MAX_CASCADES),
+      radius: new Float64Array(MAX_CASCADES),
+    };
 
     // Latched at beginFrame so flipping quality mid-frame can never strand the scene in an
     // offscreen target that endFrame then refuses to composite.
@@ -2727,6 +2842,15 @@ export class Renderer {
       fogHeight: 55,        // scale height (m): the street grid hazes, the towers rise clear
       fogBase: 4,           // world Y the density is measured at
       fogMax: 0.94,
+      // Deep air (vhFogAmount layer 2). These are metres of SIGHTLINE, not of world, so nothing
+      // here is tied to the bounding box: extend the extract and the same four numbers still say
+      // "the mid-distance is clear, the horizon is shut". main.js's TIME_PRESETS may override
+      // them per preset like any other env field, and writeEnv() carries them through untouched
+      // when a preset does not mention them, which is why all four currently share one air.
+      fogRange: 4200,       // sightline (m) at which deep-air extinction starts to accumulate
+      fogRangeSpan: 4900,   // metres of EXCESS range that add one unit of optical depth
+      fogHorizon: 7000,     // where fogMax starts giving way so the air may close completely
+      fogHorizonEnd: 15000, // and where it has given way entirely — inside the 16 km far plane
       nightFactor: 0.86,
       // Base lit fraction. Each lighting profile scales it (offices up, condos and civic well
       // down — see vhFacadeStyle), so this is a master dial rather than a literal percentage.
@@ -3536,18 +3660,29 @@ export class Renderer {
     const n = s.count;
     const size = s.size;
     const near = Math.max(Number.isFinite(cam.near) ? cam.near : 1.0, 1.0);
-    const camFar = Number.isFinite(cam.far) ? cam.far : 5600;
-    // The 'low' preset has one 1024 tile to cover the whole range, so it covers LESS range:
-    // stretched over the full 1250 m its texels are 3 m across and the shadows are mush. At 35%
-    // of the distance they are ~1 m, which still reads as a building shadow on a street.
+    const camFar = Number.isFinite(cam.far) ? cam.far : 16000;
+    // The 'low' preset has ONE 1024 tile to cover the whole range, so it covers less range or its
+    // texels turn to mush: at 20% of a 2,200 m reach they are ~1.0 m, the same figure the single
+    // cascade landed on before the reach grew, which is still a readable building shadow on a
+    // street. (It was 35% of 1,250 m; the fraction moved so the metres did not.)
     // Daylight buys extra reach (DAY_SHADOW_DISTANCE) so the skyline from the harbour is inside
     // the cascades instead of past their fade. Exactly 1x at daylight 0 — blue hour is unchanged.
-    const reach = numOr(cfg.distance, 50, 8000, 1250) * (n === 1 ? 0.35 : 1)
+    const reach = numOr(cfg.distance, 50, 8000, 2200) * (n === 1 ? 0.20 : 1)
       * (1 + (DAY_SHADOW_DISTANCE - 1) * this._daylight());
     const far = Math.max(near + 20, Math.min(reach, camFar));
-    const lambda = numOr(cfg.lambda, 0, 1, 0.76);
     const extrude = numOr(cfg.extrude, 10, 4000, 900);
     const blend = numOr(cfg.blend, 0.02, 0.5, 0.16);
+    // Street-anchored geometric splits — see the CSM_SPLIT_* block. `split0` is held below 90% of
+    // the reach as well as inside its own bracket, so a pathological `distance` can never order
+    // the first split past the last one and hand m4ortho an inverted box.
+    const split0 = Math.min(
+      far * 0.9,
+      clamp(far * numOr(cfg.splitFrac, 0.005, 0.9, CSM_SPLIT_FRAC),
+        numOr(cfg.splitMin, 5, 4000, CSM_SPLIT_MIN),
+        numOr(cfg.splitMax, 5, 4000, CSM_SPLIT_MAX))
+    );
+    // Ratio between consecutive splits once the first one is placed. n === 1 never reads it.
+    const ratio = n > 1 ? Math.pow(far / Math.max(split0, 1e-3), 1 / (n - 1)) : 1;
 
     const fov = clamp(Number.isFinite(cam.fov) ? cam.fov : 1.05, 0.15, 2.6);
     const aspect = Number.isFinite(cam.aspect) && Math.abs(cam.aspect) > 1e-4 ? cam.aspect : 1.6;
@@ -3566,11 +3701,15 @@ export class Renderer {
     else { _lightUp[0] = 0; _lightUp[1] = 1; _lightUp[2] = 0; }
 
     let sliceNear = near;
+    let worstRatio = 0;
     for (let i = 0; i < n; i++) {
-      const si = (i + 1) / n;
-      const logS = near * Math.pow(far / near, si);
-      const uniS = near + (far - near) * si;
-      const sliceFar = (i === n - 1) ? far : (lambda * logS + (1 - lambda) * uniS);
+      // Cascade 0 takes the street anchor; everything after it is geometric out to the reach;
+      // the last one IS the reach, exactly, so uShadowFar and the last split never disagree.
+      const sliceFar = (i === n - 1) ? far : split0 * Math.pow(ratio, i);
+      if (i > 0 && sliceNear > 1e-3) {
+        const r = sliceFar / sliceNear;
+        if (r > worstRatio) worstRatio = r;
+      }
 
       const hf = tanHalf * sliceFar;
       const wf = hf * aspect;
@@ -3626,7 +3765,24 @@ export class Renderer {
       _csmParam[o + 2] = sliceFar;
       _csmParam[o + 3] = sliceFar - (sliceFar - sliceNear) * blend;
 
+      // Reported, not just fitted: `renderer.shadowStats` is what makes a claim about cascade
+      // coverage checkable from the console instead of derived on paper from constants that have
+      // since moved. Rewritten in place every frame, never reallocated.
+      const st = this.shadowStats;
+      st.split[i] = sliceFar;
+      st.texel[i] = _csmParam[o];
+      st.radius[i] = radius;
+
       sliceNear = sliceFar;
+    }
+    {
+      const st = this.shadowStats;
+      st.count = n;
+      st.reach = far;
+      st.worstRatio = worstRatio;
+      for (let i = n; i < MAX_CASCADES; i++) {
+        st.split[i] = 0; st.texel[i] = 0; st.radius[i] = 0;
+      }
     }
 
     // Unused cascade slots still get sane values: the shader loops over uCsmCount, but a NaN in
@@ -3834,6 +3990,24 @@ export class Renderer {
     return _fog;
   }
 
+  // The deep-air half of the fog — see vhFogAmount in GLSL_COMMON. Deliberately NOT scaled by
+  // daylight: the four presets are the same air at four hours of the same day, and the visual
+  // range of that air does not move 5x between 15:20 and 23:30. What moves is the haze deck (the
+  // preset's own density) and the colour it is tinted (fogColor + vhAerial), both of which are
+  // already per-preset. Keeping this term common is also what makes "blue hour has not drifted"
+  // provable rather than argued: at blue hour every sightline it touches is already past 90%
+  // opaque from the deck alone, so it changes nothing measurable there.
+  _fogRangeParams() {
+    const e = this.env;
+    const r0 = numOr(e.fogRange, 0, 200000, 4200);
+    const span = Math.max(1, numOr(e.fogRangeSpan, 1, 200000, 4900));
+    _fogRange[0] = r0;
+    _fogRange[1] = 1 / span;
+    _fogRange[2] = numOr(e.fogHorizon, 0, 200000, 7000);
+    _fogRange[3] = Math.max(_fogRange[2] + 1, numOr(e.fogHorizonEnd, 0, 200000, 15000));
+    return _fogRange;
+  }
+
   // Cascade uniforms, shared by the scene and water programs.
   _setShadowUniforms(s) {
     const on = this._csmCount > 0 && this._shadowState.ready;
@@ -3850,7 +4024,7 @@ export class Renderer {
     s.set('uShadowBias', _shadowBias);
     const base = numOr(this.shadow.strength, 0, 1, 0.74);
     s.set('uShadowStrength', base + (DAY_SHADOW_STRENGTH - base) * this._daylight());
-    s.set('uShadowFar', this._shadowFar || 1250);
+    s.set('uShadowFar', this._shadowFar || 2200);
     s.set('uShadowNormalOffset', numOr(this.shadow.normalOffset, 0, 8, 1.6));
   }
 
@@ -3873,6 +4047,7 @@ export class Renderer {
     s.set('uStreetColor', e.streetColor);
     s.set('uFogColor', e.fogColor);
     s.set('uFogParams', this._fogParams());
+    s.set('uFogRange', this._fogRangeParams());
     s.set('uCnTower', this._cnTowerParams());
     s.set('uSkyBounce', numOr(e.skyBounce, 0, 6, 1.85));
     s.set('uNightFactor', numOr(e.nightFactor, 0, 1, 0.86));
@@ -3930,6 +4105,7 @@ export class Renderer {
     s.set('uAmbientGround', e.ambientGround);
     s.set('uFogColor', e.fogColor);
     s.set('uFogParams', this._fogParams());
+    s.set('uFogRange', this._fogRangeParams());
     s.set('uDaylight', this._daylight());
     s.set('uExposure', this._dayExposure());
     s.set('uTime', numOr(e.time, -1e7, 1e7, 0));
@@ -3947,6 +4123,7 @@ export class Renderer {
     s.set('uCameraPos', (cam && cam.pos) || WHITE);
     s.set('uShadowColor', e.shadowColor);
     s.set('uFogParams', this._fogParams());
+    s.set('uFogRange', this._fogRangeParams());
   }
 
   /* ------------------------------------------------------------- frame API */
