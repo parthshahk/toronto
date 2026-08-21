@@ -53,8 +53,8 @@ import {
 // water live in their own module; city.js only calls into it, at the four points marked
 // "harbourfront" below.
 import {
-  buildHarbour, carveHarbourTerrain, harbourTileHasWater, harbourWaterAt, appendHarbour,
-  harbourStats,
+  buildHarbour, carveHarbourTerrain, harbourTileHasWater, harbourWaterAt, harbourDeckY,
+  appendHarbour, harbourStats,
   // THE ISLANDS AND THE AIRPORT. Everything south of the harbour lives in harbour.js too; the
   // section below only indexes it into tiles and hands it the placement context.
   islandBounds, appendIslandMass, appendIslandDetail, islandStats, harbourCarFree,
@@ -215,6 +215,110 @@ const ROAD_CLASS_OK = { motorway: 1, major: 1, minor: 1, service: 1, pedestrian:
 const BRIDGE_RISE = { motorway: 8.2, major: 5.6, minor: 5.0, service: 4.2, pedestrian: 5.4, foot: 5.4 };
 const SIDEWALK_W = { major: 3.8, minor: 2.8, pedestrian: 0 };
 
+/* ================================================ the world boundary (§9) == */
+//
+// CONTRACT §9.1 and §9.3. Two separate problems that share one answer.
+//
+// DANGLING ENDS (§9.1). An OSM way ends where a mapper stopped work, not where the street stops.
+// Welding every road, footway and railway vertex by position and counting incidences finds every
+// end that is not a junction; resolveTermini() then either connects it to what it was obviously
+// meant to reach or gives it a designed terminus — a turning head, a barrier, a buffer stop. It
+// runs BEFORE solveGrade(), on the raw polylines, so the street graph, the walkability audit, the
+// junction table and the ribbons all see one corrected topology and none of them can disagree.
+//
+// THE EDGE OF THE WORLD (§9.3). The extract is a rectangular cut out of a much larger city, and
+// nothing in the design may know that rectangle's dimensions. Everything below derives from
+// meta.extent and from the data inside it, in three concentric bands:
+//
+//   1. the DATA, out to extent/2 — surveyed, unchanged;
+//   2. the FRINGE, SUR_FRINGE metres further — synthesised city. The terrain grid is padded by
+//      edge replication so the ground, its normals and groundY simply continue; the street
+//      network continues along the bearings the real streets arrive on; generic massing fills
+//      the blocks at the height and density measured just inside the boundary, thinning outward;
+//   3. the APRON, HAZE_REACH metres further still — ground and water only, four rings of very
+//      large quads, no features at all. This is what guarantees §9.4's "no viewpoint from which
+//      the world visibly ends": see auditHorizon().
+//
+// The player is stopped by a soft limit inside band 2, so the last thing they can reach is still
+// city and the apron is only ever something seen from a distance.
+
+// Depth of the synthesised fringe. Scaled to the map so a small extract gets a proportionate
+// surround and the full city does not pay for a 40 km ring of invention, then clamped: under
+// ~700 m the fringe reads as a token strip, over ~1.8 km it costs terrain grid for nothing that
+// is not already deep in haze.
+const SUR_FRINGE_FRAC = 0.19;
+const SUR_FRINGE_MIN = 700;
+const SUR_FRINGE_MAX = 1800;
+
+// How far the flat apron reaches beyond the fringe. This is an ATMOSPHERIC distance, not a map
+// dimension, so it is a constant in metres and stays one at any extent: it is the sightline at
+// which render.js's fog closes completely. Its three terms (haze deck, aerial perspective and
+// the quadratic horizon closer, the last of which is not scaled by the sun) put a ground plane at
+// 13 km at 98.5-100% airlight at every one of the four time presets and every altitude the
+// camera can reach — measured, not asserted; auditHorizon() re-derives it every load.
+const HAZE_REACH = 13000;
+
+// Where the player is stopped, measured outward from the data extent. Deliberately a fraction of
+// the fringe and then capped at 300 m, because main.js's own WORLD_MARGIN backstop is 320 m: the
+// soft limit has to bite BEFORE that hard clamp or the ease never runs. Everything past it —
+// SUR_FRINGE - SOFT_OUT of synthesised city, then 13 km of apron — exists only to be looked at.
+const SOFT_OUT_FRAC = 0.25;
+const SOFT_OUT_MAX = 300;
+const SOFT_EASE = 150;             // metres of deceleration before the limit
+
+// Fringe street lattice. Spoke pitch is measured from the real network at the boundary (see
+// edgeProfile) and clamped into this band; rings step outward by the local pitch, growing by
+// SUR_RING_GROW each time so blocks get bigger and detail thins with distance, exactly as §9.3
+// asks. SUR_RING_MAX caps how many rings any edge can produce.
+const SUR_PITCH_MIN = 62;
+const SUR_PITCH_MAX = 165;
+const SUR_RING_GROW = 0.34;
+const SUR_RING_MAX = 12;
+const SUR_ROAD_W = { arterial: 15.0, street: 9.5 };
+const SUR_ROAD_SEG = 55.0;         // resampling step: the padded ground is smooth, so this is
+                                   // three times the surveyed ROAD_MAX_SEG and costs a third
+const SUR_SETBACK = 5.2;           // block face to street kerb
+const SUR_MASS_MIN = 16.0;         // no synthesised footprint narrower than this
+const SUR_MASS_MAX = 46.0;         // ...nor wider: past this it reads as one megastructure
+const SUR_MASS_AREA = 2400;        // target footprint area, used to split a big block
+const SUR_MASS_CAP = 6;            // ...and the most masses one block may be split into
+const SUR_H_MIN = 6.0;
+const SUR_H_DECAY = 620;           // metres over which the fringe's storey count halves
+const SUR_COVER_DECAY = 900;       // ...and over which its built fraction does
+const SUR_H_JITTER = 0.55;         // +/- fraction of the local mean, hashed on world position
+const SUR_TALL_P = 0.045;          // fraction of fringe masses that are a district's outliers
+const SUR_TALL_MAX = 5.0;          // ...and the most they may exceed the local mean by
+const SUR_FADE_IN = 0.55;          // fraction of the fringe depth at which the blocks start to
+                                   // thin toward nothing, so the invented city has no last row
+// How far out a fringe street runs, as a fraction of the fringe depth, by its rank: one local
+// street in four, then one in two, then the rest. Arterials always run the full depth.
+const SUR_ROAD_KEEP = [0.95, 0.66, 0.42];
+const SUR_RING_KEEP = 0.70;        // ...and the last ring street, so none crosses open country
+
+// The strip just inside the boundary that the fringe copies its character from, and how finely
+// that strip is sampled around the perimeter.
+const EDGE_PROFILE_DEPTH = 420;
+const EDGE_PROFILE_PITCH = 150;
+const EDGE_BAND = 45;              // a way ending this close to the boundary is a cut, not an end
+
+// Terminus resolution.
+const TERM_WELD = 1.40;            // two ends this close were meant to be one node
+const TERM_REACH = 20.0;           // ...and this is how far an end may be extended to reach a way
+const TERM_SIDE = 9.0;             // maximum sideways offset of the point it is extended to
+const TERM_AHEAD = 0.12;           // cos of the widest angle "ahead" may mean
+const TERM_BLIND = 7.0;            // an end may also connect to something beside it this close
+const TERM_BUILDING = 3.6;         // an end this close to a facade is a door, not a dangling way
+const TERM_LAYER = 1;              // largest layer difference two ways may be connected across
+const CUL_MIN_W = 4.2;             // narrower than this gets a barrier, not a turning head
+const CUL_R_MIN = 6.4;
+const CUL_SEG = 16;                // segments round a turning head
+// The riprap band that clads every land/water meeting in the surround (CONTRACT §9.2).
+const BANK_TOP = 1.05;             // stone crest above the water plane
+const BANK_TOE = -1.30;            // ...and how far under it the toe reaches
+const BANK_LIFT = 0.06;            // proud of the ground it clads, so the two never fight
+const BUFFER_W = 2.9;              // rail buffer stop
+const BUFFER_H = 1.05;
+
 /* ============================================================== materials == */
 // Colours are linear-ish scene albedo; the renderer owns exposure and grade. Ground cover stays
 // cool and desaturated (CONTRACT §0); the FACADES do not — see the palette section below.
@@ -234,6 +338,9 @@ const M = {
   pier: [0.062, 0.052, 0.044, 0, 0, 0.80],
   water: [0.008, 0.014, 0.024, 0, 0, 0.03],
   ballast: [0.052, 0.050, 0.048, 0, 0, 0.95],
+  // Broken armour stone. Darker and rougher than the terrain it clads, wet at the toe, and the
+  // one material every synthesised land/water edge in the world is finished in.
+  riprap: [0.044, 0.044, 0.047, 0, 0, 0.88],
   tie: [0.040, 0.034, 0.030, 0, 0, 0.90],
   rail: [0.105, 0.108, 0.115, 0, 0, 0.25],
   roof: [0.046, 0.047, 0.050, 0, 0, 0.90],
@@ -1368,6 +1475,64 @@ function makeTerrain(src, extent, infraLines, waterAreas, surveyedShore) {
   return { nx, nz, cell, x0, z0, h, mask, ponds, groundY, waterY: WATER_Y };
 }
 
+/**
+ * Grow the terrain grid outward by `pad` metres of EDGE REPLICATION (CONTRACT §9.3).
+ *
+ * The bilinear sampler already clamps, so groundY outside the extract has always returned the
+ * boundary value and the ground has always been *defined* out there — it simply had no mesh, no
+ * normals and nothing standing on it, which is exactly what "you can see the world run out"
+ * looks like. Replicating the border rows and columns into a real grid makes the surround ground
+ * ordinary terrain: emitTerrainRange builds it a tile at a time, terrainNormals gives it the same
+ * normal field, and the seam to the surveyed sheet is not a seam at all because the replicated
+ * vertices ARE the surveyed boundary vertices.
+ *
+ * Run it AFTER carveHarbourTerrain, never before. The carve is what puts the lake bed below the
+ * datum; replicating an uncarved border would extrude a wall of land across the open water east
+ * and west of the harbour, which is the one thing the surround must not invent.
+ *
+ * Every grid-shaped array T carries is padded the same way — the heights, the fallback water
+ * mask, and harbour.js's island-land flags, which are indexed as j * nx + i and would otherwise
+ * be silently reinterpreted against the new stride.
+ */
+function padTerrain(T, pad) {
+  const cells = Math.max(0, Math.round(pad / T.cell));
+  if (cells <= 0) return T;
+  const onx = T.nx, onz = T.nz;
+  const nx = onx + cells * 2, nz = onz + cells * 2;
+  const x0 = T.x0 - cells * T.cell, z0 = T.z0 - cells * T.cell;
+  const grow = (src, Ctor) => {
+    if (!src) return null;
+    const dst = new Ctor(nx * nz);
+    for (let j = 0; j < nz; j++) {
+      const sj = clamp(j - cells, 0, onz - 1);
+      for (let i = 0; i < nx; i++) {
+        dst[j * nx + i] = src[sj * onx + clamp(i - cells, 0, onx - 1)];
+      }
+    }
+    return dst;
+  };
+  T.h = grow(T.h, Float32Array);
+  if (T.mask) T.mask = grow(T.mask, Float32Array);
+  if (T.isleLand) T.isleLand = grow(T.isleLand, Uint8Array);
+  T.nx = nx; T.nz = nz; T.x0 = x0; T.z0 = z0;
+  T.nrm = null;                     // recomputed over the new grid by terrainNormals()
+  T.pad = cells * T.cell;
+  const h = T.h, cell = T.cell;
+  T.groundY = (x, z) => {
+    const fx = (x - x0) / cell;
+    const fz = (z - z0) / cell;
+    if (!isFinite(fx) || !isFinite(fz)) return 0;
+    let i = Math.floor(fx), j = Math.floor(fz);
+    if (i < 0) i = 0; else if (i > nx - 2) i = nx - 2;
+    if (j < 0) j = 0; else if (j > nz - 2) j = nz - 2;
+    const tx = clamp(fx - i, 0, 1), tz = clamp(fz - j, 0, 1);
+    const a = h[j * nx + i], b = h[j * nx + i + 1];
+    const c = h[(j + 1) * nx + i], d = h[(j + 1) * nx + i + 1];
+    return (a * (1 - tx) + b * tx) * (1 - tz) + (c * (1 - tx) + d * tx) * tz;
+  };
+  return T;
+}
+
 // How finely a terrain cell is rebuilt where a depressed corridor cuts through it. The cut edge
 // is only ever accurate to half a sub-cell diagonal, which is why the corridor's paved verge is
 // TRENCH_VERGE wide: it covers whatever raggedness this leaves.
@@ -1510,35 +1675,65 @@ function emitCutCell(mb, grade, x0, z0, x1, z1, y00, y10, y01, y11, nrm, i00, i1
   refine(0, 0, 1, 1, 0);
 }
 
-function emitWaterMesh(mb, T, extent, harbour) {
+/**
+ * The lake, out to the edge of the world.
+ *
+ * Two lattices at the same Y, so their shared edges are exactly coplanar and a T-junction between
+ * them cannot open a crack: a fine one over the mapped city and the fringe, and a coarse one that
+ * carries the water out to the apron's reach. Everything is decided by the SAME land/water test
+ * the ground uses — the terrain, which harbour.js has already carved to the surveyed shoreline
+ * and padTerrain has replicated outward — so past the extract the lake continues exactly where
+ * the last surveyed metre of it said it should and stops exactly where the last metre of shore
+ * did. Before this the far field was flooded unconditionally and the world north of Bloor was a
+ * sea (invisible only because there was no ground out there to hide it).
+ */
+function emitWaterMesh(mb, T, extent, harbour, reach) {
   setMat(mb, M.water);
   const hx = extent.x / 2, hz = extent.z / 2;
-  const step = 220;
-  const x0 = -hx - 4800, x1 = hx + 4800;
-  const z0 = -hz - 1200, z1 = hz + 7200;
-  for (let z = z0; z < z1; z += step) {
-    for (let x = x0; x < x1; x += step) {
-      const xa = x, xb = Math.min(x + step, x1);
-      const za = z, zb = Math.min(z + step, z1);
-      // HARBOURFRONT: inside the surveyed lake the tile is always water. A slip between two
-      // piers is narrower than this lattice, so a terrain probe at the corners would leave it dry.
-      const surveyed = harbour ? harbourTileHasWater(harbour, xa, za, xb, zb) : false;
-      // Inside the mapped extent only emit where the terrain actually dips to the water plane.
-      if (!surveyed && xb > -hx && xa < hx && zb > -hz && za < hz) {
-        const c = Math.min(
-          Math.min(T.groundY(xa, za), T.groundY(xb, za)),
-          Math.min(T.groundY(xa, zb), T.groundY(xb, zb))
-        );
-        if (c > WATER_Y - 0.02) continue;
+  const pad = isNum(T.pad) ? T.pad : 0;
+  const far = isNum(reach) && reach > 0 ? reach : 4800;
+  const fine = 220;
+  const wet = (xa, za, xb, zb) => {
+    if (harbour && harbourTileHasWater(harbour, xa, za, xb, zb)) return true;
+    const c = Math.min(
+      Math.min(T.groundY(xa, za), T.groundY(xb, za)),
+      Math.min(T.groundY(xa, zb), T.groundY(xb, zb))
+    );
+    return c <= WATER_Y - 0.02;
+  };
+  const sheet = (x0, z0, x1, z1, step, skipX0, skipZ0, skipX1, skipZ1) => {
+    for (let z = z0; z < z1 - EPS; z += step) {
+      for (let x = x0; x < x1 - EPS; x += step) {
+        const xa = x, xb = Math.min(x + step, x1);
+        const za = z, zb = Math.min(z + step, z1);
+        if (xa >= skipX0 && xb <= skipX1 && za >= skipZ0 && zb <= skipZ1) continue;
+        if (!wet(xa, za, xb, zb)) continue;
+        mb.vert(xa, WATER_Y, zb, 0, 1, 0);
+        mb.vert(xb, WATER_Y, zb, 0, 1, 0);
+        mb.vert(xb, WATER_Y, za, 0, 1, 0);
+        mb.vert(xa, WATER_Y, zb, 0, 1, 0);
+        mb.vert(xb, WATER_Y, za, 0, 1, 0);
+        mb.vert(xa, WATER_Y, za, 0, 1, 0);
       }
-      mb.vert(xa, WATER_Y, zb, 0, 1, 0);
-      mb.vert(xb, WATER_Y, zb, 0, 1, 0);
-      mb.vert(xb, WATER_Y, za, 0, 1, 0);
-      mb.vert(xa, WATER_Y, zb, 0, 1, 0);
-      mb.vert(xb, WATER_Y, za, 0, 1, 0);
-      mb.vert(xa, WATER_Y, za, 0, 1, 0);
     }
-  }
+  };
+  // The fine sheet covers the city, the fringe and a kilometre of slack either side of them, so
+  // every slip, basin and island channel is resolved at 220 m.
+  const coarse = fine * 5;
+  const fx0 = -hx - pad - 1000, fz0 = -hz - pad - 1000;
+  // Snapped UP to a whole number of coarse cells, so the coarse lattice's cell edges land exactly
+  // on the fine sheet's boundary: every coarse cell is then either wholly inside it (and skipped)
+  // or wholly outside it (and kept). A straddling cell would lay a second water plane over the
+  // first at the same Y, which is the one overlap the depth buffer cannot arbitrate at all.
+  const fx1 = fx0 + Math.ceil((2 * (hx + pad + 1000)) / coarse) * coarse;
+  const fz1 = fz0 + Math.ceil((2 * (hz + pad + 1000)) / coarse) * coarse;
+  sheet(fx0, fz0, fx1, fz1, fine, Infinity, Infinity, -Infinity, -Infinity);
+  // ...and the coarse one carries it to the horizon.
+  const cx0 = fx0 - Math.ceil(far / coarse) * coarse;
+  const cz0 = fz0 - Math.ceil(far / coarse) * coarse;
+  const cx1 = fx1 + Math.ceil(far / coarse) * coarse;
+  const cz1 = fz1 + Math.ceil(far / coarse) * coarse;
+  sheet(cx0, cz0, cx1, cz1, coarse, fx0, fz0, fx1, fz1);
   for (let p = 0; p < T.ponds.length; p++) {
     const pond = T.ponds[p];
     const part = makePart(planArea(pond.co) > 0 ? pond.co : reverseRing(pond.co), []);
@@ -3958,6 +4153,7 @@ const WALK_BLOCK = 1.6;            // metres inside a footprint before a route i
 const STITCH_R = 8.0;              // how far a connector may reach to close a gap
 const STITCH_W = 1.9;              // and how wide it is built
 const ISLAND_MIN = 50.0;           // CONTRACT 8.2: report every island longer than this
+const MARINE_CELL = 20.0;          // cell size of the land-connectivity flood behind "marine"
 const STAIR_RISE = 0.17;
 const STAIR_RUN = 0.30;
 
@@ -4049,8 +4245,10 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
       // and so is a corridor that dives under one: both have had a portal cut through the facade
       // and both let a walker through, so counting them blocked would report a hole that the
       // player cannot find.
+      // ...and a bridge is not blocked either: its deck is carried OVER whatever it crosses, so
+      // measuring the footprints underneath it asks the wrong question entirely.
       let blocked = false;
-      if (kind !== WAY_PASSAGE && kind !== WAY_UNDER) {
+      if (kind !== WAY_PASSAGE && kind !== WAY_UNDER && kind !== WAY_OVER) {
         const steps = Math.max(1, Math.ceil(len / 4));
         for (let m = 0; m <= steps && !blocked; m++) {
           const t = m / steps;
@@ -4066,12 +4264,20 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
       // quietly stepped over — a staircase down the face of a retaining wall would be a lie about
       // what is there. Inside a corridor the surface is the carriageway, so a way running down
       // into an underpass is smooth and stays whole.
+      //
+      // AN ELEVATED WAY IS EXEMPT, for exactly the reason the cliff pass below already gives:
+      // "a deck is not the ground". Its walking surface is a ribbon carried on abutments and
+      // piers, continuous by construction, and the terrain it is sampled against is the river or
+      // the rail cut it is bridging. Testing it against the ground severed every long bridge in
+      // the extract and detached everything on the far side — measured at 26.8 km of walkable
+      // street east of the Don Valley reported as an unreachable island, which is not what a
+      // pedestrian standing on Queen Street East finds.
       const cor = G.corridor[i];
       const surf = cor
         ? (x, z) => C.terrainY(x, z) - corridorDepth(cor, x, z)
         : C.groundY;
       let sev = false;
-      const walk = Math.max(1, Math.ceil(len / 1.5));
+      const walk = kind === WAY_OVER ? 0 : Math.max(1, Math.ceil(len / 1.5));
       let prev = surf(p[k - 1][0], p[k - 1][1]);
       for (let m = 1; m <= walk && !sev; m++) {
         const t = m / walk;
@@ -4186,7 +4392,7 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
     if (root === mainRoot) continue;
     let rec = islandNodes.get(root);
     if (!rec) {
-      rec = { x: 0, z: 0, n: 0, name: '', len: compLen.get(root) || 0 };
+      rec = { root, x: 0, z: 0, n: 0, name: '', len: compLen.get(root) || 0, marine: false };
       islandNodes.set(root, rec);
     }
     rec.x += nx[edges[e]]; rec.z += nz[edges[e]]; rec.n++;
@@ -4196,18 +4402,103 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
     }
   }
   const islands = [...islandNodes.values()].sort((a, b) => b.len - a.len);
-  let islandMetres = 0, islandCount = 0;
+
+  // MARINE COMPONENTS. Some islands are islands. The Toronto Islands carry 44 km of walkable
+  // path and no bridge to the mainland — you take the ferry — so counting them as an unreachable
+  // fragment of the street network measures Lake Ontario, not the city. A component is marine
+  // when the shortest line from it to the main network crosses open water, which is decided by
+  // the terrain and needs no knowledge of where any particular island is.
+  //
+  // Both fractions are reported: `fraction` over everything, and `fractionDry` over everything a
+  // walker could reach without a boat. CONTRACT §9.4 asks for exceptions to be explained, and
+  // this is the explanation, measured rather than asserted.
+  {
+    // Which land you can WALK to, decided by the ground itself: an 8-connected flood over the
+    // terrain, seeded from every node of the main network, that may only step on cells standing
+    // above the water plane. A component none of whose nodes is reached by that flood is on the
+    // far side of open water, and the only way there is a boat.
+    //
+    // This is a question about land, not about distance, which is why it gets the Toronto Islands
+    // right without being told they exist: Ward's Island is 156 m from the nearest mainland node
+    // and Hanlan's Point is 2.5 km from it, and both are equally unreachable on foot.
+    const gi = Math.max(2, Math.round(extent.x / MARINE_CELL) + 3);
+    const gj = Math.max(2, Math.round(extent.z / MARINE_CELL) + 3);
+    const ox = -extent.x / 2 - MARINE_CELL, oz = -extent.z / 2 - MARINE_CELL;
+    const land = new Uint8Array(gi * gj);
+    for (let j = 0; j < gj; j++) {
+      const z = oz + (j + 0.5) * MARINE_CELL;
+      for (let i = 0; i < gi; i++) {
+        const y = C.rawY(ox + (i + 0.5) * MARINE_CELL, z);
+        if (isNum(y) && y > WATER_Y + 0.2) land[j * gi + i] = 1;
+      }
+    }
+    const cellOf = (x, z) => {
+      const i = Math.floor((x - ox) / MARINE_CELL), j = Math.floor((z - oz) / MARINE_CELL);
+      if (i < 0 || i >= gi || j < 0 || j >= gj) return -1;
+      return j * gi + i;
+    };
+    const seen = new Uint8Array(gi * gj);
+    const queue = new Int32Array(gi * gj);
+    let head = 0, tail = 0;
+    for (let e = 0; e < edges.length; e += 4) {
+      if (uf.find(edges[e]) !== mainRoot) continue;
+      for (const v of [edges[e], edges[e + 1]]) {
+        const k = cellOf(nx[v], nz[v]);
+        if (k < 0 || seen[k] || !land[k]) continue;
+        seen[k] = 1;
+        queue[tail++] = k;
+      }
+    }
+    while (head < tail) {
+      const k = queue[head++];
+      const i = k % gi, j = (k / gi) | 0;
+      for (let dj = -1; dj <= 1; dj++) {
+        for (let di = -1; di <= 1; di++) {
+          if (!di && !dj) continue;
+          const a = i + di, b = j + dj;
+          if (a < 0 || a >= gi || b < 0 || b >= gj) continue;
+          const m = b * gi + a;
+          if (seen[m] || !land[m]) continue;
+          seen[m] = 1;
+          queue[tail++] = m;
+        }
+      }
+    }
+    const islNodes = new Map();
+    for (let e = 0; e < edges.length; e += 4) {
+      const root = uf.find(edges[e]);
+      if (root === mainRoot) continue;
+      const b = islNodes.get(root);
+      if (b) b.push(edges[e], edges[e + 1]);
+      else islNodes.set(root, [edges[e], edges[e + 1]]);
+    }
+    for (const isl of islands) {
+      if (isl.len <= ISLAND_MIN || !isl.n) continue;
+      const mine = islNodes.get(isl.root) || [];
+      let onMainland = false;
+      for (let m = 0; m < mine.length && !onMainland; m++) {
+        const k = cellOf(nx[mine[m]], nz[mine[m]]);
+        if (k >= 0 && seen[k]) onMainland = true;
+      }
+      isl.marine = !onMainland;
+    }
+    W.landCells = tail;
+  }
+
+  let islandMetres = 0, islandCount = 0, marineMetres = 0, marineCount = 0;
   const worst = [];
   for (const isl of islands) {
     if (isl.len <= ISLAND_MIN) continue;
     islandCount++;
     islandMetres += isl.len;
+    if (isl.marine) { marineCount++; marineMetres += isl.len; }
     if (worst.length < 12) {
       worst.push({
         m: Math.round(isl.len),
         x: Math.round(isl.x / Math.max(1, isl.n)),
         z: Math.round(isl.z / Math.max(1, isl.n)),
         name: isl.name,
+        marine: !!isl.marine,
       });
     }
   }
@@ -4288,6 +4579,9 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
   W.components = compLen.size;
   W.islands = islandCount;
   W.islandMetres = islandMetres;
+  W.marineIslands = marineCount;
+  W.marineMetres = marineMetres;
+  W.fractionDry = total - marineMetres > 0 ? mainLen / (total - marineMetres) : 1;
   W.worstIslands = worst;
   W.cliffs = cliffs;
   W.cliffWorst = worstCliff;
@@ -5872,8 +6166,15 @@ function seatOnBench(C, P, b) {
   if (C.tilePeople >= MAX_PEOPLE) return;
   const c = Math.cos(b.yaw), s = Math.sin(b.yaw);
   const du = 0.10, dv = (P() < 0.5 ? -1 : 1) * (0.30 + P() * 0.34);
-  const x = b.x + du * c + dv * s;
-  const z = b.z - du * s + dv * c;
+  let x = b.x + du * c + dv * s;
+  let z = b.z - du * s + dv * c;
+  // The bench's own site was validated; the seat is up to two thirds of a metre along it, and on
+  // a bench set right at the kerb that offset can put the sitter over the carriageway. Re-test
+  // it, fall back to the middle of the bench, and give up rather than seat somebody in traffic.
+  if (onCarriageway(C, x, z, 0) || inFootprint(C, x, z, 0)) {
+    x = b.x; z = b.z;
+    if (onCarriageway(C, x, z, 0) || inFootprint(C, x, z, 0)) return;
+  }
   appendPedestrian(C.mb.props, P, x, b.y, z, b.yaw + (P() - 0.5) * 0.30, 'sit');
   noteProp(C, 'pedestrian');
   S.sitting++; S.total++; S.onSidewalk++;
@@ -6225,6 +6526,1404 @@ function placeRailCars(C, raw, lift, profile) {
 // One merged mesh per material class per tile. `water` is deliberately absent: the lake is a
 // single 30 k-vertex sheet that is visible from almost everywhere, has its own shader pass, and
 // would gain nothing from being cut up.
+/* ================================================== termini (CONTRACT §9.1) == */
+//
+// "A way that simply stops in mid-air, mid-block or mid-pavement is a BUG regardless of what OSM
+// says." This is the pass that makes that true.
+//
+// Every road, footway and railway vertex in the extract is welded by position, exactly as
+// solveGrade() welds them a moment later, and every incidence is counted. A vertex at the END of
+// a way with exactly one incidence is a TERMINUS. It is legitimate only if it is one of:
+//
+//   * a junction        — impossible by construction, that is what degree >= 2 means;
+//   * a building        — a driveway into a garage, a service road into a loading bay, a footway
+//                         into a lobby. Measured against the real footprint edges, not guessed;
+//   * the world edge    — the extract is a rectangular cut, so a way that reaches the boundary is
+//                         not ending, it is leaving. buildSurround() continues it outward;
+//   * a designed end    — a turning head, a barrier line or a buffer stop, which is what this
+//                         pass BUILDS for everything left over.
+//
+// Anything else is resolved first: two ends a metre apart are welded, and an end that points at
+// another way within TERM_REACH is extended to meet it — with the meeting point spliced into the
+// TARGET way as well, because two polylines that merely cross do not share a node and the weld
+// that the whole street graph is built on would never see the connection.
+//
+// It runs on the raw polylines BEFORE solveGrade(), so the grade solve, the walkability audit,
+// the junction table, the ribbons and the street-name index all read one corrected topology.
+
+/** Squared distance from (px,pz) to segment ab, plus the closest point, into `out`. */
+const _seg = { d2: 0, x: 0, z: 0, t: 0 };
+function nearestOnSeg(px, pz, ax, az, bx, bz) {
+  const dx = bx - ax, dz = bz - az;
+  const l2 = dx * dx + dz * dz;
+  let t = 0;
+  if (l2 > EPS) t = clamp(((px - ax) * dx + (pz - az) * dz) / l2, 0, 1);
+  const qx = ax + dx * t, qz = az + dz * t;
+  _seg.x = qx; _seg.z = qz; _seg.t = t;
+  _seg.d2 = (px - qx) * (px - qx) + (pz - qz) * (pz - qz);
+  return _seg;
+}
+
+/** A footprint index over the RAW rings, so the terminus pass can run before buildParts(). */
+function makeFootprintProbe(buildingsRaw, extent) {
+  const cell = 64;
+  const x0 = -extent.x / 2 - 600, z0 = -extent.z / 2 - 600;
+  const nx = Math.ceil((extent.x + 1200) / cell) + 1;
+  const nz = Math.ceil((extent.z + 1200) / cell) + 1;
+  const idx = makeGridIndex(cell, x0, z0, nx, nz);
+  for (let i = 0; i < buildingsRaw.length; i++) {
+    const b = buildingsRaw[i];
+    if (!b || !Array.isArray(b.r) || !b.r.length || !(isNum(b.h) && b.h > 0.5)) continue;
+    const ring = b.r[0];
+    if (!Array.isArray(ring) || ring.length < 3) continue;
+    let bx0 = Infinity, bz0 = Infinity, bx1 = -Infinity, bz1 = -Infinity;
+    for (let k = 0; k < ring.length; k++) {
+      const p = ring[k];
+      if (!isNum(p[0]) || !isNum(p[1])) continue;
+      if (p[0] < bx0) bx0 = p[0];
+      if (p[0] > bx1) bx1 = p[0];
+      if (p[1] < bz0) bz0 = p[1];
+      if (p[1] > bz1) bz1 = p[1];
+    }
+    if (!(bx0 <= bx1)) continue;
+    idx.add(bx0, bz0, bx1, bz1, { r: b.r, bb: [bx0, bz0, bx1, bz1] });
+  }
+  return {
+    /** Distance from a point to the nearest footprint edge, capped at `r`. */
+    near(x, z, r) {
+      let best = r * r;
+      idx.query(x, z, r, (rec) => {
+        const bb = rec.bb;
+        if (x < bb[0] - r || x > bb[2] + r || z < bb[1] - r || z > bb[3] + r) return;
+        for (let g = 0; g < rec.r.length; g++) {
+          const ring = rec.r[g];
+          if (!Array.isArray(ring) || ring.length < 3) continue;
+          for (let k = 0, j = ring.length - 1; k < ring.length; j = k++) {
+            const a = ring[j], c = ring[k];
+            if (!isNum(a[0]) || !isNum(c[0])) continue;
+            const d = nearestOnSeg(x, z, a[0], a[1], c[0], c[1]).d2;
+            if (d < best) best = d;
+          }
+        }
+      });
+      return Math.sqrt(best);
+    },
+    /** Does the segment ab cut across any footprint edge? */
+    blocks(ax, az, bx, bz) {
+      const mx = (ax + bx) * 0.5, mz = (az + bz) * 0.5;
+      const r = Math.hypot(bx - ax, bz - az) * 0.5 + 1;
+      let hit = false;
+      idx.query(mx, mz, r, (rec) => {
+        if (hit) return false;
+        for (let g = 0; g < rec.r.length; g++) {
+          const ring = rec.r[g];
+          if (!Array.isArray(ring) || ring.length < 3) continue;
+          for (let k = 0, j = ring.length - 1; k < ring.length; j = k++) {
+            const p = ring[j], q = ring[k];
+            if (!isNum(p[0]) || !isNum(q[0])) continue;
+            if (segIntersects([ax, az], [bx, bz], [p[0], p[1]], [q[0], q[1]])) { hit = true; return false; }
+          }
+        }
+      });
+      return hit;
+    },
+  };
+}
+
+// A way's terminus can only be connected to something on roughly its own level and of roughly its
+// own kind: a footpath may join a street (they meet at a kerb), a railway may only join a railway,
+// and the PATH concourse three storeys down joins nothing on the surface.
+function termCompatible(a, b) {
+  if (a.rail !== b.rail) return false;
+  if ((a.k === WAY_SUB) !== (b.k === WAY_SUB)) return false;
+  return Math.abs(a.lay - b.lay) <= TERM_LAYER;
+}
+
+/**
+ * Find, weld, connect and cap every dangling end in the extract.
+ *
+ * MUTATES the raw polylines. Returns the list of designed termini that still have to be BUILT —
+ * turning heads, barrier lines and buffer stops — for the tile builder to emit.
+ */
+function resolveTermini(roadsRaw, railsRaw, buildingsRaw, extent, stats) {
+  const E = stats.edge;
+  const t0 = now();
+  const EX = extent.x / 2, EZ = extent.z / 2;
+  const probe = makeFootprintProbe(buildingsRaw, extent);
+
+  // --- 1. every ground-level linear feature, in one list ---------------------
+  const feats = [];
+  for (let i = 0; i < roadsRaw.length; i++) {
+    const r = roadsRaw[i];
+    if (!r || !Array.isArray(r.p) || r.p.length < 2) continue;
+    feats.push({
+      raw: r, rail: false, k: classifyWay(r),
+      lay: isNum(r.lay) ? clamp(Math.round(r.lay), -4, 4) : 0,
+      cls: ROAD_CLASS_OK[r.c] ? r.c : 'minor',
+      w: clamp(isNum(r.w) ? r.w : 8, 1.6, 44),
+      splice: null,
+    });
+  }
+  for (let i = 0; i < railsRaw.length; i++) {
+    const r = railsRaw[i];
+    if (!r || !Array.isArray(r.p) || r.p.length < 2) continue;
+    feats.push({
+      raw: r, rail: true, k: r.k === 'subway' ? WAY_SUB : WAY_GRADE, lay: 0,
+      cls: r.k === 'rail' ? 'heavy' : 'tram', w: r.k === 'rail' ? 4.6 : 3.4, splice: null,
+    });
+  }
+
+  // --- 2. weld and count incidences ------------------------------------------
+  const weld = () => {
+    const set = makeNodeSet(0.30);
+    const deg = [];
+    for (let f = 0; f < feats.length; f++) {
+      const p = feats[f].raw.p;
+      const ids = new Int32Array(p.length);
+      for (let k = 0; k < p.length; k++) {
+        ids[k] = (isNum(p[k][0]) && isNum(p[k][1])) ? set.at(p[k][0], p[k][1]) : -1;
+      }
+      feats[f].ids = ids;
+    }
+    for (let f = 0; f < feats.length; f++) {
+      const ids = feats[f].ids;
+      for (let k = 1; k < ids.length; k++) {
+        const a = ids[k - 1], b = ids[k];
+        if (a < 0 || b < 0 || a === b) continue;
+        deg[a] = (deg[a] || 0) + 1;
+        deg[b] = (deg[b] || 0) + 1;
+      }
+    }
+    return { set, deg };
+  };
+
+  let deg = weld().deg;
+
+  const collect = () => {
+    const out = [];
+    for (let f = 0; f < feats.length; f++) {
+      const F = feats[f];
+      const p = F.raw.p;
+      const ids = F.ids;
+      for (const end of [0, 1]) {
+        const k = end ? ids.length - 1 : 0;
+        const v = ids[k];
+        if (v < 0 || (deg[v] || 0) !== 1) continue;
+        const j = end ? k - 1 : k + 1;
+        let dx = p[k][0] - p[j][0], dz = p[k][1] - p[j][1];
+        const l = Math.hypot(dx, dz);
+        if (l > EPS) { dx /= l; dz /= l; } else { dx = 1; dz = 0; }
+        out.push({ f, F, end, k, v, x: p[k][0], z: p[k][1], dx, dz });
+      }
+    }
+    return out;
+  };
+
+  let term = collect();
+  E.termini = term.length;
+
+  const atBoundary = (x, z) => (Math.abs(x) > EX - EDGE_BAND || Math.abs(z) > EZ - EDGE_BAND);
+  let dangling = 0, atB = 0, atEdge = 0;
+  for (let i = 0; i < term.length; i++) {
+    const t = term[i];
+    if (atBoundary(t.x, t.z)) { atEdge++; continue; }
+    if (probe.near(t.x, t.z, TERM_BUILDING) < TERM_BUILDING) { atB++; continue; }
+    dangling++;
+  }
+  E.danglingBefore = dangling;
+  E.atBuilding = atB;
+  E.atBoundary = atEdge;
+
+  // --- 3. weld ends that were meant to be one node ---------------------------
+  // A pair of ends a metre apart is digitising slop, not a gap. Move BOTH to their midpoint so
+  // the 0.30 m weld the whole street graph runs on actually catches them.
+  {
+    const cellW = Math.max(TERM_WELD, 0.5);
+    const buckets = new Map();
+    for (let i = 0; i < term.length; i++) {
+      const t = term[i];
+      if (atBoundary(t.x, t.z)) continue;
+      const key = Math.floor(t.x / cellW) + ':' + Math.floor(t.z / cellW);
+      const b = buckets.get(key);
+      if (b) b.push(i); else buckets.set(key, [i]);
+    }
+    const done = new Uint8Array(term.length);
+    for (let i = 0; i < term.length; i++) {
+      if (done[i]) continue;
+      const t = term[i];
+      if (atBoundary(t.x, t.z)) continue;
+      const bi = Math.floor(t.x / cellW), bj = Math.floor(t.z / cellW);
+      let best = -1, bestD = TERM_WELD;
+      for (let dj = -1; dj <= 1; dj++) {
+        for (let di = -1; di <= 1; di++) {
+          const b = buckets.get((bi + di) + ':' + (bj + dj));
+          if (!b) continue;
+          for (let m = 0; m < b.length; m++) {
+            const o = b[m];
+            if (o === i || done[o] || term[o].f === t.f) continue;
+            const d = Math.hypot(term[o].x - t.x, term[o].z - t.z);
+            if (d > 0.30 && d < bestD) { bestD = d; best = o; }
+          }
+        }
+      }
+      if (best < 0) continue;
+      const u = term[best];
+      const mx = (t.x + u.x) * 0.5, mz = (t.z + u.z) * 0.5;
+      t.F.raw.p[t.k] = [mx, mz];
+      u.F.raw.p[u.k] = [mx, mz];
+      t.x = mx; t.z = mz; u.x = mx; u.z = mz;
+      done[i] = 1; done[best] = 1;
+      E.welded++;
+    }
+  }
+
+  // --- 4. extend what points at something --------------------------------------
+  // Index every segment of every feature, then, for each surviving end, take the nearest
+  // compatible point that is either ahead of it or close beside it, extend the way to that point
+  // and splice the same point into the way it lands on.
+  //
+  // Splices are resolved BY GEOMETRY, never by a remembered vertex index: extending one way and
+  // splicing into another both change the indices of everything after them, and a stale index
+  // silently inserts a node in the wrong segment — a way that folds back on itself, which the
+  // ribbon builder then reports as a fold and drops.
+  const gx0 = -EX - 500, gz0 = -EZ - 500;
+  const idxNX = Math.ceil((extent.x + 1000) / 28) + 1;
+  const idxNZ = Math.ceil((extent.z + 1000) / 28) + 1;
+  const buildSegIdx = () => {
+    const idx = makeGridIndex(28, gx0, gz0, idxNX, idxNZ);
+    for (let f = 0; f < feats.length; f++) {
+      const p = feats[f].raw.p;
+      for (let k = 1; k < p.length; k++) {
+        const a = p[k - 1], b = p[k];
+        if (!isNum(a[0]) || !isNum(b[0])) continue;
+        idx.add(Math.min(a[0], b[0]) - 1, Math.min(a[1], b[1]) - 1,
+          Math.max(a[0], b[0]) + 1, Math.max(a[1], b[1]) + 1,
+          [f, a[0], a[1], b[0], b[1]]);
+      }
+    }
+    return idx;
+  };
+  // Insert a point into the segment of `p` it actually lies on. Returns true if it went in.
+  const spliceInto = (p, x, z) => {
+    let bd = 0.35 * 0.35, bk = -1;
+    for (let k = 1; k < p.length; k++) {
+      const d = nearestOnSeg(x, z, p[k - 1][0], p[k - 1][1], p[k][0], p[k][1]).d2;
+      if (d < bd) { bd = d; bk = k; }
+    }
+    if (bk < 0) return false;
+    if (Math.hypot(p[bk - 1][0] - x, p[bk - 1][1] - z) < 0.25) return false;
+    if (Math.hypot(p[bk][0] - x, p[bk][1] - z) < 0.25) return false;
+    p.splice(bk, 0, [x, z]);
+    return true;
+  };
+
+  let segIdx = buildSegIdx();
+  const spliceAt = new Map();      // feature index -> [[x, z], ...]
+  for (let i = 0; i < term.length; i++) {
+    const t = term[i];
+    if (atBoundary(t.x, t.z)) continue;
+    if (probe.near(t.x, t.z, TERM_BUILDING) < TERM_BUILDING) continue;
+    let bestD = TERM_REACH, bestF = -1, bx = 0, bz = 0;
+    segIdx.query(t.x, t.z, TERM_REACH, (rec) => {
+      const of = rec[0];
+      if (of === t.f) return;
+      const O = feats[of];
+      if (!termCompatible(t.F, O)) return;
+      const s = nearestOnSeg(t.x, t.z, rec[1], rec[2], rec[3], rec[4]);
+      const d = Math.sqrt(s.d2);
+      if (d >= bestD || d < 1e-4) return;
+      // Ahead, or close enough beside that the gap is obviously a survey artifact.
+      const ux = (s.x - t.x) / d, uz = (s.z - t.z) / d;
+      const ahead = ux * t.dx + uz * t.dz;
+      if (ahead < TERM_AHEAD && d > TERM_BLIND) return;
+      if (ahead >= TERM_AHEAD) {
+        const side = Math.abs(ux * -t.dz + uz * t.dx) * d;
+        if (side > TERM_SIDE) return;
+      }
+      bestD = d; bestF = of; bx = s.x; bz = s.z;
+    });
+    if (bestF < 0) continue;
+    if (probe.blocks(t.x, t.z, bx, bz)) continue;
+    // Extend this way to the meeting point...
+    if (t.end) t.F.raw.p.push([bx, bz]);
+    else t.F.raw.p.unshift([bx, bz]);
+    // ...and record the same point for insertion into the way it lands on, so the two really
+    // share a node rather than merely touching.
+    const list = spliceAt.get(bestF);
+    if (list) list.push([bx, bz]);
+    else spliceAt.set(bestF, [[bx, bz]]);
+    t.connected = true;
+    E.connected++;
+  }
+  for (const [f, list] of spliceAt) {
+    for (let m = 0; m < list.length; m++) {
+      if (spliceInto(feats[f].raw.p, list[m][0], list[m][1])) E.spliced++;
+    }
+  }
+
+  // --- 4b. crossings that share no node ---------------------------------------
+  // The other half of the same survey artifact: two ways at the same level that cross on the
+  // ground but were never given a shared node. Nothing dangles, and yet the graph the whole
+  // walkability audit is built on says the two are unconnected — which on a park path crossing
+  // another park path is simply false. Splice the intersection into both.
+  //
+  // Each crossing is tested in exactly ONE cell, the one that contains the intersection, which
+  // is what makes a dedup table unnecessary: over 88,000 segments the table was most of the cost
+  // of this pass and none of its value.
+  {
+    segIdx = buildSegIdx();
+    const cells = segIdx.cells;
+    const nxi = segIdx.nx;
+    const pend = new Map();
+    const level = (F) => (F.k === WAY_OVER ? Math.max(1, F.lay)
+      : (F.k === WAY_UNDER || F.k === WAY_SUB ? Math.min(-1, F.lay) : 0));
+    for (let c = 0; c < cells.length; c++) {
+      const arr = cells[c];
+      if (!arr || arr.length < 2) continue;
+      const ci = c % nxi, cj = (c / nxi) | 0;
+      for (let a = 0; a < arr.length; a++) {
+        const ra = arr[a];
+        const A = feats[ra[0]];
+        if (A.rail || !WALK_CLASS[A.cls]) continue;
+        for (let b = a + 1; b < arr.length; b++) {
+          const rb = arr[b];
+          if (ra[0] === rb[0]) continue;
+          const B = feats[rb[0]];
+          if (B.rail || !WALK_CLASS[B.cls]) continue;
+          if (level(A) !== level(B)) continue;
+          const d = (ra[3] - ra[1]) * (rb[4] - rb[2]) - (ra[4] - ra[2]) * (rb[3] - rb[1]);
+          if (Math.abs(d) < 1e-9) continue;
+          const t = ((rb[1] - ra[1]) * (rb[4] - rb[2]) - (rb[2] - ra[2]) * (rb[3] - rb[1])) / d;
+          const u = ((rb[1] - ra[1]) * (ra[4] - ra[2]) - (rb[2] - ra[2]) * (ra[3] - ra[1])) / d;
+          if (t < 0 || t > 1 || u < 0 || u > 1) continue;
+          const cxp = ra[1] + (ra[3] - ra[1]) * t, czp = ra[2] + (ra[4] - ra[2]) * t;
+          if (segIdx.ci(cxp) !== ci || segIdx.cj(czp) !== cj) continue;
+          // Already sharing a node there? Then the weld has it and nothing is missing.
+          if (Math.hypot(ra[1] - cxp, ra[2] - czp) < 0.9) continue;
+          if (Math.hypot(ra[3] - cxp, ra[4] - czp) < 0.9) continue;
+          if (Math.hypot(rb[1] - cxp, rb[2] - czp) < 0.9) continue;
+          if (Math.hypot(rb[3] - cxp, rb[4] - czp) < 0.9) continue;
+          for (const f of [ra[0], rb[0]]) {
+            const list = pend.get(f);
+            if (list) list.push([cxp, czp]);
+            else pend.set(f, [[cxp, czp]]);
+          }
+          E.crossings++;
+        }
+      }
+    }
+    for (const [f, list] of pend) {
+      for (let m = 0; m < list.length; m++) {
+        if (spliceInto(feats[f].raw.p, list[m][0], list[m][1])) E.spliced++;
+      }
+    }
+  }
+
+  // --- 5. what is left gets a designed terminus --------------------------------
+  deg = weld().deg;
+  term = collect();
+
+  const caps = [];
+  let left = 0;
+  for (let i = 0; i < term.length; i++) {
+    const t = term[i];
+    if (atBoundary(t.x, t.z)) continue;
+    if (probe.near(t.x, t.z, TERM_BUILDING) < TERM_BUILDING) continue;
+    left++;
+    // A concourse way is three storeys underground inside a building; its end is a door in a
+    // wall the subway pass already builds, and a turning circle down there would be nonsense.
+    if (t.F.k === WAY_SUB) { E.subwayEnds++; continue; }
+    let kind;
+    if (t.F.rail) kind = 'buffer';
+    else if (t.F.cls === 'foot' || t.F.cls === 'pedestrian' || t.F.w < CUL_MIN_W) kind = 'barrier';
+    else kind = 'cul';
+    caps.push({
+      kind, x: t.x, z: t.z, dx: t.dx, dz: t.dz,
+      w: t.F.w, cls: t.F.cls, heavy: t.F.rail && t.F.cls === 'heavy',
+    });
+    if (kind === 'cul') E.culDeSacs++;
+    else if (kind === 'barrier') E.barriers++;
+    else E.bufferStops++;
+  }
+  E.capped = caps.length;
+  E.danglingAfter = left - caps.length - E.subwayEnds;
+  E.terminiAfter = term.length;
+  E.ms = now() - t0;
+  return caps;
+}
+
+/* ------------------------------------------------------- terminus geometry -- */
+
+/**
+ * A cul-de-sac head: the paved bulb a dead-end street actually ends in, with a kerb ring round
+ * everything except the mouth the street arrives through.
+ */
+function emitCulDeSac(C, capRec) {
+  const hw = Math.max(capRec.w * 0.5, 1.6);
+  const r = Math.max(CUL_R_MIN, hw + 2.2);
+  // Centred so the bulb's rear extreme sits one half-width BEHIND the street's last vertex: the
+  // ribbon's square end is then completely inside the bulb and there is no notch between them.
+  // The two surfaces overlap over that half-width, deliberately — they are the same material at
+  // the same rung, so the overlap is invisible, where a gap would be a hole in the pavement. The
+  // carriageway's crown keeps the ribbon proud of the bulb along its centre line anyway.
+  const cx = capRec.x + capRec.dx * (r - hw);
+  const cz = capRec.z + capRec.dz * (r - hw);
+  const g = C.groundY(cx, cz);
+  if (!isNum(g)) return;
+  const mbR = C.mb.roads;
+  setMat(mbR, M.asphalt);
+  const yAt = (x, z) => C.groundY(x, z) + ROAD_Y;
+  // The bulb, as a fan of triangles laid on the ground so it follows the crown of the street.
+  const px = new Float64Array(CUL_SEG + 1), pz = new Float64Array(CUL_SEG + 1);
+  const py = new Float64Array(CUL_SEG + 1);
+  for (let i = 0; i <= CUL_SEG; i++) {
+    const a = (i / CUL_SEG) * TAU;
+    px[i] = cx + Math.cos(a) * r;
+    pz[i] = cz + Math.sin(a) * r;
+    py[i] = yAt(px[i], pz[i]);
+  }
+  const cy = yAt(cx, cz);
+  for (let i = 0; i < CUL_SEG; i++) {
+    const j = i + 1;
+    mbR.tri(cx, cy, cz, px[j], py[j], pz[j], px[i], py[i], pz[i]);
+  }
+  // Kerb ring, opened where the carriageway comes in so the street and the bulb are one surface.
+  setMat(mbR, M.curb);
+  const back = -capRec.dx, backZ = -capRec.dz;
+  for (let i = 0; i < CUL_SEG; i++) {
+    const a0 = (i / CUL_SEG) * TAU, a1 = ((i + 1) / CUL_SEG) * TAU;
+    const mx = Math.cos((a0 + a1) * 0.5), mz = Math.sin((a0 + a1) * 0.5);
+    if (mx * back + mz * backZ > 0.62) continue;          // the mouth
+    const x0 = cx + Math.cos(a0) * r, z0 = cz + Math.sin(a0) * r;
+    const x1 = cx + Math.cos(a1) * r, z1 = cz + Math.sin(a1) * r;
+    const o0 = cx + Math.cos(a0) * (r + 0.34), q0 = cz + Math.sin(a0) * (r + 0.34);
+    const o1 = cx + Math.cos(a1) * (r + 0.34), q1 = cz + Math.sin(a1) * (r + 0.34);
+    const y0 = yAt(x0, z0) + CURB, y1 = yAt(x1, z1) + CURB;
+    // Kerb face, looking IN at the carriageway (the outward radial is the back of it).
+    mbR.tri(x0, y0 - CURB, z0, x1, y1, z1, x0, y0, z0);
+    mbR.tri(x0, y0 - CURB, z0, x1, y1 - CURB, z1, x1, y1, z1);
+    // ...and its top, facing the sky.
+    mbR.tri(x0, y0, z0, o1, y1, q1, o0, y0, q0);
+    mbR.tri(x0, y0, z0, x1, y1, z1, o1, y1, q1);
+  }
+  C.stats.edge.culBuilt++;
+}
+
+/** A barrier line: the bollards and the kerb an alley or a footpath actually ends at. */
+function emitTerminusBarrier(C, capRec) {
+  const hw = clamp(capRec.w * 0.5, 0.9, 5.0);
+  const x = capRec.x + capRec.dx * 0.9, z = capRec.z + capRec.dz * 0.9;
+  const g = C.groundY(x, z);
+  if (!isNum(g)) return;
+  const sx = -capRec.dz, sz = capRec.dx;
+  const n = clamp(Math.round(hw / 0.85) * 2 + 1, 3, 9);
+  for (let i = 0; i < n; i++) {
+    const t = n > 1 ? (i / (n - 1)) * 2 - 1 : 0;
+    const bx = x + sx * hw * t * 0.86, bz = z + sz * hw * t * 0.86;
+    const by = C.groundY(bx, bz);
+    if (!isNum(by)) continue;
+    appendBollard(C.mb.props, bx, by + ROAD_Y, bz);
+    noteProp(C, 'bollard');
+  }
+  C.stats.edge.barriersBuilt++;
+}
+
+/** A buffer stop: the sleeper-built block a siding really ends at. */
+function emitBufferStop(C, capRec, liftAt) {
+  const x = capRec.x + capRec.dx * 1.1, z = capRec.z + capRec.dz * 1.1;
+  const g = C.terrainY(x, z) + (isNum(liftAt) ? liftAt : 0) + (capRec.heavy ? RAIL_BED : 0.03);
+  if (!isNum(g)) return;
+  const mb = C.mb.rails;
+  const sx = -capRec.dz * (BUFFER_W * 0.5), sz = capRec.dx * (BUFFER_W * 0.5);
+  setMat(mb, M.tie);
+  boxAA(mb, x, z, capRec.dx * 0.55, capRec.dz * 0.55, sx, sz, g - 0.10, g + BUFFER_H * 0.55);
+  setMat(mb, M.rail);
+  boxAA(mb, x - capRec.dx * 0.12, z - capRec.dz * 0.12, capRec.dx * 0.16, capRec.dz * 0.16,
+    sx * 0.92, sz * 0.92, g + BUFFER_H * 0.55, g + BUFFER_H);
+  C.stats.edge.buffersBuilt++;
+}
+
+/* ============================= the synthesised surround (CONTRACT §9.3) ==== */
+//
+// Beyond the surveyed rectangle the city has to keep going, and it has to keep going in the
+// pattern of whatever district it is leaving. Everything below is measured out of the data at the
+// boundary and nothing is hard-coded to this bounding box.
+//
+// The fringe is built as four EDGE STRIPS and four CORNER WEDGES, each with its own local frame:
+//
+//   * an edge strip carries SPOKES — parallel outward streets, one per real street that crosses
+//     the boundary there plus fill where the survey leaves a gap wider than the local block. They
+//     all share one bearing, the length-weighted mean of the real crossing streets, so the fringe
+//     grid is the district's grid and two spokes can never converge and cross;
+//   * a corner wedge carries a fan of spokes sweeping the ninety degrees between two edges;
+//   * RINGS run across the spokes at the local block pitch, each further out than the last by
+//     SUR_RING_GROW, so blocks get bigger and the fringe thins with distance;
+//   * a CELL between two spokes and two rings is a block. Its massing height and its built
+//     fraction are the area-weighted mean of the real buildings in the strip just inside the
+//     boundary, decayed outward, jittered by a hash of WORLD POSITION.
+//
+// Water is decided by the terrain, which harbour.js has carved to the surveyed shoreline and
+// padTerrain has replicated outward: a spoke whose base is wet carries nothing, and a spoke dies
+// at the first ring that goes wet. That is what keeps the surround from inventing a city on Lake
+// Ontario, and it needs no knowledge whatever of where Toronto's shore happens to run.
+
+function edgeFrames(extent) {
+  const EX = extent.x / 2, EZ = extent.z / 2;
+  return [
+    // name, origin, along-boundary tangent, outward normal, length
+    { nm: 'N', ox: -EX, oz: -EZ, sx: 1, sz: 0, nx: 0, nz: -1, len: 2 * EX },
+    { nm: 'E', ox: EX, oz: -EZ, sx: 0, sz: 1, nx: 1, nz: 0, len: 2 * EZ },
+    { nm: 'S', ox: EX, oz: EZ, sx: -1, sz: 0, nx: 0, nz: 1, len: 2 * EX },
+    { nm: 'W', ox: -EX, oz: EZ, sx: 0, sz: -1, nx: -1, nz: 0, len: 2 * EZ },
+  ];
+}
+
+/**
+ * Which edge a point inside the rectangle belongs to, and where on it.
+ * Returns [edgeIndex, s along the edge, depth inward from it].
+ */
+function edgeOf(edges, extent, x, z) {
+  const EX = extent.x / 2, EZ = extent.z / 2;
+  const d = [z + EZ, EX - x, EZ - z, x + EX];      // N, E, S, W
+  let best = 0;
+  for (let i = 1; i < 4; i++) if (d[i] < d[best]) best = i;
+  const e = edges[best];
+  const s = (x - e.ox) * e.sx + (z - e.oz) * e.sz;
+  return [best, s, d[best]];
+}
+
+/**
+ * Measure the district just inside each boundary: how dense its street grid is, which way its
+ * streets run, how tall and how closely packed its buildings are, and where it is water.
+ */
+function edgeProfile(edges, extent, roadsRaw, buildingsRaw, landAt) {
+  const prof = [];
+  for (let e = 0; e < 4; e++) {
+    const n = Math.max(2, Math.round(edges[e].len / EDGE_PROFILE_PITCH));
+    prof.push({
+      n,
+      step: edges[e].len / n,
+      road: new Float64Array(n),
+      area: new Float64Array(n),
+      hSum: new Float64Array(n),
+      bearX: 0, bearZ: 0, bearW: 0,
+      pitch: SUR_PITCH_MAX,
+      h: new Float64Array(n),
+      cover: new Float64Array(n),
+      wet: new Uint8Array(n),
+      cross: [],
+    });
+  }
+  const bin = (e, s) => clamp(Math.floor(s / prof[e].step), 0, prof[e].n - 1);
+
+  for (let i = 0; i < roadsRaw.length; i++) {
+    const r = roadsRaw[i];
+    if (!r || !Array.isArray(r.p) || r.p.length < 2) continue;
+    if (r.c !== 'motorway' && r.c !== 'major' && r.c !== 'minor' && r.c !== 'service') continue;
+    if (r.tun === 1) continue;
+    const p = r.p;
+    for (let k = 1; k < p.length; k++) {
+      const a = p[k - 1], b = p[k];
+      if (!isNum(a[0]) || !isNum(b[0])) continue;
+      const mx = (a[0] + b[0]) * 0.5, mz = (a[1] + b[1]) * 0.5;
+      const q = edgeOf(edges, extent, mx, mz);
+      if (q[2] > EDGE_PROFILE_DEPTH || q[1] < 0 || q[1] > edges[q[0]].len) continue;
+      const dx = b[0] - a[0], dz = b[1] - a[1];
+      const l = Math.hypot(dx, dz);
+      if (!(l > 0.5)) continue;
+      const P = prof[q[0]];
+      P.road[bin(q[0], q[1])] += l;
+      // Bearing: only the streets that genuinely cross the boundary say anything about which way
+      // the grid runs outward. One parallel to it says nothing and must not dilute the mean.
+      const E2 = edges[q[0]];
+      let ux = dx / l, uz = dz / l;
+      const dot = ux * E2.nx + uz * E2.nz;
+      if (Math.abs(dot) < 0.5) continue;
+      if (dot < 0) { ux = -ux; uz = -uz; }
+      const w = l * (r.c === 'motorway' || r.c === 'major' ? 2.2 : 1);
+      P.bearX += ux * w; P.bearZ += uz * w; P.bearW += w;
+    }
+  }
+
+  for (let i = 0; i < buildingsRaw.length; i++) {
+    const b = buildingsRaw[i];
+    if (!b || !Array.isArray(b.r) || !b.r.length) continue;
+    const h = isNum(b.h) ? b.h : 0;
+    if (h < 2) continue;
+    const ring = b.r[0];
+    if (!Array.isArray(ring) || ring.length < 3) continue;
+    let cx = 0, cz = 0, m = 0;
+    for (let k = 0; k < ring.length; k++) {
+      if (!isNum(ring[k][0])) continue;
+      cx += ring[k][0]; cz += ring[k][1]; m++;
+    }
+    if (!m) continue;
+    cx /= m; cz /= m;
+    const q = edgeOf(edges, extent, cx, cz);
+    if (q[2] > EDGE_PROFILE_DEPTH || q[1] < 0 || q[1] > edges[q[0]].len) continue;
+    const a = ringPlanArea(ring);
+    if (!(a > 4)) continue;
+    const P = prof[q[0]];
+    const k = bin(q[0], q[1]);
+    P.area[k] += a;
+    P.hSum[k] += a * h;
+  }
+
+  // Reduce to the numbers the fringe actually uses, then blur them along the boundary so the
+  // synthesised city changes character gradually instead of block by block.
+  for (let e = 0; e < 4; e++) {
+    const P = prof[e];
+    const boxArea = P.step * EDGE_PROFILE_DEPTH;
+    let roadTotal = 0;
+    for (let k = 0; k < P.n; k++) {
+      roadTotal += P.road[k];
+      P.h[k] = P.area[k] > 1 ? P.hSum[k] / P.area[k] : 0;
+      P.cover[k] = clamp(P.area[k] / Math.max(boxArea, 1), 0, 0.62);
+    }
+    // A lattice of spacing p puts 2/p metres of street on every square metre of ground.
+    const density = roadTotal / Math.max(boxArea * P.n, 1);
+    P.pitch = clamp(density > 1e-6 ? 2 / density : SUR_PITCH_MAX, SUR_PITCH_MIN, SUR_PITCH_MAX);
+    const bl = (a) => {
+      const t = new Float64Array(a.length);
+      for (let k = 0; k < a.length; k++) {
+        const lo = a[Math.max(0, k - 1)], hi = a[Math.min(a.length - 1, k + 1)];
+        t[k] = (lo + a[k] * 2 + hi) * 0.25;
+      }
+      a.set(t);
+    };
+    bl(P.h); bl(P.h); bl(P.cover); bl(P.cover);
+    const E2 = edges[e];
+    let bx = P.bearX, bz = P.bearZ;
+    const bl2 = Math.hypot(bx, bz);
+    if (bl2 > 1e-6 && P.bearW > 40) { bx /= bl2; bz /= bl2; } else { bx = E2.nx; bz = E2.nz; }
+    // Never further than 45 degrees off the normal: past that the "outward" street is really a
+    // boundary-parallel one and the strip would shear into slivers.
+    const dot = clamp(bx * E2.nx + bz * E2.nz, -1, 1);
+    if (dot < Math.SQRT1_2) {
+      const side = bx * E2.sx + bz * E2.sz;
+      const k = side >= 0 ? Math.SQRT1_2 : -Math.SQRT1_2;
+      bx = E2.nx * Math.SQRT1_2 + E2.sx * k;
+      bz = E2.nz * Math.SQRT1_2 + E2.sz * k;
+    }
+    P.dirX = bx; P.dirZ = bz;
+    for (let k = 0; k < P.n; k++) {
+      const s = (k + 0.5) * P.step;
+      const x = E2.ox + E2.sx * s + E2.nx * 6;
+      const z = E2.oz + E2.sz * s + E2.nz * 6;
+      P.wet[k] = landAt(x, z) ? 0 : 1;
+    }
+  }
+  return prof;
+}
+
+/** Where the real streets cross one boundary edge, as positions along it. */
+function edgeCrossings(edges, extent, roadsRaw, e) {
+  const E2 = edges[e];
+  const out = [];
+  for (let i = 0; i < roadsRaw.length; i++) {
+    const r = roadsRaw[i];
+    if (!r || !Array.isArray(r.p) || r.p.length < 2) continue;
+    if (r.c !== 'motorway' && r.c !== 'major' && r.c !== 'minor' && r.c !== 'service') continue;
+    const p = r.p;
+    for (const k of [0, p.length - 1]) {
+      const q = edgeOf(edges, extent, p[k][0], p[k][1]);
+      if (q[0] !== e || q[2] > EDGE_BAND || q[1] < 0 || q[1] > E2.len) continue;
+      const j = k === 0 ? 1 : p.length - 2;
+      const dx = p[k][0] - p[j][0], dz = p[k][1] - p[j][1];
+      const l = Math.hypot(dx, dz);
+      if (!(l > 1)) continue;
+      if ((dx / l) * E2.nx + (dz / l) * E2.nz < 0.25) continue;
+      out.push({ s: q[1], big: r.c === 'motorway' || r.c === 'major' });
+    }
+  }
+  out.sort((a, b) => a.s - b.s);
+  return out;
+}
+
+/**
+ * Build the whole surround: the spokes, the rings, the streets they make and the blocks between
+ * them. Pure analysis and a few thousand small records; no vertices are produced here.
+ */
+function buildSurround(opts) {
+  const t0 = now();
+  const extent = opts.extent;
+  const F = opts.fringe;
+  const landAt = opts.landAt;
+  const terrainY = opts.terrainY;
+  const stats = opts.stats;
+  const S = stats.surround;
+  const edges = edgeFrames(extent);
+  const prof = edgeProfile(edges, extent, opts.roadsRaw, opts.buildingsRaw, landAt);
+
+  const roads = [];
+  const blocks = [];
+  const strips = [];
+
+  const ringsFor = (pitch) => {
+    const t = [0];
+    let step = pitch;
+    for (let r = 0; r < SUR_RING_MAX && t[t.length - 1] < F; r++) {
+      t.push(t[t.length - 1] + step);
+      step *= 1 + SUR_RING_GROW;
+    }
+    return t;
+  };
+
+  // --- edge strips -----------------------------------------------------------
+  for (let e = 0; e < 4; e++) {
+    const E2 = edges[e];
+    const P = prof[e];
+    const pitch = P.pitch;
+    const ring = ringsFor(pitch);
+    const seeds = edgeCrossings(edges, extent, opts.roadsRaw, e);
+    // Real crossings first, deduped, then fill so no block is wider than 1.55 pitches.
+    const sPos = [];
+    const big = [];
+    for (let i = 0; i < seeds.length; i++) {
+      if (sPos.length && seeds[i].s - sPos[sPos.length - 1] < pitch * 0.42) {
+        if (seeds[i].big) big[big.length - 1] = true;
+        continue;
+      }
+      sPos.push(seeds[i].s);
+      big.push(seeds[i].big);
+    }
+    if (!sPos.length) { sPos.push(pitch * 0.5); big.push(false); }
+    const fill = [];
+    const fillBig = [];
+    const put = (s, b) => { fill.push(s); fillBig.push(b); };
+    if (sPos[0] > pitch * 0.6) {
+      const n = Math.ceil(sPos[0] / pitch);
+      for (let k = 1; k <= n - 1; k++) put(sPos[0] * (k / n), false);
+    }
+    for (let i = 0; i < sPos.length; i++) {
+      put(sPos[i], big[i]);
+      const next = i + 1 < sPos.length ? sPos[i + 1] : E2.len;
+      const gap = next - sPos[i];
+      if (gap > pitch * 1.55) {
+        const n = Math.round(gap / pitch);
+        for (let k = 1; k < n; k++) put(sPos[i] + gap * (k / n), false);
+      }
+    }
+    const spokes = [];
+    for (let i = 0; i < fill.length; i++) {
+      const s = fill[i];
+      if (s < -1 || s > E2.len + 1) continue;
+      const bx = E2.ox + E2.sx * s, bz = E2.oz + E2.sz * s;
+      const k = clamp(Math.floor(s / P.step), 0, P.n - 1);
+      // How far this spoke reaches before it runs into the lake.
+      let alive = 0;
+      for (let r = 1; r < ring.length; r++) {
+        const x = bx + P.dirX * ring[r], z = bz + P.dirZ * ring[r];
+        if (!landAt(x, z)) break;
+        alive = r;
+      }
+      if (!landAt(bx + P.dirX * 4, bz + P.dirZ * 4)) alive = 0;
+      spokes.push({
+        x: bx, z: bz, dx: P.dirX, dz: P.dirZ, alive,
+        h: P.h[k], cover: P.cover[k], big: fillBig[i],
+      });
+      if (!alive) S.waterSpokes++;
+    }
+    strips.push({ kind: 'edge', spokes, ring, pitch, e });
+    S.spokes += spokes.length;
+  }
+
+  // --- corner wedges ---------------------------------------------------------
+  // The ninety degrees between two edges, as a fan from the corner point. Its radius runs a
+  // little past the fringe depth so the diagonal is covered rather than notched.
+  for (let c = 0; c < 4; c++) {
+    const A = edges[c], B = edges[(c + 1) & 3];
+    const cx = A.ox + A.sx * A.len, cz = A.oz + A.sz * A.len;
+    const pitch = (prof[c].pitch + prof[(c + 1) & 3].pitch) * 0.5;
+    const ring = ringsFor(pitch);
+    const R = ring[ring.length - 1];
+    const a0 = Math.atan2(A.nz, A.nx);
+    const nSp = clamp(Math.round((Math.PI * 0.5 * R * 0.55) / pitch), 3, 26);
+    const kA = clamp(prof[c].n - 1, 0, prof[c].n - 1);
+    const spokes = [];
+    for (let i = 0; i <= nSp; i++) {
+      const a = a0 + (Math.PI * 0.5) * (i / nSp);
+      const dx = Math.cos(a), dz = Math.sin(a);
+      let alive = 0;
+      for (let r = 1; r < ring.length; r++) {
+        if (!landAt(cx + dx * ring[r], cz + dz * ring[r])) break;
+        alive = r;
+      }
+      if (!landAt(cx + dx * 4, cz + dz * 4)) alive = 0;
+      const t = i / nSp;
+      spokes.push({
+        x: cx, z: cz, dx, dz, alive,
+        h: lerp(prof[c].h[kA], prof[(c + 1) & 3].h[0], t),
+        cover: lerp(prof[c].cover[kA], prof[(c + 1) & 3].cover[0], t),
+        big: false,
+      });
+      if (!alive) S.waterSpokes++;
+    }
+    strips.push({ kind: 'corner', spokes, ring, pitch, e: -1 });
+    S.spokes += spokes.length;
+  }
+
+  // --- streets and blocks ------------------------------------------------------
+  const pointAt = (sp, t) => [sp.x + sp.dx * t, sp.z + sp.dz * t];
+  for (let g = 0; g < strips.length; g++) {
+    const st = strips[g];
+    const ring = st.ring;
+    S.rings = Math.max(S.rings, ring.length - 1);
+    // Radial streets — and they thin outward with the blocks. A street grid that keeps its full
+    // density past the last building draws a lattice of empty roads across open country, which
+    // reads as stranger than a hard edge would. What survives furthest is what survives furthest
+    // in a real city: the arterials, then one local street in four, then one in two, then all.
+    const rankReach = (i, sp) => {
+      if (sp.big) return 1.0;
+      if (i % 4 === 0) return SUR_ROAD_KEEP[0];
+      if (i % 2 === 0) return SUR_ROAD_KEEP[1];
+      return SUR_ROAD_KEEP[2];
+    };
+    const liveAt = [];
+    for (let i = 0; i < st.spokes.length; i++) {
+      const sp = st.spokes[i];
+      const cap = F * rankReach(i, sp);
+      let live = 0;
+      while (live + 1 <= sp.alive && ring[live + 1] <= cap + EPS) live++;
+      liveAt.push(live);
+    }
+    for (let i = 0; i < st.spokes.length; i++) {
+      const sp = st.spokes[i];
+      if (liveAt[i] < 1) continue;
+      const end = ring[liveAt[i]];
+      const pts = [];
+      const n = Math.max(2, Math.ceil(end / SUR_ROAD_SEG) + 1);
+      for (let k = 0; k < n; k++) pts.push(pointAt(sp, (end * k) / (n - 1)));
+      roads.push({ p: pts, w: sp.big ? SUR_ROAD_W.arterial : SUR_ROAD_W.street, t: 0 });
+    }
+    // Ring streets: one polyline per ring through every spoke still alive at it.
+    for (let r = 1; r < ring.length; r++) {
+      if (ring[r] > F * SUR_RING_KEEP) break;
+      let run = [];
+      for (let i = 0; i < st.spokes.length; i++) {
+        if (liveAt[i] >= r) { run.push(pointAt(st.spokes[i], ring[r])); continue; }
+        if (run.length > 1) roads.push({ p: run, w: SUR_ROAD_W.street, t: ring[r] });
+        run = [];
+      }
+      if (run.length > 1) roads.push({ p: run, w: SUR_ROAD_W.street, t: ring[r] });
+    }
+    // Blocks.
+    for (let i = 0; i + 1 < st.spokes.length; i++) {
+      const a = st.spokes[i], b = st.spokes[i + 1];
+      const live = Math.min(a.alive, b.alive);
+      for (let r = 0; r + 1 <= live; r++) {
+        const t0r = ring[r], t1r = ring[r + 1];
+        const A = pointAt(a, t0r), B = pointAt(b, t0r);
+        const Cc = pointAt(b, t1r), D = pointAt(a, t1r);
+        const mid = [(A[0] + B[0] + Cc[0] + D[0]) * 0.25, (A[1] + B[1] + Cc[1] + D[1]) * 0.25];
+        if (!landAt(mid[0], mid[1])) continue;
+        const tMid = (t0r + t1r) * 0.5;
+        const hMean = (a.h + b.h) * 0.5;
+        const cover = (a.cover + b.cover) * 0.5;
+        blocks.push({
+          co: [A, B, Cc, D],
+          mx: mid[0], mz: mid[1],
+          t: tMid,
+          fringe: F,
+          h: hMean,
+          cover,
+          streetHW: SUR_ROAD_W.street * 0.5,
+        });
+      }
+    }
+  }
+
+  S.blocks = blocks.length;
+  S.streets = roads.length;
+  let m = 0;
+  for (let i = 0; i < roads.length; i++) {
+    const p = roads[i].p;
+    for (let k = 1; k < p.length; k++) m += Math.hypot(p[k][0] - p[k - 1][0], p[k][1] - p[k - 1][1]);
+  }
+  S.streetMetres = m;
+  S.fringe = F;
+  S.ms = now() - t0;
+  return { roads, blocks, prof, edges };
+}
+
+/* ------------------------------------------------------- surround geometry -- */
+
+/** One synthesised street: carriageway, and a kerbed pavement where the player can reach it. */
+function emitSurroundStreet(C, rec) {
+  let pts = polyResample(rec.p, SUR_ROAD_SEG);
+  if (pts.length < 2) return;
+  const hw = rec.w * 0.5;
+  const walk = rec.t <= C.surWalk;
+  const reach = hw + (walk ? 2.8 : 0.4);
+  pts = pruneSpikes(pts, reach);
+  if (pts.length < 2) return;
+  const frames = polyFrames(pts, reach);
+  const yAt = (x, z) => C.groundY(x, z) + ROAD_Y;
+  const mbR = C.mb.roads;
+  setMat(mbR, M.asphalt);
+  emitRibbon(mbR, pts, frames, [{ o: -hw, dy: 0 }, { o: 0, dy: CROWN }, { o: hw, dy: 0 }], yAt);
+  if (!walk) return;
+  // Kerb face and pavement, only where the player can actually reach it. The cross-section is
+  // always given in INCREASING offset, which is what emitRibbon's winding test expects.
+  const mbS = C.mb.sidewalks;
+  setMat(mbS, M.sidewalk);
+  emitRibbon(mbS, pts, frames, [
+    { o: -(hw + 2.6), dy: CURB }, { o: -hw, dy: CURB }, { o: -hw, dy: 0 },
+  ], yAt);
+  emitRibbon(mbS, pts, frames, [
+    { o: hw, dy: 0 }, { o: hw, dy: CURB }, { o: hw + 2.6, dy: CURB },
+  ], yAt);
+}
+
+/**
+ * Enumerate the generic masses of one synthesised block: between one and SUR_MASS_CAP of them, at
+ * the height and density the real district just inside the boundary was measured at, thinning
+ * with distance out.
+ *
+ * A PURE function of the block and of world position — every choice is hashed on the mass's own
+ * centre — so the geometry pass and the collision registration below enumerate exactly the same
+ * buildings, and a tile rebuilt after eviction is identical to the one it replaces.
+ *
+ * `visit(ring, groundY, height, cx, cz)` gets a plan-CCW flat ring, ready for emitPrism.
+ */
+function forEachSurroundMass(blk, terrainY, visit, blocked) {
+  const co = blk.co;
+  // Inset from the streets that bound it.
+  const inset = blk.streetHW + SUR_SETBACK;
+  const cx = blk.mx, cz = blk.mz;
+  const pull = (p) => {
+    let dx = cx - p[0], dz = cz - p[1];
+    const l = Math.hypot(dx, dz);
+    if (!(l > EPS)) return [p[0], p[1]];
+    const k = Math.min(inset / l, 0.42);
+    return [p[0] + dx * k, p[1] + dz * k];
+  };
+  const q = [pull(co[0]), pull(co[1]), pull(co[2]), pull(co[3])];
+  const eU = Math.hypot(q[1][0] - q[0][0], q[1][1] - q[0][1]);
+  const eV = Math.hypot(q[3][0] - q[0][0], q[3][1] - q[0][1]);
+  if (eU < SUR_MASS_MIN || eV < SUR_MASS_MIN) return;
+  const nU = clamp(Math.round(eU / SUR_MASS_MAX) || 1, 1, SUR_MASS_CAP);
+  const nV = clamp(Math.round(eV / SUR_MASS_MAX) || 1, 1, SUR_MASS_CAP);
+  const decayH = Math.pow(0.5, blk.t / SUR_H_DECAY);
+  const decayC = Math.pow(0.5, blk.t / SUR_COVER_DECAY);
+  // ...and a taper to nothing over the last stretch of the fringe. Without it the invented city
+  // stops on a line — the last ring of blocks is still at 40% of its density and then there is
+  // bare ground — and a line is exactly what §9.3 says must not be there. With it the blocks
+  // thin to scattered outliers and then to open country, which is what the edge of a city looks
+  // like from the air and what the haze can then finish.
+  const fade = 1 - smoothstep(blk.fringe * SUR_FADE_IN, blk.fringe, blk.t);
+  const base = Math.max(SUR_H_MIN, blk.h * decayH);
+  const cover = clamp(blk.cover * decayC * 2.4 * fade, 0, 0.94);
+  const lerp2 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+  for (let v = 0; v < nV; v++) {
+    for (let u = 0; u < nU; u++) {
+      // Bilinear sub-quad of the block, then a gap so the masses read as separate buildings.
+      const u0 = u / nU, u1 = (u + 1) / nU, v0 = v / nV, v1 = (v + 1) / nV;
+      const corner = (uu, vv) => lerp2(lerp2(q[0], q[1], uu), lerp2(q[3], q[2], uu), vv);
+      const p00 = corner(u0, v0), p10 = corner(u1, v0);
+      const p11 = corner(u1, v1), p01 = corner(u0, v1);
+      const mx = (p00[0] + p10[0] + p11[0] + p01[0]) * 0.25;
+      const mz = (p00[1] + p10[1] + p11[1] + p01[1]) * 0.25;
+      if (hash2(mx, mz, 0x5e1) > cover) continue;
+      // Side yard, hashed: a constant gap subdivides every block into identical slabs, which is
+      // what makes generated filler read as generated.
+      const gap = 1.2 + hash2(mx, mz, 0x5e4) * 3.3;
+      const shrink = (p) => {
+        let dx = mx - p[0], dz = mz - p[1];
+        const l = Math.hypot(dx, dz);
+        if (!(l > EPS)) return [p[0], p[1]];
+        const k = Math.min(gap / l, 0.40);
+        return [p[0] + dx * k, p[1] + dz * k];
+      };
+      const s00 = shrink(p00), s10 = shrink(p10), s11 = shrink(p11), s01 = shrink(p01);
+      const w = Math.hypot(s10[0] - s00[0], s10[1] - s00[1]);
+      const d = Math.hypot(s01[0] - s00[0], s01[1] - s00[1]);
+      if (w < SUR_MASS_MIN * 0.5 || d < SUR_MASS_MIN * 0.5) continue;
+      // Height: the district mean, decayed outward, jittered on world position, and quantised to
+      // whole storeys so the fringe skyline has the same step a real one does.
+      const j = 1 + (hash2(mx, mz, 0x5e2) * 2 - 1) * SUR_H_JITTER;
+      // ...and the outliers. Every real district has a handful of buildings several times the
+      // height of the stock around them — the tower at the subway stop, the slab on the
+      // arterial — and a fringe drawn only from the MEAN of its neighbours has none of them,
+      // which reads from the air as a container yard rather than as a city.
+      const tall = hash2(mx, mz, 0x5e5);
+      const spike = tall < SUR_TALL_P ? lerp(2.2, SUR_TALL_MAX, tall / SUR_TALL_P) : 1;
+      const storeys = Math.max(1, Math.round((base * j * spike) / 3.4));
+      const h = storeys * 3.4;
+      // Ground: the lowest corner, so nothing floats on a slope; the wall starts below it.
+      let g = Infinity;
+      for (const p of [s00, s10, s11, s01]) {
+        const y = terrainY(p[0], p[1]);
+        if (isNum(y) && y < g) g = y;
+      }
+      if (!isFinite(g)) continue;
+      // A surveyed footprint is the authority wherever it reaches, and the extract clips at the
+      // bounding box rather than at the building, so real footprints spill up to a hundred metres
+      // into the fringe. Never invent a mass on top of one. Tested on the centre AND the corners,
+      // and by the SAME predicate in both the geometry pass and the collision registration, so
+      // what you walk into is still exactly what you can see.
+      if (blocked && (blocked(mx, mz) || blocked(s00[0], s00[1]) || blocked(s10[0], s10[1])
+        || blocked(s11[0], s11[1]) || blocked(s01[0], s01[1]))) continue;
+      let ring = [s00[0], -s00[1], s10[0], -s10[1], s11[0], -s11[1], s01[0], -s01[1]];
+      // Plan-CCW, so the prism's walls face out and its cap faces the sky.
+      if (shoelace(ring, 0, ring.length) < 0) {
+        ring = [ring[6], ring[7], ring[4], ring[5], ring[2], ring[3], ring[0], ring[1]];
+      }
+      visit(ring, g, h, mx, mz);
+    }
+  }
+}
+
+/** The geometry of one synthesised block. */
+function emitSurroundBlock(C, blk) {
+  forEachSurroundMass(blk, C.terrainY, (ring, g, h, mx, mz) => {
+    const profile = h >= 34 ? (hash2(mx, mz, 0x5e3) < 0.45 ? 1 : 2) : (h >= 12 ? 3 : 5);
+    const spec = facadeMaterial({ h, y: g, cx: mx, cz: mz, t: profile }, null);
+    const mb = spec.glassy ? C.mb.glass : C.mb.buildings;
+    setMat(mb, spec.mat);
+    emitPrism(mb, ring, ring, g - 1.6, g + h, false);
+    // The roof is its own material and PROFILE 0 without exception, exactly as the surveyed
+    // city's is: a roof that emits window light is the loudest tell there is.
+    const mbR = C.mb.buildings;
+    setMat(mbR, roofMaterial(spec.mat, _roofMat));
+    const top = g + h;
+    for (let k = 4; k < ring.length; k += 2) {
+      mbR.tri(ring[0], top, -ring[1], ring[k - 2], top, -ring[k - 1], ring[k], top, -ring[k + 1]);
+    }
+    C.stats.surround.masses++;
+  }, C.realFoot);
+}
+
+/**
+ * The riprap bank where the synthesised ground meets the water (CONTRACT §9.2).
+ *
+ * Inside the survey every land/water meeting is an engineered edge that harbour.js builds from
+ * surveyed geometry — a quay wall, a beach, a mound of rubble. Outside it there is no survey to
+ * build from, and the padded terrain on its own would hand the lake a bare slope of ground: a
+ * surface that simply becomes water, which §9.2 forbids in as many words.
+ *
+ * So the waterline is found in the terrain itself — marching squares over the padded grid, cell
+ * by cell, wherever a cell straddles the water plane outside the surveyed rectangle — and clad in
+ * a band of riprap: a crest a metre above the water, the waterline itself, and a toe below it, all
+ * laid a few centimetres proud of the ground so the stone is what the lake meets and the water
+ * plane never intersects bare terrain at a grazing angle.
+ *
+ * Per tile, from the tile's own terrain cells, so it costs nothing where there is no shore and is
+ * built and evicted exactly like the ground it clads.
+ */
+function emitFringeBank(C, T, i0, i1, j0, j1, extent) {
+  const { nx, nz, cell, x0, z0, h } = T;
+  const EX = extent.x / 2, EZ = extent.z / 2;
+  const mb = C.mb.terrain;
+  const ia = Math.max(0, i0), ib = Math.min(nx - 1, i1);
+  const ja = Math.max(0, j0), jb = Math.min(nz - 1, j1);
+  let set = false;
+  const grad = [0, 0];
+  const upAt = (gi, gj) => {
+    const a = clamp(gi, 1, nx - 2), b = clamp(gj, 1, nz - 2);
+    // Uphill, i.e. inland: the ground rises away from the water on the land side by definition.
+    let ux = h[b * nx + a - 1] - h[b * nx + a + 1];
+    let uz = h[(b - 1) * nx + a] - h[(b + 1) * nx + a];
+    const l = Math.hypot(ux, uz);
+    if (l > EPS) { ux /= l; uz /= l; } else { ux = 1; uz = 0; }
+    grad[0] = ux; grad[1] = uz;
+    // Steepness, metres of rise per metre of plan, from the same central difference.
+    const rise = Math.hypot(h[b * nx + a - 1] - h[b * nx + a + 1],
+      h[(b - 1) * nx + a] - h[(b + 1) * nx + a]) / (2 * cell);
+    return rise > 0.02 ? rise : 0.02;
+  };
+  for (let j = ja; j < jb; j++) {
+    for (let i = ia; i < ib; i++) {
+      const xa = x0 + i * cell, xb = xa + cell;
+      const za = z0 + j * cell, zb = za + cell;
+      // Only outside the surveyed rectangle: inside it the quay, the beach and the rubble mounds
+      // are real geometry built from real data and this would be a second, invented edge.
+      if (xb > -EX && xa < EX && zb > -EZ && za < EZ) continue;
+      const y00 = h[j * nx + i], y10 = h[j * nx + i + 1];
+      const y01 = h[(j + 1) * nx + i], y11 = h[(j + 1) * nx + i + 1];
+      const s00 = y00 > WATER_Y, s10 = y10 > WATER_Y;
+      const s01 = y01 > WATER_Y, s11 = y11 > WATER_Y;
+      const nWet = (s00 ? 0 : 1) + (s10 ? 0 : 1) + (s01 ? 0 : 1) + (s11 ? 0 : 1);
+      if (nWet === 0 || nWet === 4) continue;
+      // Marching squares: the crossing point on each edge that straddles the water plane.
+      const cross = [];
+      const edge = (ax, az, av, bx, bz, bv) => {
+        if ((av > WATER_Y) === (bv > WATER_Y)) return;
+        const t = clamp((WATER_Y - av) / ((bv - av) || EPS), 0, 1);
+        cross.push(ax + (bx - ax) * t, az + (bz - az) * t);
+      };
+      edge(xa, za, y00, xb, za, y10);
+      edge(xb, za, y10, xb, zb, y11);
+      edge(xb, zb, y11, xa, zb, y01);
+      edge(xa, zb, y01, xa, za, y00);
+      if (cross.length < 4) continue;
+      if (!set) { setMat(mb, M.riprap); set = true; }
+      for (let k = 0; k + 3 < cross.length; k += 4) {
+        const ax = cross[k], az = cross[k + 1], bx = cross[k + 2], bz = cross[k + 3];
+        if (Math.hypot(bx - ax, bz - az) < 0.05) continue;
+        const rise = upAt(Math.round((((ax + bx) * 0.5) - x0) / cell),
+          Math.round((((az + bz) * 0.5) - z0) / cell));
+        const ux = grad[0], uz = grad[1];
+        const inW = clamp(BANK_TOP / rise, 0.8, 7.0);
+        const toeW = clamp(-BANK_TOE / rise, 0.6, 6.0);
+        const crest = WATER_Y + BANK_TOP + BANK_LIFT;
+        const wl = WATER_Y + BANK_LIFT;
+        const toe = WATER_Y + BANK_TOE;
+        const iax = ax + ux * inW, iaz = az + uz * inW;
+        const ibx = bx + ux * inW, ibz = bz + uz * inW;
+        const tax = ax - ux * toeW, taz = az - uz * toeW;
+        const tbx = bx - ux * toeW, tbz = bz - uz * toeW;
+        triUp(mb, iax, crest, iaz, ibx, crest, ibz, bx, wl, bz);
+        triUp(mb, iax, crest, iaz, bx, wl, bz, ax, wl, az);
+        triUp(mb, ax, wl, az, bx, wl, bz, tbx, toe, tbz);
+        triUp(mb, ax, wl, az, tbx, toe, tbz, tax, toe, taz);
+        C.stats.surround.bankMetres += Math.hypot(bx - ax, bz - az);
+      }
+      C.stats.surround.bankCells++;
+    }
+  }
+}
+
+/**
+ * The apron: the ground between the last tile and the horizon (CONTRACT §9.3, §9.4).
+ *
+ * Past the padded terrain grid the height field is constant in the outward direction — that is
+ * what edge replication means — so the surface out there is exactly a ruled extrusion of the
+ * grid's boundary row, and two rings of quads describe it without a single metre of error. Its
+ * vertices, its heights and its normals are read from the grid's own boundary, so the join is not
+ * a join: the apron's inner edge IS the terrain's outer edge, vertex for vertex.
+ *
+ * Two rings rather than one only so that no triangle is thirteen kilometres long; the surface is
+ * identical either way. It comes to about 17 k vertices for the whole world, is always resident
+ * and is never culled, because it is on screen from every viewpoint there is.
+ */
+function emitSurroundApron(mb, T, reach) {
+  const nrm = terrainNormals(T);
+  const { nx, nz, cell, x0, z0, h } = T;
+  const x1 = x0 + (nx - 1) * cell, z1 = z0 + (nz - 1) * cell;
+  const mid = Math.min(800, reach * 0.5);
+  const steps = [mid, reach];
+  setMat(mb, M.terrain);
+  const put = (x, z, k) => {
+    const o = k * 3;
+    mb.vert(x, h[k], z, nrm[o], nrm[o + 1], nrm[o + 2]);
+  };
+  // North (outward -Z) and south (+Z): one column of quads per terrain column.
+  for (let i = 0; i + 1 < nx; i++) {
+    const xa = x0 + i * cell, xb = x0 + (i + 1) * cell;
+    let za = z0;
+    for (let s = 0; s < steps.length; s++) {
+      const zb = z0 - steps[s];
+      const ka = i, kb = i + 1;
+      put(xa, za, ka); put(xb, za, kb); put(xb, zb, kb);
+      put(xa, za, ka); put(xb, zb, kb); put(xa, zb, ka);
+      za = zb;
+    }
+    const r = (nz - 1) * nx;
+    let zc = z1;
+    for (let s = 0; s < steps.length; s++) {
+      const zd = z1 + steps[s];
+      const ka = r + i, kb = r + i + 1;
+      put(xa, zd, ka); put(xb, zd, kb); put(xb, zc, kb);
+      put(xa, zd, ka); put(xb, zc, kb); put(xa, zc, ka);
+      zc = zd;
+    }
+  }
+  // West (outward -X) and east (+X).
+  for (let j = 0; j + 1 < nz; j++) {
+    const za = z0 + j * cell, zb = z0 + (j + 1) * cell;
+    let xa = x0;
+    for (let s = 0; s < steps.length; s++) {
+      const xb = x0 - steps[s];
+      const ka = j * nx, kb = (j + 1) * nx;
+      put(xb, za, ka); put(xa, za, ka); put(xa, zb, kb);
+      put(xb, za, ka); put(xa, zb, kb); put(xb, zb, kb);
+      xa = xb;
+    }
+    let xc = x1;
+    for (let s = 0; s < steps.length; s++) {
+      const xd = x1 + steps[s];
+      const ka = j * nx + nx - 1, kb = (j + 1) * nx + nx - 1;
+      put(xc, za, ka); put(xd, za, ka); put(xd, zb, kb);
+      put(xc, za, ka); put(xd, zb, kb); put(xc, zb, kb);
+      xc = xd;
+    }
+  }
+  // Four corner squares, at the corner vertex's own height and normal.
+  const corner = (kx, kz, sx, sz) => {
+    const k = kz * nx + kx;
+    const ox = kx === 0 ? x0 : x1, oz = kz === 0 ? z0 : z1;
+    const ax = ox, az = oz;
+    const bx = ox + sx * reach, bz = oz + sz * reach;
+    const p = [[ax, az], [bx, az], [bx, bz], [ax, bz]];
+    // Wind so the cap faces the sky whichever corner this is.
+    const s = (p[1][0] - p[0][0]) * (p[0][1] - p[3][1]) - (p[3][0] - p[0][0]) * (p[0][1] - p[1][1]);
+    const o = s >= 0 ? [0, 1, 2, 3] : [0, 3, 2, 1];
+    put(p[o[0]][0], p[o[0]][1], k); put(p[o[1]][0], p[o[1]][1], k); put(p[o[2]][0], p[o[2]][1], k);
+    put(p[o[0]][0], p[o[0]][1], k); put(p[o[2]][0], p[o[2]][1], k); put(p[o[3]][0], p[o[3]][1], k);
+  };
+  corner(0, 0, -1, -1);
+  corner(nx - 1, 0, 1, -1);
+  corner(nx - 1, nz - 1, 1, 1);
+  corner(0, nz - 1, -1, 1);
+}
+
+/* ============================================== the soft limit (§9.3) ===== */
+//
+// "Then stop the player with a soft, explained limit well inside the visual edge."
+//
+// The limit is a rectangle SOFT_OUT metres outside the data, so the last thing anyone can reach
+// is still synthesised city with several hundred metres of it still ahead. Approaching it, the
+// OUTWARD component of the camera's velocity is scaled down over SOFT_EASE metres and reaches
+// zero exactly at the limit: the camera coasts to a stop instead of striking a plane, sideways
+// motion is never touched, and turning round is instant because the gain applies only to motion
+// that is trying to leave. `limitFrac` rises 0 -> 1 across the same band, which is what a HUD or
+// a vignette should read to say WHY.
+//
+// The hard clamp is a backstop for a teleport, not the mechanism.
+
+function makeLimits(extent, fringe) {
+  const out = clamp(fringe * SOFT_OUT_FRAC, 120, SOFT_OUT_MAX);
+  return {
+    x: extent.x / 2 + out, z: extent.z / 2 + out,
+    ease: Math.min(SOFT_EASE, out * 0.9),
+    out,
+  };
+}
+
+function limitAxis(u, lim, ease) {
+  const m = Math.abs(u);
+  const a = lim - ease;
+  if (m <= a) return 1;
+  return 1 - smoothstep(0, 1, clamp((m - a) / Math.max(ease, EPS), 0, 1));
+}
+
+/* ==================================================== horizon audit (§9.4) == */
+//
+// "No viewpoint inside the playable area from which the world visibly ends."
+//
+// Proved rather than asserted, and proved GEOMETRICALLY, because a screenshot only ever proves
+// one frame. The drawn world is a rectangle: the apron. Along any horizontal bearing from any
+// viewpoint there is therefore exactly one distance at which it stops and the sky begins, and
+// that distance is computable in closed form. What has to be true is that render.js's air is
+// already opaque there — at every one of the four time presets and at every altitude the camera
+// can reach.
+//
+// The fog model below is a faithful JS copy of vhFogAmount() in render.js together with the four
+// presets' parameters from main.js. It is duplicated ON PURPOSE and for audit only: the point of
+// the test is to fail loudly if either of them changes in a way that reopens the horizon, which a
+// shared implementation could not do. render.js is the authority for what is drawn; this is a
+// second opinion about it.
+
+// `sun` is the sun's contribution to airlight — render.js multiplies both the haze thinning and
+// the aerial-perspective coefficient by it, and by nothing else. NOTE that this table is an
+// AUDIT, not detail: it produces no vertex, sets no material and is read by nothing that emits.
+// CONTRACT §7 forbids geometry from carrying a notion of time of day, and none here does; what
+// this measures is whether the ATMOSPHERE closes the horizon at every hour, which is a question
+// that cannot be asked without knowing what the hours are.
+const HORIZON_PRESETS = [
+  { name: 'Afternoon', sun: 1.00, density: 0.00026, height: 120, base: 4, max: 0.72 },
+  { name: 'Golden hour', sun: 0.45, density: 0.00072, height: 85, base: 4, max: 0.86 },
+  { name: 'Blue hour', sun: 0.00, density: 0.00110, height: 55, base: 4, max: 0.94 },
+  { name: 'Night', sun: 0.00, density: 0.00135, height: 48, base: 4, max: 0.96 },
+];
+const HORIZON_DAY_FOG = 0.24;       // render.js DAY_FOG_DENSITY
+const HORIZON_VISUAL = 40000;       // render.js env.fogVisualRange
+const HORIZON_R0 = 3000;            // env.fogRange
+const HORIZON_SPAN = 5200;          // env.fogRangeSpan
+const HORIZON_CAP0 = 3000;          // env.fogHorizon
+const HORIZON_CAP1 = 13000;         // env.fogHorizonEnd
+const HORIZON_CEILING = 2400;       // main.js CEILING
+const HORIZON_PASS = 0.97;          // airlight below which an edge could still be resolved
+
+function horizonFog(p, camY, worldY, len) {
+  const dens = p.density * (1 + (HORIZON_DAY_FOG - 1) * p.sun);
+  const beta = (3.912 / HORIZON_VISUAL) * p.sun;
+  const H = Math.max(p.height, 1);
+  const ec = Math.pow(2, -1.442695 * clamp((camY - p.base) / H, -8, 40));
+  const ew = Math.pow(2, -1.442695 * clamp((worldY - p.base) / H, -8, 40));
+  const dy = worldY - camY;
+  let f = Math.abs(dy) > 1e-3 ? dens * H * (ec - ew) * (len / dy) : dens * ec * len;
+  const s = Math.max(len - HORIZON_R0, 0) / HORIZON_SPAN;
+  f = clamp(f + beta * len + s * s, 0, 60);
+  const cap = lerp(clamp(p.max, 0, 1), 1, smoothstep(HORIZON_CAP0, HORIZON_CAP1, len));
+  return clamp(1 - Math.pow(2, -1.442695 * f), 0, 1) * cap;
+}
+
+/** Distance along a horizontal bearing from (px,pz) to the edge of the drawn rectangle. */
+function exitDistance(px, pz, dx, dz, x0, z0, x1, z1) {
+  let t = Infinity;
+  if (Math.abs(dx) > EPS) {
+    const a = ((dx > 0 ? x1 : x0) - px) / dx;
+    if (a > 0 && a < t) t = a;
+  }
+  if (Math.abs(dz) > EPS) {
+    const a = ((dz > 0 ? z1 : z0) - pz) / dz;
+    if (a > 0 && a < t) t = a;
+  }
+  return isFinite(t) ? t : 0;
+}
+
+/**
+ * Sample the perimeter of the soft limit at several altitudes and bearings and report the WORST
+ * airlight the world's edge is seen through. `worst` must stay above HORIZON_PASS.
+ */
+function auditHorizon(T, limits, reach, groundY, stats) {
+  const H = stats.horizon;
+  const x0 = T.x0 - reach, z0 = T.z0 - reach;
+  const x1 = T.x0 + (T.nx - 1) * T.cell + reach;
+  const z1 = T.z0 + (T.nz - 1) * T.cell + reach;
+  H.worldX = [x0, x1];
+  H.worldZ = [z0, z1];
+  const LX = limits.x, LZ = limits.z;
+  const spots = [];
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * TAU;
+    // Project the direction onto the limit rectangle, so every sample really is ON the limit.
+    const cx = Math.cos(a), cz = Math.sin(a);
+    const k = Math.min(Math.abs(cx) > EPS ? LX / Math.abs(cx) : Infinity,
+      Math.abs(cz) > EPS ? LZ / Math.abs(cz) : Infinity);
+    spots.push([cx * k, cz * k]);
+  }
+  spots.push([0, 0]);
+  const alts = [1.7, 120, 300, 1200, HORIZON_CEILING];
+  let worst = 1, wx = 0, wz = 0, wAlt = 0, wPreset = '', wLen = 0;
+  let rays = 0, fails = 0, minLen = Infinity;
+  for (let s = 0; s < spots.length; s++) {
+    const px = spots[s][0], pz = spots[s][1];
+    const gy = groundY(px, pz);
+    for (let b = 0; b < 24; b++) {
+      const a = (b / 24) * TAU;
+      const dx = Math.cos(a), dz = Math.sin(a);
+      const horiz = exitDistance(px, pz, dx, dz, x0, z0, x1, z1);
+      if (!(horiz > 0)) continue;
+      const ex = px + dx * horiz, ez = pz + dz * horiz;
+      const ey = groundY(ex, ez);
+      if (horiz < minLen) minLen = horiz;
+      for (let ai = 0; ai < alts.length; ai++) {
+        const camY = Math.max(alts[ai], isNum(gy) ? gy + 1.7 : 1.7);
+        const len = Math.hypot(horiz, camY - (isNum(ey) ? ey : 0));
+        for (let p = 0; p < HORIZON_PRESETS.length; p++) {
+          const f = horizonFog(HORIZON_PRESETS[p], camY, isNum(ey) ? ey : 0, len);
+          rays++;
+          if (f < HORIZON_PASS) fails++;
+          if (f < worst) {
+            worst = f; wx = Math.round(px); wz = Math.round(pz);
+            wAlt = Math.round(camY); wPreset = HORIZON_PRESETS[p].name; wLen = Math.round(len);
+          }
+        }
+      }
+    }
+  }
+  H.rays = rays;
+  H.fails = fails;
+  H.worst = worst;
+  H.worstAt = { x: wx, z: wz, alt: wAlt, preset: wPreset, len: wLen };
+  H.minEdgeDistance = isFinite(minLen) ? minLen : 0;
+  H.pass = HORIZON_PASS;
+  return H;
+}
+
 /* ====================================================== islands and airport == */
 //
 // The south half of the map — the Toronto Islands, the Western and Eastern Gaps and Billy Bishop
@@ -6301,6 +8000,13 @@ function makeBuilders() {
   const o = {};
   for (let i = 0; i < MESH_CLASSES.length; i++) o[MESH_CLASSES[i]] = new MeshBuilder();
   return o;
+}
+
+/** Total vertices standing in a builder set, so a pass can measure what it cost. */
+function surroundVerts(mb) {
+  let n = 0;
+  for (let i = 0; i < MESH_CLASSES.length; i++) n += mb[MESH_CLASSES[i]].count;
+  return n;
 }
 
 /**
@@ -6734,10 +8440,33 @@ function makeCityStats() {
     // raw OSM topology: a way that was skipped is a hole a pedestrian falls into whatever the
     // survey says about it.
     walk: {
-      metres: 0, largest: 0, fraction: 0, components: 0, islands: 0, islandMetres: 0,
+      metres: 0, largest: 0, fraction: 0, fractionDry: 0, components: 0, islands: 0,
+      islandMetres: 0, marineIslands: 0, marineMetres: 0, landCells: 0,
       worstIslands: [], worstCliffs: [], cliffs: 0, cliffWorst: 0, samples: 0,
       stitched: 0, stitchMetres: 0, steps: 0, flights: 0, blockedMetres: 0, severedMetres: 0,
       groundHoles: 0, groundMin: 0, groundMax: 0, subNetMetres: 0, subComponents: 0,
+    },
+    // DANGLING ENDS (CONTRACT §9.1). `danglingBefore` counts every welded way-end inside the map
+    // that is neither a junction nor a door; `danglingAfter` must be zero, and everything in
+    // between says how each one was resolved.
+    edge: {
+      termini: 0, terminiAfter: 0, danglingBefore: 0, danglingAfter: 0,
+      atBuilding: 0, atBoundary: 0, welded: 0, connected: 0, spliced: 0, subwayEnds: 0,
+      capped: 0, culDeSacs: 0, barriers: 0, bufferStops: 0, crossings: 0,
+      culBuilt: 0, barriersBuilt: 0, buffersBuilt: 0, ms: 0,
+    },
+    // THE SYNTHESISED SURROUND (CONTRACT §9.3).
+    surround: {
+      spokes: 0, waterSpokes: 0, rings: 0, streets: 0, streetMetres: 0, blocks: 0, masses: 0,
+      registered: 0, tiles: 0, verts: 0, apronVerts: 0, ms: 0, fringe: 0, reach: 0,
+      bankCells: 0, bankMetres: 0,
+      pitch: [], height: [], softX: 0, softZ: 0, softEase: 0, edgeX: 0, edgeZ: 0,
+    },
+    // THE HORIZON PROOF (CONTRACT §9.4). Every ray from the soft limit to the edge of the drawn
+    // world, at every altitude and every time preset, measured against render.js's own fog.
+    horizon: {
+      rays: 0, fails: 0, worst: 1, worstAt: null, minEdgeDistance: 0, pass: 0,
+      worldX: [0, 0], worldZ: [0, 0],
     },
     propsInFootprint: 0, propsOnRoad: 0,
     markingsBelowRoad: 0, markLiftMin: Infinity, markLiftMax: -Infinity,
@@ -6773,7 +8502,7 @@ function makeCityStats() {
       onSidewalk: 0, onFootway: 0, onPlaza: 0, inPark: 0, atStop: 0, atCrossing: 0,
       atShopfront: 0, inBikeLane: 0,
       core: 0, cells: 0, peakCell: 0, medianCell: 0,
-      inFootprint: 0, onCarriageway: 0, sunk: 0,
+      inFootprint: 0, onCarriageway: 0, sunk: 0, worstSunk: 0, worstSunkAt: null,
     },
   };
 }
@@ -6867,9 +8596,51 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   const HARBOUR = buildHarbour(data, { extent, terrain: T, waterY: WATER_Y });
   if (HARBOUR) carveHarbourTerrain(T, HARBOUR);
 
+  /* --------------------------------------------------------- world boundary */
+  // CONTRACT §9.3. The ground has to keep going past the survey, so the grid does. AFTER the
+  // harbour carve, never before: replication copies whatever the boundary row says, and before
+  // the carve every boundary row says "land" — which east and west of the harbour would extrude
+  // a wall of dry ground straight across the open lake.
+  const SUR_FRINGE = clamp(Math.min(extent.x, extent.z) * SUR_FRINGE_FRAC,
+    SUR_FRINGE_MIN, SUR_FRINGE_MAX);
+  padTerrain(T, SUR_FRINGE);
+  // The bare padded height field, before the harbour wraps its decks round it again. The
+  // land/water questions the surround and the walkability audit ask are about the GROUND, and a
+  // quay apron or a pier deck is neither; reading them through the wrapper also costs a
+  // deck-index query per sample, which over a hundred thousand samples is seconds rather than
+  // milliseconds.
+  const rawTerrainY = T.groundY;
+  if (HARBOUR) {
+    // groundY was rebuilt over the padded grid, so the quay/pier deck field has to be wrapped
+    // round the new one or the harbour would go back to being terrain.
+    HARBOUR.baseGroundY = rawTerrainY;
+    T.groundY = (x, z) => {
+      const g = rawTerrainY(x, z);
+      const d = harbourDeckY(HARBOUR, x, z);
+      return d > g ? d : g;
+    };
+  }
+  const LIMITS = makeLimits(extent, SUR_FRINGE);
+  stats.surround.fringe = SUR_FRINGE;
+  stats.surround.reach = HAZE_REACH;
+  stats.surround.softX = LIMITS.x;
+  stats.surround.softZ = LIMITS.z;
+  stats.surround.softEase = LIMITS.ease;
+  stats.surround.edgeX = T.x0 + (T.nx - 1) * T.cell + HAZE_REACH;
+  stats.surround.edgeZ = T.z0 + (T.nz - 1) * T.cell + HAZE_REACH;
+
   // The natural ground. Everything that is NOT part of the walking surface — the terrain mesh, the
   // lake, the railway, a bridge deck's own reference — reads this one.
   const terrainY = T.groundY;
+  await frame();
+
+  /* ------------------------------------------------------------- dangling ends */
+  // CONTRACT §9.1, and it runs HERE for a reason: it mutates the raw polylines, and everything
+  // after this line — the grade solve, the junction table, the walkability audit, the ribbons,
+  // the street-name index — is built from them. Correcting the topology anywhere later would
+  // leave two of those disagreeing about where the network joins up.
+  report(0.38, 'closing the dangling ends');
+  const termCaps = resolveTermini(roadsRaw, railsRaw, buildingsRaw, extent, stats);
   await frame();
 
   /* ------------------------------------------------------- grade separation */
@@ -6885,7 +8656,7 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   terrainNormals(T);
   // The lake is the one surface that is not tiled: 30 k vertices, visible from nearly every
   // viewpoint in the world, and drawn by its own reflection pass.
-  emitWaterMesh(waterMB, T, extent, HARBOUR);
+  emitWaterMesh(waterMB, T, extent, HARBOUR, HAZE_REACH);
   report(0.44, 'shoreline');
   await frame();
 
@@ -6933,8 +8704,12 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   }
   const claims = assignLandmarks(prepped, project);
 
-  const bIndex = makeGridIndex(48, -extent.x / 2 - 200, -extent.z / 2 - 200,
-    Math.ceil((extent.x + 400) / 48) + 1, Math.ceil((extent.z + 400) / 48) + 1);
+  // Wide enough to hold the reachable part of the synthesised fringe as well as the survey: a
+  // fringe mass indexed outside these bounds would be clamped into a boundary cell, and that cell
+  // would then be queried by everything along the whole edge of the map.
+  const B_PAD = 200 + SUR_FRINGE;
+  const bIndex = makeGridIndex(48, -extent.x / 2 - B_PAD, -extent.z / 2 - B_PAD,
+    Math.ceil((extent.x + B_PAD * 2) / 48) + 1, Math.ceil((extent.z + B_PAD * 2) / 48) + 1);
 
   const cnPoint = project(-79.3871, 43.6426);
   let cnBuilding = null;
@@ -7031,7 +8806,10 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     }
   }
 
-  const grid = makeTileGrid(extent, TILE_SIZE, 420);
+  // The tile grid has to reach past the data far enough to hold the whole synthesised fringe and
+  // the padded terrain under it, or a surround feature would be indexed into an edge tile whose
+  // draw box then swells to cover a kilometre of nothing.
+  const grid = makeTileGrid(extent, TILE_SIZE, SUR_FRINGE + 420);
 
   // Footways are built LAST of the ground plane, because whether a walkway is worth building at
   // all depends on what the carriageways and their sidewalk ribbons already cover. NOTHING is
@@ -7289,6 +9067,23 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     stats.gridDeg = deg > 45 ? 90 - deg : deg;
   }
 
+  // Is a SURVEYED footprint here? Deliberately blind to the synthesised masses already in the
+  // index, so the predicate answers the same question however many of them have been added.
+  const realFoot = (x, z) => {
+    if (!isNum(x) || !isNum(z)) return false;
+    const pv = -z;
+    let hit = false;
+    bIndex.query(x, z, 0.5, (b) => {
+      if (hit || b.surround || !b.parts) return;
+      if (x < b.bbox[0] - 0.5 || x > b.bbox[2] + 0.5 ||
+        z < b.bbox[1] - 0.5 || z > b.bbox[3] + 0.5) return;
+      for (let p = 0; p < b.parts.length; p++) {
+        if (partContains(b.parts[p], x, pv)) { hit = true; return false; }
+      }
+    });
+    return hit;
+  };
+
   /* --------------------------------------------------------- detail context */
   // One context object, rebound per tile. `mb`, `rng`, `occ`, `stats` and the site lists all
   // belong to the tile being built; the indices are global and read-only from here on.
@@ -7297,7 +9092,11 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   const C = {
     mb, groundY, terrainY, grade: gradeField, bIndex, roadIdx, tramIdx, deckIdx,
     rng: makeRng(SEED), stats, pedSeed: PED_SEED, tilePeople: 0,
-    harbour: HARBOUR,
+    // How far into the synthesised fringe a street still gets a kerb and a pavement: exactly as
+    // far as the soft limit lets anyone walk, plus a block. Past that nobody is ever closer than
+    // a few hundred metres and the detail returns nothing (CONTRACT §9.3).
+    surWalk: LIMITS.out + 120,
+    harbour: HARBOUR, rawY: rawTerrainY, realFoot,
     occ: makeOccupancy(5.0, gx0, gz0,
       Math.ceil((extent.x + 800) / 5) + 1, Math.ceil((extent.z + 800) / 5) + 1),
     // Sites the people pass draws on, recorded by the passes that built them so nobody is
@@ -7442,6 +9241,41 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   }
   await frame();
 
+  /* ------------------------------------------------------ synthesised surround */
+  // CONTRACT §9.3. Measured out of the boundary strip and generated ONCE, as a few thousand small
+  // records; the tiles build the geometry from them on demand exactly as they do for surveyed
+  // features. Land and water are decided by the terrain alone, which is why the same code puts a
+  // city north of Bloor and open lake south of the Islands without being told which is which.
+  report(0.74, 'building the surround');
+  const landAt = (x, z) => {
+    const y = terrainY(x, z);
+    return isNum(y) && y > WATER_Y + 0.20;
+  };
+  const SUR = buildSurround({
+    extent, fringe: SUR_FRINGE, landAt, terrainY, roadsRaw, buildingsRaw, stats,
+  });
+  // Everything the player can physically reach is a real obstacle. The reachable band is thin —
+  // the soft limit is SOFT_OUT past the data and a body radius past that — so only the first few
+  // rings are registered, and they are registered from the SAME pure enumeration the geometry
+  // pass uses, so what you walk into is exactly what you can see.
+  {
+    const reach = LIMITS.out + 90;
+    for (let i = 0; i < SUR.blocks.length; i++) {
+      const blk = SUR.blocks[i];
+      if (blk.t > reach) continue;
+      forEachSurroundMass(blk, terrainY, (ring, g, h) => {
+        const part = makePart(ring, []);
+        const bb = part.bbox;
+        const rec = {
+          parts: [part], bbox: [bb[0], -bb[3], bb[2], -bb[1]], y: g - 1.6, h, surround: true,
+        };
+        bIndex.add(rec.bbox[0], rec.bbox[1], rec.bbox[2], rec.bbox[3], rec);
+        stats.surround.registered++;
+      }, realFoot);
+    }
+  }
+  await frame();
+
   /* ================================================================= tiles == */
   report(0.76, 'indexing tiles');
 
@@ -7450,6 +9284,8 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       i0: 0, i1: 0, j0: 0, j1: 0,
       b: [], recs: [], foot: [], sub: [], pass: [], corr: [], rails: [],
       areas: [], junc: [], parks: [], plazas: [], cn: false, harbour: null, isle: false,
+      // CONTRACT §9.1 / §9.3: designed termini, and the synthesised fringe.
+      caps: [], sroads: [], sblocks: [],
     };
     grid.tiles[k].built = [false, false];
   }
@@ -7610,6 +9446,55 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     t.f.junc.push(J);
     const gy = groundY(J.x, J.z);
     grid.cover(t, J.x - J.r - 4, J.z - J.r - 4, J.x + J.r + 4, J.z + J.r + 4, gy - 2, gy + 10);
+  }
+
+  // --- designed termini (CONTRACT §9.1) and the synthesised fringe (§9.3). Indexed like any
+  // other feature, which is the whole point: the surround is not a special case in the renderer,
+  // in the culler, in the eviction policy or in the vertex budget.
+  for (let i = 0; i < termCaps.length; i++) {
+    const capRec = termCaps[i];
+    const t = grid.at(capRec.x, capRec.z);
+    t.f.caps.push(capRec);
+    const r = capRec.kind === 'cul' ? Math.max(CUL_R_MIN, capRec.w * 0.5 + 2.2) * 2.2 : 6;
+    const gy = groundY(capRec.x, capRec.z);
+    grid.cover(t, capRec.x - r, capRec.z - r, capRec.x + r, capRec.z + r, gy - 2, gy + 3);
+  }
+  {
+    const surTiles = new Set();
+    for (let i = 0; i < SUR.roads.length; i++) {
+      const rec = SUR.roads[i];
+      _spans.length = 0;
+      splitLongWay(grid, rec.p, _spans);
+      for (let s = 0; s < _spans.length; s++) {
+        const sub = _spans[s];
+        if (sub.length < 2) continue;
+        const t = indexLine((tt) => tt.f.sroads, { p: sub, w: rec.w, t: rec.t }, sub,
+          rec.w * 0.5 + 4, -3, 4);
+        surTiles.add(t.id);
+      }
+    }
+    for (let i = 0; i < SUR.blocks.length; i++) {
+      const blk = SUR.blocks[i];
+      const t = grid.at(blk.mx, blk.mz);
+      t.f.sblocks.push(blk);
+      let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity, gy = Infinity;
+      for (let k = 0; k < blk.co.length; k++) {
+        const p = blk.co[k];
+        if (p[0] < x0) x0 = p[0];
+        if (p[0] > x1) x1 = p[0];
+        if (p[1] < z0) z0 = p[1];
+        if (p[1] > z1) z1 = p[1];
+        const y = terrainY(p[0], p[1]);
+        if (isNum(y) && y < gy) gy = y;
+      }
+      if (!isFinite(gy)) gy = 0;
+      // Headroom for the tallest mass this block can hash into: the district mean, undecayed,
+      // at full positive jitter.
+      const top = Math.max(SUR_H_MIN, blk.h) * (1 + SUR_H_JITTER) * SUR_TALL_MAX + 6;
+      grid.cover(t, x0, z0, x1, z1, gy - 3, gy + top);
+      surTiles.add(t.id);
+    }
+    stats.surround.tiles = surTiles.size;
   }
 
   // --- ISLANDS AND AIRPORT. Not indexed feature by feature: harbour.js holds its own spatial
@@ -7887,7 +9772,14 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         if (inFootprint(C, x, z, 0)) stats.people.inFootprint++;
         if (!C.auditPed[i + 3] && onCarriageway(C, x, z, 0)) stats.people.onCarriageway++;
         const g = groundY(x, z);
-        if (y < g - 0.02 || y > g + ROAD_Y + CURB + 0.06) stats.people.sunk++;
+        const dy = y - g;
+        if (dy < -0.02 || dy > ROAD_Y + CURB + 0.06) {
+          stats.people.sunk++;
+          if (Math.abs(dy) > Math.abs(stats.people.worstSunk)) {
+            stats.people.worstSunk = dy;
+            stats.people.worstSunkAt = [Math.round(x), Math.round(z)];
+          }
+        }
       }
       for (let i = 0; i < C.auditDeck.length; i += 4) {
         const x = C.auditDeck[i], z = C.auditDeck[i + 1];
@@ -7949,6 +9841,8 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
 
     if (stage === S_MASS) {
       emitTerrainRange(builders.terrain, T, gradeField, F.i0, F.i1, F.j0, F.j1);
+      // CONTRACT §9.2: the synthesised ground never simply becomes water.
+      emitFringeBank(C, T, F.i0, F.i1, F.j0, F.j1, extent);
       yield;
       for (let i = 0; i < F.areas.length; i++) {
         const part = F.areas[i];
@@ -7989,6 +9883,28 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       if (F.isle) {
         yield;
         appendIslandMass(HARBOUR, islandCtx(builders, F), tile.cx0, tile.cz0, tile.cx1, tile.cz1);
+      }
+      // THE WORLD BOUNDARY. A designed terminus is part of the street it ends, and the fringe is
+      // massing and the ground plane, so both belong to stage 0: they have to exist as soon as
+      // the tile does, or the world would still visibly stop until the detail stage caught up.
+      if (F.caps.length || F.sroads.length || F.sblocks.length) {
+        yield;
+        const v0 = surroundVerts(builders);
+        for (let i = 0; i < F.caps.length; i++) {
+          const capRec = F.caps[i];
+          if (capRec.kind === 'cul') emitCulDeSac(C, capRec);
+          else if (capRec.kind === 'buffer') emitBufferStop(C, capRec, 0);
+        }
+        for (let i = 0; i < F.sroads.length; i++) {
+          emitSurroundStreet(C, F.sroads[i]);
+          if ((i & 15) === 15) yield;
+        }
+        yield;
+        for (let i = 0; i < F.sblocks.length; i++) {
+          emitSurroundBlock(C, F.sblocks[i]);
+          if ((i & 15) === 15) yield;
+        }
+        if (first) C.stats.surround.verts += surroundVerts(builders) - v0;
       }
     } else {
       /* --------------------------------------------------------- ground plane */
@@ -8135,6 +10051,11 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         appendIslandDetail(HARBOUR, islandCtx(builders, F), tile.cx0, tile.cz0, tile.cx1,
           tile.cz1);
       }
+      // THE WORLD BOUNDARY: the bollard lines that close an alley or a footpath. Street
+      // furniture, so it belongs to the detail stage exactly as every other bollard does.
+      for (let i = 0; i < F.caps.length; i++) {
+        if (F.caps[i].kind === 'barrier') emitTerminusBarrier(C, F.caps[i]);
+      }
     }
 
     endTile(tile, stage, first);
@@ -8181,6 +10102,23 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   const meshes = { water: new Mesh(gl, waterMB.data()) };
   stats.meshes.water = waterMB.count;
   waterMB.reset();
+
+  // THE APRON (CONTRACT §9.3/§9.4). The only other piece of geometry in the world that is not
+  // tiled, for the same reason the lake is not: it is on screen from every viewpoint there is,
+  // and it is cheap enough that streaming it would cost more than keeping it.
+  {
+    const apron = new MeshBuilder();
+    emitSurroundApron(apron, T, HAZE_REACH);
+    stats.surround.apronVerts = apron.count;
+    stats.meshes.apron = apron.count;
+    tiles.setStatic('terrain', new Mesh(gl, apron.data()));
+    apron.reset();
+  }
+
+  // CONTRACT §9.4: prove that the world never visibly ends, from the whole perimeter of the soft
+  // limit, at five altitudes, along twenty-four bearings, at all four time presets.
+  auditHorizon(T, LIMITS, HAZE_REACH, groundY, stats);
+
   stats.isle = islandStats(HARBOUR);
   stats.seconds = (now() - t0) / 1000;
   stats.yields = _yields;
@@ -8303,8 +10241,51 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         }
       }
     }
+    // THE WORLD BOUNDARY (CONTRACT §9.3). A backstop, not the mechanism: what actually stops the
+    // camera is confine(), which bleeds the OUTWARD component of its velocity to nothing over
+    // SOFT_EASE metres so it coasts to a halt instead of striking a plane. This clamp exists so
+    // that nothing else — a teleport, an ejection from a footprint, a recovery from NaN — can
+    // leave anyone outside the world. Idempotent, so clamping a clamped point does nothing.
+    if (px < -LIMITS.x) { px = -LIMITS.x; out.hit = true; }
+    else if (px > LIMITS.x) { px = LIMITS.x; out.hit = true; }
+    if (pz < -LIMITS.z) { pz = -LIMITS.z; out.hit = true; }
+    else if (pz > LIMITS.z) { pz = LIMITS.z; out.hit = true; }
     out.x = px; out.z = pz;
     return out;
+  }
+
+  /* ---------------------------------------------------------- the soft limit */
+
+  /**
+   * How far into the deceleration band a point is: 0 anywhere the player is free, rising to 1 at
+   * the limit itself. Read it for a HUD line, a vignette or a compass cue — this is the "if there
+   * is a natural way to signal it, use that" half of CONTRACT §9.3.
+   */
+  function limitFrac(x, z) {
+    if (!isNum(x) || !isNum(z)) return 0;
+    const gx = limitAxis(x, LIMITS.x, LIMITS.ease);
+    const gz = limitAxis(z, LIMITS.z, LIMITS.ease);
+    return 1 - Math.min(gx, gz);
+  }
+
+  /**
+   * Ease the camera to a halt at the world's soft limit.
+   *
+   * Call once per frame from the movement update, AFTER integrating position, with the player
+   * object (anything carrying x, z and optionally vx, vz). Only the component of velocity trying
+   * to LEAVE the world is scaled, and only inside the last SOFT_EASE metres, so motion along the
+   * boundary and motion back inward are never touched and turning round is instant. Returns the
+   * same 0..1 the band reads, for whatever the HUD wants to do with it.
+   */
+  function confine(p) {
+    if (!p || !isNum(p.x) || !isNum(p.z)) return 0;
+    const gx = limitAxis(p.x, LIMITS.x, LIMITS.ease);
+    const gz = limitAxis(p.z, LIMITS.z, LIMITS.ease);
+    if (gx < 1 && isNum(p.vx) && p.vx * p.x > 0) p.vx *= gx;
+    if (gz < 1 && isNum(p.vz) && p.vz * p.z > 0) p.vz *= gz;
+    if (p.x < -LIMITS.x) p.x = -LIMITS.x; else if (p.x > LIMITS.x) p.x = LIMITS.x;
+    if (p.z < -LIMITS.z) p.z = -LIMITS.z; else if (p.z > LIMITS.z) p.z = LIMITS.z;
+    return 1 - Math.min(gx, gz);
   }
 
   /* --------------------------------------------------------- street naming */
@@ -8368,7 +10349,10 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       GR.wallPortals + ' portals cut through a facade');
     const WK = stats.walk;
     console.log('[city] walkability: ' + (WK.fraction * 100).toFixed(2) + '% of ' +
-      Math.round(WK.metres).toLocaleString() + ' walkable m in the largest component, ' +
+      Math.round(WK.metres).toLocaleString() + ' walkable m in the largest component (' +
+      (WK.fractionDry * 100).toFixed(2) + '% of everything reachable without a boat: ' +
+      WK.marineIslands + ' components holding ' + Math.round(WK.marineMetres).toLocaleString() +
+      ' m are across open water), ' +
       WK.components + ' components, ' + WK.islands + ' islands over 50 m holding ' +
       Math.round(WK.islandMetres).toLocaleString() + ' m; ' + WK.cliffs + ' cliffs left (' +
       WK.flights + ' flights of steps built, ' + WK.stitched + ' gaps stitched over ' +
@@ -8382,6 +10366,34 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       ' stepped down, ' + CP.buriedRecords + ' whole records dropped, ' + CP.wallPairsLeft +
       ' wall + ' + CP.capPairsLeft + ' cap fights left; ground rung ' +
       CP.groundRungMin.toFixed(3) + ' m (carriageway ' + CP.groundRungMinMicro.toFixed(3) + ' m)');
+    // THE WORLD BOUNDARY. CONTRACT §9.1's counter, §9.3's cost and §9.4's proof, in that order.
+    const ED = stats.edge;
+    console.log('[city] dangling ends: ' + ED.danglingBefore + ' of ' + ED.termini +
+      ' way ends were dangling inside the map (' + ED.atBuilding + ' end at a building, ' +
+      ED.atBoundary + ' at the world edge and are continued by the surround); ' + ED.welded +
+      ' welded, ' + ED.connected + ' extended to a way (' + ED.spliced +
+      ' nodes spliced into the ways they met), ' + ED.capped +
+      ' given a designed terminus (' + ED.culDeSacs + ' turning heads, ' + ED.barriers +
+      ' barrier lines, ' + ED.bufferStops + ' buffer stops), ' + ED.subwayEnds +
+      ' concourse ends left to the PATH walls; ' + ED.danglingAfter + ' left, ' +
+      ED.terminiAfter + ' way ends remain in total');
+    const SR = stats.surround;
+    console.log('[city] surround: ' + Math.round(SR.fringe) + ' m fringe on ' + SR.spokes +
+      ' spokes (' + SR.waterSpokes + ' open water), ' + SR.rings + ' rings, ' + SR.streets +
+      ' streets over ' + Math.round(SR.streetMetres).toLocaleString() + ' m, ' + SR.blocks +
+      ' blocks in ' + SR.tiles + ' tiles, ' + SR.registered +
+      ' masses registered for collision; ' + SR.verts.toLocaleString() +
+      ' vertices built + ' + SR.apronVerts.toLocaleString() + ' in the apron, generated in ' +
+      SR.ms.toFixed(1) + ' ms (ends ' + ED.ms.toFixed(1) + ' ms); soft limit at +' +
+      Math.round(SR.softX - extent.x / 2) + ' m over ' + Math.round(SR.softEase) +
+      ' m of easing, drawn world out to +' + Math.round(SR.reach / 1000) + ' km');
+    const HZ = stats.horizon;
+    console.log('[city] horizon: ' + HZ.rays.toLocaleString() + ' rays from the soft limit to ' +
+      'the edge of the drawn world, nearest ' + Math.round(HZ.minEdgeDistance).toLocaleString() +
+      ' m; worst airlight ' + (HZ.worst * 100).toFixed(2) + '% (' +
+      (HZ.worstAt ? HZ.worstAt.preset + ' at ' + HZ.worstAt.alt + ' m, ' +
+        HZ.worstAt.len.toLocaleString() + ' m sightline' : 'n/a') + '), ' + HZ.fails +
+      ' below the ' + (HZ.pass * 100).toFixed(0) + '% threshold');
     const HB = HARBOUR ? harbourStats(HARBOUR) : null;
     if (HB) {
       console.log('[city] harbourfront: ' + Math.round(HB.shoreMetres).toLocaleString() +
@@ -8465,6 +10477,16 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     buildingAt,
     collide,
     streetNameAt,
+    // THE WORLD BOUNDARY (CONTRACT §9.3). `bounds` is every number the edge of the world is made
+    // of; `confine` is the soft limit; `limitFrac` is how close to it you are.
+    bounds: {
+      extentX: extent.x / 2, extentZ: extent.z / 2,
+      x: LIMITS.x, z: LIMITS.z, ease: LIMITS.ease, out: LIMITS.out,
+      fringe: SUR_FRINGE, reach: HAZE_REACH,
+      edgeX: stats.surround.edgeX, edgeZ: stats.surround.edgeZ,
+    },
+    confine,
+    limitFrac,
     update,
     warm,
     dispose() {

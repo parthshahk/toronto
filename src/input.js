@@ -1,6 +1,11 @@
-// src/input.js — keyboard / mouse / pointer-lock / gamepad state.
+// src/input.js — keyboard / mouse / pointer-lock / gamepad / touch state.
 // Edge-triggered pressed/released sets are valid for exactly one frame; call endFrame()
 // at the very END of the game loop. Zero dependencies by contract.
+//
+// Four sources feed the SAME canonical key codes: the keyboard (with the left-handed KEY_ALIAS
+// layer), a standard-mapping gamepad, and — for touch devices — a virtual thumbstick and virtual
+// buttons driven by src/touch.js. Each source is tracked in its own set so releasing one can
+// never strand another: a real keyup does not cancel a held on-screen button, and vice versa.
 
 // --- tuning -----------------------------------------------------------------
 const MOUSE_CLAMP = 260;        // reject absurd single-event deltas (browser hiccups / lock warmup)
@@ -116,6 +121,12 @@ export class Input {
     // gamepad-derived state, kept apart so a real keyup can never strand it
     this._padHeld = new Set();     // buttons + dpad, participate in down/pressed/released
     this._stickHeld = new Set();   // stick-as-WASD, feeds down() but NOT axis() (axis stays analog)
+    this._virtualHeld = new Set(); // on-screen touch buttons, same treatment as pad buttons
+
+    // Virtual thumbstick, in the same convention as the gamepad's left stick: x right positive,
+    // y FORWARD negative. Zero on any device that never touches the glass.
+    this._touchX = 0;
+    this._touchY = 0;
 
     this._mouseDX = 0;
     this._mouseDY = 0;
@@ -140,7 +151,8 @@ export class Input {
 
   down(code) {
     if (!this.enabled) return false;
-    return this._held.has(code) || this._padHeld.has(code) || this._stickHeld.has(code);
+    return this._held.has(code) || this._padHeld.has(code) || this._stickHeld.has(code) ||
+      this._virtualHeld.has(code);
   }
 
   pressed(code) {
@@ -156,8 +168,10 @@ export class Input {
   axis(negCode, posCode) {
     if (!this.enabled) return 0;
     let v = 0;
-    if (this._held.has(posCode) || this._padHeld.has(posCode)) v += 1;
-    if (this._held.has(negCode) || this._padHeld.has(negCode)) v -= 1;
+    if (this._held.has(posCode) || this._padHeld.has(posCode) ||
+        this._virtualHeld.has(posCode)) v += 1;
+    if (this._held.has(negCode) || this._padHeld.has(negCode) ||
+        this._virtualHeld.has(negCode)) v -= 1;
     const pad = this._stickAxis(negCode, posCode);
     if (v === 0) return pad;
     if (pad !== 0 && Math.abs(pad) > Math.abs(v) && (pad < 0) === (v < 0)) return pad;
@@ -167,6 +181,52 @@ export class Input {
   get mouseDX() { return this.enabled ? this._mouseDX : 0; }
   get mouseDY() { return this.enabled ? this._mouseDY : 0; }
   get wheel() { return this.enabled ? this._wheel : 0; }
+
+  // --- touch feeds ----------------------------------------------------------
+  // src/touch.js owns the gestures; these three doors are the only way it reaches the rest of
+  // the game, and each one lands in the SAME accumulator its mouse/gamepad equivalent uses, so
+  // every consumer downstream — look inversion, the speed dial, the KEY_ALIAS layer — is
+  // completely unaware that a finger was involved.
+
+  /** Drag-look. Deltas are in the same "mouse pixels" the pointer-lock path produces. */
+  addLookDelta(dx, dy) {
+    let ax = dx;
+    let ay = dy;
+    if (typeof ax !== 'number' || !isFinite(ax)) ax = 0;
+    if (typeof ay !== 'number' || !isFinite(ay)) ay = 0;
+    if (ax > MOUSE_CLAMP) ax = MOUSE_CLAMP; else if (ax < -MOUSE_CLAMP) ax = -MOUSE_CLAMP;
+    if (ay > MOUSE_CLAMP) ay = MOUSE_CLAMP; else if (ay < -MOUSE_CLAMP) ay = -MOUSE_CLAMP;
+    this._mouseDX += ax;
+    this._mouseDY += ay;
+  }
+
+  /** Virtual thumbstick. `x` right positive, `forward` forward positive, both -1..1. */
+  setTouchStick(x, forward, on) {
+    let vx = (typeof x === 'number' && isFinite(x)) ? x : 0;
+    let vy = (typeof forward === 'number' && isFinite(forward)) ? forward : 0;
+    if (!on) { vx = 0; vy = 0; }
+    this._touchX = vx < -1 ? -1 : (vx > 1 ? 1 : vx);
+    this._touchY = -(vy < -1 ? -1 : (vy > 1 ? 1 : vy));   // pad convention: stick up is negative
+    this._syncStickKeys();
+  }
+
+  /** On-screen button -> canonical key code. Edge-triggered exactly like a physical key. */
+  setVirtual(code, on) {
+    if (!code) return;
+    const was = this._virtualHeld.has(code);
+    if (!!on === was) return;
+    if (on) {
+      this._virtualHeld.add(code);
+      if (!this._held.has(code) && !this._padHeld.has(code) && !this._stickHeld.has(code)) {
+        this._pressed.add(code);
+      }
+    } else {
+      this._virtualHeld.delete(code);
+      if (!this._held.has(code) && !this._padHeld.has(code) && !this._stickHeld.has(code)) {
+        this._released.add(code);
+      }
+    }
+  }
 
   requestLock() {
     const c = this.canvas;
@@ -212,14 +272,36 @@ export class Input {
 
   // --- internals ------------------------------------------------------------
 
+  // Pad stick and touch stick share one analog pair. Summed and clamped rather than picked
+  // between, so a thumb and a stick on the same axis cannot cancel into a dead control.
+  _analogX() {
+    const v = this._padX + this._touchX;
+    return v < -1 ? -1 : (v > 1 ? 1 : v);
+  }
+
+  _analogY() {
+    const v = this._padY + this._touchY;
+    return v < -1 ? -1 : (v > 1 ? 1 : v);
+  }
+
   _stickAxis(negCode, posCode) {
     const which = STICK_AXIS_PAIRS.get(negCode + '|' + posCode);
-    if (which === 'x') return this._padX;
-    if (which === 'y') return -this._padY;   // stick up is negative, +Y here means "forward"
+    if (which === 'x') return this._analogX();
+    if (which === 'y') return -this._analogY();   // stick up is negative, +Y here means "forward"
     const flipped = STICK_AXIS_PAIRS.get(posCode + '|' + negCode);
-    if (flipped === 'x') return -this._padX;
-    if (flipped === 'y') return this._padY;
+    if (flipped === 'x') return -this._analogX();
+    if (flipped === 'y') return this._analogY();
     return 0;
+  }
+
+  // Analog stick (either source) also reports as WASD so plain down('KeyW') checks work.
+  _syncStickKeys() {
+    const x = this._analogX();
+    const y = this._analogY();
+    this._syncSynthetic(this._stickHeld, 'KeyD', x > STICK_KEY_THRESHOLD);
+    this._syncSynthetic(this._stickHeld, 'KeyA', x < -STICK_KEY_THRESHOLD);
+    this._syncSynthetic(this._stickHeld, 'KeyW', y < -STICK_KEY_THRESHOLD);
+    this._syncSynthetic(this._stickHeld, 'KeyS', y > STICK_KEY_THRESHOLD);
   }
 
   // A physical key and its alias both feed the SAME canonical code, so track the raw physical
@@ -252,11 +334,13 @@ export class Input {
     if (on) {
       if (this._held.has(code)) return;
       this._held.add(code);
-      if (!this._padHeld.has(code) && !this._stickHeld.has(code)) this._pressed.add(code);
+      if (!this._padHeld.has(code) && !this._stickHeld.has(code) &&
+          !this._virtualHeld.has(code)) this._pressed.add(code);
     } else {
       if (!this._held.has(code)) return;
       this._held.delete(code);
-      if (!this._padHeld.has(code) && !this._stickHeld.has(code)) this._released.add(code);
+      if (!this._padHeld.has(code) && !this._stickHeld.has(code) &&
+          !this._virtualHeld.has(code)) this._released.add(code);
     }
   }
 
@@ -266,10 +350,14 @@ export class Input {
     for (const code of this._held) this._released.add(code);
     for (const code of this._padHeld) if (!this._held.has(code)) this._released.add(code);
     for (const code of this._stickHeld) if (!this._held.has(code)) this._released.add(code);
+    for (const code of this._virtualHeld) if (!this._held.has(code)) this._released.add(code);
     this._held.clear();
     this._physical.clear();
     this._padHeld.clear();
     this._stickHeld.clear();
+    this._virtualHeld.clear();
+    this._touchX = 0;
+    this._touchY = 0;
     this._mouseButtons = 0;
     this._mouseDX = 0;
     this._mouseDY = 0;
@@ -391,6 +479,8 @@ export class Input {
     this._padRY = 0;
     this._padLT = 0;
     this._padRT = 0;
+    // A pad going away must not take a thumb that is still on the glass with it.
+    this._syncStickKeys();
   }
 
   _pollGamepad() {
@@ -462,10 +552,7 @@ export class Input {
     }
 
     // stick-as-WASD so plain down('KeyW') checks still work on a pad
-    this._syncSynthetic(this._stickHeld, 'KeyD', this._padX > STICK_KEY_THRESHOLD);
-    this._syncSynthetic(this._stickHeld, 'KeyA', this._padX < -STICK_KEY_THRESHOLD);
-    this._syncSynthetic(this._stickHeld, 'KeyW', this._padY < -STICK_KEY_THRESHOLD);
-    this._syncSynthetic(this._stickHeld, 'KeyS', this._padY > STICK_KEY_THRESHOLD);
+    this._syncStickKeys();
 
     // --- buttons
     const n = Math.min(btns.length, 20);
@@ -503,11 +590,13 @@ export class Input {
     if (on === was) return;
     if (on) {
       set.add(code);
-      if (!this._held.has(code)) this._pressed.add(code);
+      if (!this._held.has(code) && !this._virtualHeld.has(code)) this._pressed.add(code);
     } else {
       set.delete(code);
       const stillOther = (set === this._padHeld ? this._stickHeld : this._padHeld).has(code);
-      if (!this._held.has(code) && !stillOther) this._released.add(code);
+      if (!this._held.has(code) && !stillOther && !this._virtualHeld.has(code)) {
+        this._released.add(code);
+      }
     }
   }
 }

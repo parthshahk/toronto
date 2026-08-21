@@ -295,15 +295,50 @@ export class TileManager {
     this._casters = [];
     this._now = 0;
 
+    // STATIC GEOMETRY. One mesh per material class that is always resident, always drawn, never
+    // culled and never evicted — the world's outermost ground apron and nothing else. The apron
+    // is a handful of very large quads that reach thirteen kilometres past the last tile, so it
+    // is simultaneously the cheapest thing in the world (about 25 k vertices) and the thing that
+    // is on screen from literally every viewpoint. Tiling it would mean either a tile grid two
+    // orders of magnitude larger than the city or a draw box so big the culler is a no-op; both
+    // are worse than admitting that a few pieces of geometry are genuinely global.
+    //
+    // They are drawn FIRST within their class, before any tile, so the horizon ground is under
+    // everything the city puts on top of it.
+    this._statics = new Map();
+
     this.stats = {
       residentVerts: 0, residentTiles: 0, visibleTiles: 0, drawMeshes: 0,
       built: 0, evicted: 0, evictedVerts: 0, queued: 0, buildMs: 0, lastBuildMs: 0,
       peakResidentVerts: 0, uploads: 0, freed: 0, lodScale: 1, lodShrinks: 0, lodRelaxes: 0,
-      evictedWanted: 0,
+      evictedWanted: 0, staticVerts: 0, staticMeshes: 0,
     };
   }
 
   get visibleTiles() { return this._visible; }
+
+  /**
+   * Register (or replace) the always-resident mesh of one material class. Pass null to clear.
+   * Its vertices come out of the resident cap, so the level-of-detail valve accounts for them
+   * exactly as it does for a tile.
+   */
+  setStatic(cls, mesh) {
+    const had = this._statics.get(cls);
+    if (had && had !== mesh) had.dispose();
+    if (mesh && mesh.vertexCount > 0) this._statics.set(cls, mesh);
+    else this._statics.delete(cls);
+    let verts = 0;
+    for (const m of this._statics.values()) verts += m.vertexCount | 0;
+    this.stats.staticVerts = verts;
+    this.stats.staticMeshes = this._statics.size;
+    return this;
+  }
+
+  /** The cap the TILES may fill: whatever is left after the static geometry has taken its share. */
+  _cap() {
+    const left = this.vertexCap - this.stats.staticVerts;
+    return left > 200000 ? left : 200000;
+  }
 
   /** Tile stages wanted but not yet built, as of the last frame(). */
   get pending() { return this._queue.length + (this._job ? 1 : 0); }
@@ -400,7 +435,7 @@ export class TileManager {
     if (!n) return;
 
     const res = this.stats.residentVerts;
-    const cap = this.vertexCap;
+    const cap = this._cap();
 
     // The ceiling records "this scale overflowed HERE, at THIS cap", so it has to be forgiven
     // whenever either of those stops being true. Without the last of these three the scale is a
@@ -664,7 +699,7 @@ export class TileManager {
     // and will not simply be rebuilt on the next frame.
     this._adaptLod(px, py, pz);
 
-    let over = this.stats.residentVerts - this.vertexCap;
+    let over = this.stats.residentVerts - this._cap();
     if (over > 0) this._evict(over);
     else this._evict(0);           // still retire anything past evictMs, so memory comes back
 
@@ -705,6 +740,8 @@ export class TileManager {
 
   /** Every resident mesh of one class on the visible tiles, nearest first. */
   forEachMesh(cls, fn) {
+    const st = this._statics.get(cls);
+    if (st && st.vertexCount > 0) fn(st, null, -1);
     const vis = this._visible;
     for (let i = 0; i < vis.length; i++) {
       const t = vis[i];
@@ -720,6 +757,10 @@ export class TileManager {
   dispose() {
     const tiles = this.grid.tiles;
     for (let k = 0; k < tiles.length; k++) this.releaseTile(tiles[k]);
+    for (const m of this._statics.values()) m.dispose();
+    this._statics.clear();
+    this.stats.staticVerts = 0;
+    this.stats.staticMeshes = 0;
     this._job = null;
     this._queue.length = 0;
     this._visible.length = 0;

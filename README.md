@@ -49,8 +49,28 @@ in the whole Toronto Islands chain and Billy Bishop airport.
 - The rail corridor, the harbourfront quay walls, rooftop plant, the Don channel retaining walls
 
 Roads that pass under the rail corridor genuinely duck beneath it: 77 depressed corridors, 364 ways
-carried over, 131 building passages, 7,462 crossings resolved. `groundY` is finite everywhere —
-**zero holes** — and the walkable network runs to 1,210 km.
+carried over, 131 building passages, 7,486 crossings resolved. `groundY` is finite everywhere —
+**zero holes** — and the walkable network runs to 1,218 km.
+
+## The edge of the map
+
+No road stops in mid-air. Every way-end is either a junction, a door, or a designed terminus, and
+the count is a permanent stat: of 3,086 way-ends, 1,446 were dangling; 791 were extended to what
+they were meant to reach, 603 nodes were spliced, 628 got a turning head, a barrier or a buffer
+stop. **Zero left.**
+
+Past the surveyed rectangle the city keeps going — about 1.2 km of synthesised streets and massing
+that copy the bearing, block pitch, height and density of whatever district they are leaving, then
+13 km of ground and water to the horizon. You are stopped 300 m outside the data by a soft limit
+that eases your outward speed to zero over the last 150 m, so you coast to a halt rather than
+hitting a wall, with invented city still ahead of you and the drawn world running 14 km further.
+
+A 6,240-ray audit fires from the whole perimeter of that limit, at five altitudes and 24 bearings
+at all four times of day, and evaluates the renderer's own fog: nearest world edge 13,907 m, worst
+airlight 99.15%, **zero rays under the 97% threshold**. The world never visibly ends. It is not
+uniformly *interesting*, though — the surround has no synthesised terrain relief, so past the
+fringe on the landward side you get a flat hazed plain rather than more city. Over the lake, which
+is most of the perimeter, it is seamless.
 
 ## How it runs
 
@@ -102,6 +122,32 @@ Both layouts are live at once — use either, or mix them.
 | Viewpoints | `V` | `'` |
 | Back to start | `R` | `,` |
 | Help | `H` | `-` |
+
+Double-click toggles the mouse cursor on and off, in both directions.
+
+### On a phone or tablet
+
+Touch controls are the Google Maps ones, because that is the set every phone user already knows.
+The map camera is the default; `WALK` drops you to eye level and `MAP` lifts you back out.
+
+| | Gesture |
+|---|---|
+| Pan | One finger drag — the ground stays under your finger |
+| Height | Pinch, or double tap in / two-finger tap out |
+| Heading | Twist two fingers |
+| Tilt | Two fingers up or down |
+| Walk: look | Drag the right of the screen |
+| Walk: move | Thumbstick, bottom left |
+
+Six 52 px buttons sit down the side — face north, walk/map, run, jump, time of day, quality and
+help — and fold into a row on a landscape phone. The page itself never scrolls, bounces or
+zooms: `touch-action: none` and `overscroll-behavior: none` all the way down, and every gesture
+event is consumed.
+
+Nothing touch-related is installed on a machine with no touch points, and every handler ignores a
+mouse, so a desktop keeps exactly the input it had. A touchscreen laptop gets **both** at once.
+The renderer picks its own quality and resolution on a phone and then re-picks it from measured
+frame times — see [ARCHITECTURE.md](ARCHITECTURE.md#device-profile-resolution-and-the-adaptive-step).
 
 ## Running it
 

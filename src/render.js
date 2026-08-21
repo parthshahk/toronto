@@ -3476,7 +3476,28 @@ export class Renderer {
       const wantAo = q.ssao;
       const wantSsr = q.ssr;
       const wantFxaa = q.fxaa;
-      if (!wantBloom && !wantAo && !wantSsr && !wantFxaa) { this._destroyTargets(); return false; }
+      // NOTE: the offscreen path is kept even when every post feature is off, and this is a
+      // PERFORMANCE decision, not a tidiness one.
+      //
+      // gl.js asks for `antialias: true`, so the default framebuffer is 4x multisampled — this
+      // context reports SAMPLES = 4. At every preset that runs the post chain, the only thing
+      // ever drawn into that framebuffer is one full-screen composite quad, which costs nothing.
+      // Take the chain away and the WHOLE SCENE is shaded into a 4x MSAA surface instead, and
+      // the cheapest preset becomes the most expensive one.
+      //
+      // MEASURED, foreground Chrome on an M1 Pro, 3248 x 1500, the harbour viewpoint, 447 draws:
+      //   Minimal straight to the 4x MSAA default framebuffer   16.3 ms   61 fps
+      //   Minimal through the offscreen target + one composite    8.7 ms  115 fps
+      //   Low     (offscreen, 13 post passes)                     8.8 ms  114 fps
+      // So the cheapest rung of the quality ladder was 1.87x the cost of the rung above it —
+      // which makes stepping down actively harmful, and the adaptive quality step in main.js
+      // depends on the ladder being monotonic. One composite pass over a single-sampled target
+      // beats shading the city four times over.
+      //
+      // The fallback for a GPU with no renderable offscreen format is untouched: _postSupported
+      // is false there and this function returns at the top, straight to the in-shader grade.
+      // What this preset gives up is the default framebuffer's free MSAA — but Minimal has FXAA
+      // off anyway, and 87% of the frame time is not a fair price for it.
 
       const gl = this.gl;
       const w = Math.max(1, gl.drawingBufferWidth || this.width);
