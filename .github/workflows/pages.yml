@@ -1,0 +1,48 @@
+# Publish the site to GitHub Pages on every push to main.
+#
+# There is no build step: the whole thing is static files served as-is, so this just uploads the
+# repo root. index.html is at the root and everything it loads (src/, data/toronto.json) is
+# referenced relatively, so it works unchanged under a /toronto/ subpath.
+#
+# Requires Pages to be enabled on the repo (Settings -> Pages -> Source: GitHub Actions).
+# On a free plan that means the repo must be public; private Pages needs Pro/Team/Enterprise.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a running deploy finish rather than cancelling it, so a rapid series of pushes still
+# lands the newest commit last.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sanity-check the modules before publishing
+        run: |
+          for f in src/*.js; do node --check "$f"; done
+          echo "all modules parse"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
