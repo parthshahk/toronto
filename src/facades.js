@@ -73,6 +73,48 @@
 // (harness numbers, typical arguments) are in the doc comment of each export; the composite
 // appendGroundFloor() lands a full retail treatment near 300 and an office one near 320, inside
 // the ~400 budget. Each export returns the number of vertices it appended.
+//
+// LEVEL OF DETAIL — what the tiling system calls at mid distance
+// --------------------------------------------------------------
+// The city is streamed as tiles that build in stages, and a frontage a kilometre away cannot
+// afford the geometry a frontage across the street deserves. So every builder here takes a
+// LEVEL, through the `lod` field of the `opts` object each of them already accepts:
+//
+//   export const FACADE_LOD = { FULL: 0, COARSE: 1 };            // FULL is the default
+//   export const FACADE_LOD_FEATURE = 0.62;                      // metres; see below
+//   export function facadeLodFor(dist, mPerPx) -> FACADE_LOD.*   // range -> level
+//
+// FULL is untouched: every FULL path in this file is the original code and emits the original
+// vertices, so nothing the player can walk up to has changed by a triangle.
+//
+// COARSE keeps the SILHOUETTE, the MATERIALS and the RANDOM CHOICES and throws away the internal
+// articulation — mullions, door leaves, the revolving drum, balustrades, tie rods, railings,
+// dentil courses, bumpers. What is dropped is either thinner than FACADE_LOD_FEATURE or projects
+// less than it, which is one pixel at 484 m in the framing this project is judged at, so the
+// difference is not detail the eye is losing, it is high-frequency noise the window LOD in
+// render.js would otherwise have to filter out. Measured, per frontage:
+//
+//   appendGroundFloor  retail 330 -> 48  office 294 -> 42  condo 210 -> 42  service 108 -> 12
+//   appendShopfront    318 -> 36     appendEntrance  108-222 -> 12    appendCanopy    72 -> 30
+//   appendBalconyBand   54 -> 30     appendCornice        84 -> 30    appendAwning    30 -> 12
+//   appendFireEscape   324 -> 72     appendLoadingDock   150 -> 36    appendParapet   30 -> 18
+//   appendStringCourse  18 -> 6
+//
+// (Frontages 8-18 m, four floors of fire escape, ends on. Every one of these is a harness number
+// from tools, not an estimate, and the harness also asserts the two invariants below.)
+//
+// TWO INVARIANTS make the level safe to choose per tile and to change while the player moves:
+//
+//   1. Both levels draw the SAME number of values off `rng`, in the same order. city.js shares
+//      one seeded stream across everything it places in a tile, so a level that drew one value
+//      fewer would move every lamp, tree and parked car built after it. Where a COARSE path skips
+//      a helper that would have consumed a draw, it consumes one itself and says so.
+//   2. Both levels make the same DECISIONS from those values — the same sign, lit the same way,
+//      the same entry bay, the same fire-escape side. A tile that swaps level does not swap
+//      content; it swaps how finely the same content is modelled.
+//
+// Neither level knows anything about tiles, ranges or cameras. The caller passes `lod`; this
+// file just builds what it was asked for.
 
 import { clamp, lerp } from './math.js';
 
@@ -217,6 +259,61 @@ function fallbackRng(x, z, salt) {
 
 function rngOf(rng, x, z, salt) {
   return typeof rng === 'function' ? rng : fallbackRng(x, z, salt);
+}
+
+/* ================================================================== LOD == */
+
+/**
+ * Detail level for every builder in this file, selected per call through opts.lod.
+ *
+ *   FULL    everything the builder knows how to draw. The default, and bit-for-bit what this
+ *           module emitted before LOD existed — every FULL path below is the original code.
+ *   COARSE  the same SILHOUETTE, the same MATERIALS and the same random choices, with the
+ *           internal articulation collapsed: no mullions, no door leaves, no revolving drum, no
+ *           balustrades, no tie rods, no railings. Measured 1.7x cheaper on a parapet that was
+ *           already a single slab, 8.8x on a shopfront, 18.5x on a revolving-door lobby.
+ *
+ * @readonly
+ */
+export const FACADE_LOD = Object.freeze({ FULL: 0, COARSE: 1 });
+
+/**
+ * The smallest feature FULL keeps and COARSE drops, in metres. Everything COARSE removes is
+ * either thinner than this (a 0.15 m mullion, a 0.07 m grating, a 0.055 m cap rail) or projects
+ * less than it (a 0.62 m entrance reveal, a 0.42 m lobby surround). One pixel wide is where the
+ * difference stops being visible and starts being noise the LOD in render.js has to filter out.
+ */
+export const FACADE_LOD_FEATURE = 0.62;
+
+// Angular size of one pixel at the reference framing this project is judged at: 1440 x 900,
+// vertical fov 1.05 rad. 2 * tan(fov/2) / heightPx metres per pixel per metre of range.
+const REF_M_PER_PX = 1.2814e-3;
+
+/**
+ * Which level a frontage at this range should be built at.
+ *
+ * Pass `mPerPx` — metres per pixel PER METRE of range, i.e. 2 * tan(fov/2) / viewportHeight — to
+ * make the switch follow the camera the player actually has; omit it and the reference framing
+ * above is assumed, which puts the switch at 484 m.
+ *
+ * The caller decides WHERE the boundary sits in its own streaming scheme; this function only
+ * says where the geometry stops being worth its vertices. A tiling system whose detail stage
+ * already ends closer than this can ignore it and always ask for COARSE in its mid stage.
+ *
+ * @param {number} dist metres from the camera to the frontage
+ * @param {number} [mPerPx] metres per pixel per metre of range
+ * @returns {number} FACADE_LOD.FULL or FACADE_LOD.COARSE
+ */
+export function facadeLodFor(dist, mPerPx) {
+  const d = isNum(dist) ? dist : 0;
+  const k = (isNum(mPerPx) && mPerPx > 1e-9) ? mPerPx : REF_M_PER_PX;
+  return d * k > FACADE_LOD_FEATURE ? FACADE_LOD.COARSE : FACADE_LOD.FULL;
+}
+
+// opts.lod, defended. Anything that is not a recognised level is FULL: a caller who mistypes the
+// option gets the good geometry, never a silently degraded city.
+function lodOf(o) {
+  return (o && (o.lod | 0) === FACADE_LOD.COARSE) ? FACADE_LOD.COARSE : FACADE_LOD.FULL;
 }
 
 /**
@@ -557,6 +654,39 @@ function entService(mb, F, rng, host, width) {
   }
 }
 
+// COARSE: the opening as two flat faces — the surround's outward plane in the host's own stone,
+// and the glazing (or the steel leaf) inside it. Every style draws exactly ONE random value, the
+// same as its FULL counterpart, so a caller sharing one rng stream across a tile gets the same
+// stream whichever level it asked for. 12 verts against 96-219.
+//
+// Nothing projects. At the range COARSE is for, the 0.42-0.72 m reveal these builders model is
+// under a pixel deep, and a flat panel at SKIN cannot self-shadow, cannot z-fight and cannot
+// leave a back-facing hole where a one-sided slab used to be. Returns the head height, as
+// entShopfront does, so appendShopfront can glaze above it. 12 verts against 108-222.
+function entCoarse(mb, F, rng, host, width, style, base) {
+  // Drawn first and unconditionally, exactly as every FULL style draws exactly one value. The
+  // shopfront style is the one that USES it — its head height is random — so taking it here
+  // keeps both the stream and the head line identical between levels.
+  const rv = rng();
+  const d0 = isNum(base) ? Math.max(base, SKIN) : SKIN;
+  let hw, h, j, glass;
+  if (style === 'revolving') {
+    hw = clamp(width * 0.5, 1.3, 3.6); h = 3.05; j = 0.26; glass = MAT_GLASS_LIT;
+  } else if (style === 'shopfront') {
+    hw = clamp(width * 0.5, 0.6, 2.4); h = clamp(2.55 + rv * 0.25, 2.4, 2.9);
+    j = 0.18; glass = MAT_INTERIOR;
+  } else if (style === 'service') {
+    hw = clamp(width * 0.5, 0.5, 1.35); h = 2.32; j = 0.13; glass = MAT_STEEL;
+  } else {
+    hw = clamp(width * 0.5, 0.95, 2.6); h = 2.86; j = 0.22; glass = MAT_GLASS_LIT;
+  }
+  applyHost(mb, host, 1.06, 0.50);
+  rect(mb, F, -hw - j, hw + j, 0, h + 0.18, d0);
+  applyMat(mb, glass);
+  rect(mb, F, -hw, hw, 0.05, h - 0.05, d0 + 0.02);
+  return h + 0.18;
+}
+
 /**
  * A building entrance. `yaw` faces out of the facade; (x, y, z) is the wall point at the CENTRE
  * of the opening, at sidewalk level. `width` is the clear opening — the surround projects and
@@ -567,19 +697,23 @@ function entService(mb, F, rng, host, width) {
  *        'shopfront' recessed retail entry with an interior plane (~132 verts)
  *        'service'   flush steel door, step and bulkhead lamp (~96 verts)
  *
+ * opts: { lod } — FACADE_LOD.COARSE flattens every style to 12 verts. See the LOD block above.
+ *
  * @param {MeshBuilder} mb
  * @param {function} rng seeded 0..1 generator; a deterministic positional fallback is used if absent
  * @param {number[]} [mat] host wall material [r,g,b,emissive,tintable,rough,profile]
+ * @param {object} [opts]
  * @returns {number} vertices appended
  */
-export function appendEntrance(mb, rng, x, y, z, yaw, width, style, mat) {
+export function appendEntrance(mb, rng, x, y, z, yaw, width, style, mat, opts) {
   if (!mb || !isNum(x) || !isNum(y) || !isNum(z)) return 0;
   const w = clamp(isNum(width) ? width : 2.2, 1.0, 8.0);
   const before = vcount(mb);
   const F = frameAt(x, y, z, yaw);
   const R = rngOf(rng, x, z, 7);
   const host = readHost(mb, mat);
-  if (style === 'revolving') entRevolving(mb, F, R, host, w);
+  if (lodOf(opts) === FACADE_LOD.COARSE) entCoarse(mb, F, R, host, w, style);
+  else if (style === 'revolving') entRevolving(mb, F, R, host, w);
   else if (style === 'shopfront') entShopfront(mb, F, R, host, w);
   else if (style === 'service') entService(mb, F, R, host, w);
   else entDouble(mb, F, R, host, w);
@@ -596,8 +730,9 @@ export function appendEntrance(mb, rng, x, y, z, yaw, width, style, mat) {
  * (x, y, z) is the wall point at the CENTRE of the frontage, at sidewalk level. `height` is the
  * shopfront zone, floor to the top of the fascia — typically 4.2-5.6 m.
  *
- * opts: { door: boolean (default true), sign: boolean, lit: boolean, bay: number }
+ * opts: { door: boolean (default true), sign: boolean, lit: boolean, bay: number, lod }
  * Cost: ~62 verts per bay plus ~66 fixed, ~200 for a 12 m three-bay frontage with a door.
+ * At FACADE_LOD.COARSE: 18-36 verts whatever the frontage, because the bays go away.
  *
  * @returns {number} vertices appended
  */
@@ -630,6 +765,38 @@ export function appendShopfront(mb, rng, x, y, z, yaw, width, height, mat, opts)
   const pitch = w / nBays;
   const wantDoor = o.door !== false && w >= 3.2 && pitch >= 1.5;
   const doorBay = wantDoor ? Math.min(nBays - 1, Math.floor(rDoor * nBays)) : -1;
+  const wantSign = o.sign !== false && rSign < 0.92;
+  const signLit = o.lit !== undefined ? !!o.lit : rLitSign < 0.48;
+
+  // --- COARSE ---------------------------------------------------------------------------------
+  // Four flat bands and, where the full version would recess an entry, one dark panel: riser,
+  // glazing, head, fascia. The bay rhythm is what goes — at 0.15 m a mullion is a pixel at 117 m
+  // and pure aliasing past that — but the DATUM lines survive, and those are what a shopfront
+  // reads as from across a block. Same materials, same sign, same lit/unlit decision, and the
+  // same number of draws off the rng: the entry consumes one exactly when the full path's
+  // entShopfront would have.
+  if (lodOf(o) === FACADE_LOD.COARSE) {
+    applyHost(mb, host, 0.74, 0.70);
+    rect(mb, F, -hw, hw, 0, glazBot, SKIN);
+    applyMat(mb, MAT_GLASS_LIT);
+    rect(mb, F, -hw, hw, glazBot, glazTop, SKIN + 0.015);
+    applyHost(mb, host, 0.92, 0.60);
+    rect(mb, F, -hw, hw, glazTop, glazTop + headH, SKIN);
+    if (wantSign) {
+      if (signLit) applyMat(mb, MAT_SIGN_LIT); else applyHost(mb, host, 0.58, 0.55);
+      rect(mb, F, -hw, hw, H - signH, H, SKIN);
+    }
+    if (doorBay >= 0) {
+      const uc = -hw + (doorBay + 0.5) * pitch;
+      const clear = pitch - MULLION_W * 1.2;
+      const dF = frameAt(fx(F, uc, 0), F.y, fz(F, uc, 0), F.yaw);
+      // In front of the glazing band, because the entry is no longer a cavity that could be
+      // seen INTO — flat geometry has to be layered, and 0.03 m is under a tenth of a pixel at
+      // the range this level is for while being ten times the depth buffer's resolution there.
+      entCoarse(mb, dF, R, host, clear, 'shopfront', SKIN + 0.03);
+    }
+    return vcount(mb) - before;
+  }
 
   // --- stall riser, split around the entry so the recess floor is not blocked ---------------
   applyHost(mb, host, 0.74, 0.70);
@@ -675,9 +842,8 @@ export function appendShopfront(mb, rng, x, y, z, yaw, width, height, mat, opts)
   slab(mb, F, -hw, hw, glazTop, glazTop + headH, SKIN, 0.16, F_OUT | F_BOT);
   applyMat(mb, MAT_VALANCE);
   slab(mb, F, -hw + 0.2, hw - 0.2, glazTop - 0.03, glazTop + 0.01, 0.07, 0.15, F_BOT);
-  if (o.sign !== false && rSign < 0.92) {
-    const lit = o.lit !== undefined ? !!o.lit : rLitSign < 0.48;
-    if (lit) applyMat(mb, MAT_SIGN_LIT); else applyHost(mb, host, 0.58, 0.55);
+  if (wantSign) {
+    if (signLit) applyMat(mb, MAT_SIGN_LIT); else applyHost(mb, host, 0.58, 0.55);
     slab(mb, F, -hw, hw, H - signH, H, SKIN, 0.21, F_OUT | F_TOP | F_BOT);
   }
 
@@ -698,7 +864,8 @@ export function appendShopfront(mb, rng, x, y, z, yaw, width, height, mat, opts)
 /**
  * A fabric awning over a shopfront bay: sloped top, valance, gores at each end. (x, y, z) is the
  * wall point at the TOP fixing; the front bar sits `depth` out and 0.55 m lower.
- * Cost: 30 verts.
+ * opts: { ends: boolean (default true), lod }
+ * Cost: 30 verts, 12 at FACADE_LOD.COARSE.
  * @returns {number} vertices appended
  */
 export function appendAwning(mb, rng, x, y, z, yaw, width, depth, mat, opts) {
@@ -715,6 +882,18 @@ export function appendAwning(mb, rng, x, y, z, yaw, width, depth, mat, opts) {
   const val = 0.30;
   const col = AWNING_COLS[Math.min(AWNING_COLS.length - 1, (R() * AWNING_COLS.length) | 0)];
   const rough = 0.90;
+
+  // COARSE: the sloped sheet and its underside. The valance and the end gores are 0.3 m and
+  // 0.1 m2 of fabric — under a pixel at the range this level is for — but the awning's own
+  // colour and the shade it throws on the shopfront behind it are the whole point of it, and
+  // both of those are carried by these two faces.
+  if (lodOf(o) === FACADE_LOD.COARSE) {
+    mb.color(col[0], col[1], col[2], 0, 0, rough, 0);
+    quad(mb, F, -hw, -drop, dp, hw, -drop, dp, hw, 0, SKIN, -hw, 0, SKIN);
+    mb.color(col[0] * 0.45, col[1] * 0.45, col[2] * 0.45, 0, 0, rough, 0);
+    quad(mb, F, -hw, 0, SKIN, hw, 0, SKIN, hw, -drop, dp, -hw, -drop, dp);
+    return vcount(mb) - before;
+  }
 
   mb.color(col[0], col[1], col[2], 0, 0, rough, 0);
   // Top surface, wall high, front bar low. Wound so the normal points up and out.
@@ -739,7 +918,8 @@ export function appendAwning(mb, rng, x, y, z, yaw, width, depth, mat, opts) {
 /**
  * A rigid entrance canopy: a cantilevered slab with a lit soffit, hung on two tie rods.
  * (x, y, z) is the wall point at the canopy's UNDERSIDE.
- * Cost: 60 verts.
+ * opts: { rods: boolean (default true), lod }
+ * Cost: 60 verts, 72 with a third tie rod. 30 at FACADE_LOD.COARSE.
  * @returns {number} vertices appended
  */
 export function appendCanopy(mb, rng, x, y, z, yaw, width, depth, mat, opts) {
@@ -754,6 +934,17 @@ export function appendCanopy(mb, rng, x, y, z, yaw, width, depth, mat, opts) {
   const host = readHost(mb, mat);
   const hw = w * 0.5;
   const t = clamp(dp * 0.11, 0.16, 0.34);
+
+  // COARSE: one closed slab. The 70 mm tie rods and the strip light in the soffit are the two
+  // things that go; the projecting deck, which is the whole silhouette and the whole shadow, is
+  // exactly what it was. The rng is drawn under precisely the same condition as below, so the
+  // stream does not move.
+  if (lodOf(o) === FACADE_LOD.COARSE) {
+    applyHost(mb, host, 1.02, 0.55);
+    slab(mb, F, -hw, hw, 0, t, SKIN, dp, F_SHELL);
+    if (o.rods !== false && dp > 0.9 && w > 6.0) R();
+    return vcount(mb) - before;
+  }
 
   applyHost(mb, host, 1.02, 0.55);
   slab(mb, F, -hw, hw, 0, t, SKIN, dp, F_SHELL & ~F_BOT);
@@ -792,8 +983,13 @@ export function appendCanopy(mb, rng, x, y, z, yaw, width, depth, mat, opts) {
  * stock. (x, y, z) is the wall point at the balcony DECK level (the walking surface); the slab
  * hangs below it and the rail stands on it.
  *
- * opts: { ends: boolean (default true), rail: number rail height, slab: number slab thickness }
- * Cost: 54 verts with ends, 42 without.
+ * opts: { ends: boolean (default true), rail: number rail height, slab: number slab thickness,
+ *         lod }
+ * Cost: 54 verts with ends, 42 without. At FACADE_LOD.COARSE, 30 and 18.
+ *
+ * This is the builder LOD matters most for: a 40-storey condo carries up to 20 bands on each of
+ * two elevations, so the level chosen here is worth more vertices than every other feature on
+ * the building put together.
  * @returns {number} vertices appended
  */
 export function appendBalconyBand(mb, x, y, z, yaw, width, depth, mat, opts) {
@@ -809,6 +1005,17 @@ export function appendBalconyBand(mb, x, y, z, yaw, width, depth, mat, opts) {
   const th = clamp(isNum(o.slab) ? o.slab : 0.24, 0.10, 0.6);
   const rail = clamp(isNum(o.rail) ? o.rail : 1.07, 0.7, 1.5);
   const ends = o.ends !== false;
+
+  // COARSE: deck slab and glass rail as ONE solid, from the underside of the slab to the top of
+  // the balustrade. The two of them are 0.24 m of pale concrete under 1.07 m of dark glass and
+  // they sit within 0.07 m of the same plane, so at range they are one 1.31 m projecting band —
+  // which is exactly the horizontal striping that makes a Toronto condo read as a condo from two
+  // kilometres. 0.80 is the area-weighted lightness of the pair and 0.60 splits their roughness.
+  if (lodOf(o) === FACADE_LOD.COARSE) {
+    applyHost(mb, host, 0.80, 0.60);
+    slab(mb, F, -hw, hw, -th, rail, SKIN, dp, F_OUT | F_TOP | F_BOT | (ends ? F_ENDS : 0));
+    return vcount(mb) - before;
+  }
 
   // Slab: fascia, deck and ends in the wall's own concrete, underside darker.
   applyHost(mb, host, 0.86, 0.80);
@@ -830,8 +1037,8 @@ export function appendBalconyBand(mb, x, y, z, yaw, width, depth, mat, opts) {
 /**
  * A projecting cornice for masonry and heritage stock: dentil band, corona, weathered crown.
  * (x, y, z) is the wall point at the BOTTOM of the cornice. `depth` is the maximum projection.
- * opts: { ends: boolean (default true) } — turn ends off for a band that wraps a whole building.
- * Cost: 84 verts with ends, 48 without.
+ * opts: { ends: boolean (default true), lod } — turn ends off for a band that wraps a building.
+ * Cost: 84 verts with ends, 48 without. At FACADE_LOD.COARSE, 30 and 18.
  * @returns {number} vertices appended
  */
 export function appendCornice(mb, x, y, z, yaw, width, depth, mat, opts) {
@@ -845,6 +1052,15 @@ export function appendCornice(mb, x, y, z, yaw, width, depth, mat, opts) {
   const host = readHost(mb, mat);
   const hw = w * 0.5;
   const e = o.ends !== false ? F_ENDS : 0;
+
+  // COARSE: one band at the corona's own projection, spanning the whole cornice height. What a
+  // cornice does at range is put a lit top edge and a shadowed underside on the roofline, and a
+  // single slab does both; the dentil course and the weathered crown are 0.2 m steps.
+  if (lodOf(o) === FACADE_LOD.COARSE) {
+    applyHost(mb, host, 1.08, 0.78);
+    slab(mb, F, -hw, hw, 0, dp * 1.62, SKIN, dp, F_BAND | e);
+    return vcount(mb) - before;
+  }
 
   applyHost(mb, host, 1.00, 0.78);
   slab(mb, F, -hw, hw, 0, dp * 0.36, SKIN, dp * 0.34, F_BAND | e);
@@ -860,8 +1076,9 @@ export function appendCornice(mb, x, y, z, yaw, width, depth, mat, opts) {
 /**
  * A string course: the thin horizontal band that ties a masonry facade together at floor lines.
  * (x, y, z) is the wall point at the BOTTOM of the band.
- * opts: { h: band height (0.24), proj: projection (0.10), ends: boolean (default false) }
- * Cost: 18 verts, 30 with ends.
+ * opts: { h: band height (0.24), proj: projection (0.10), ends: boolean (default false), lod }
+ * Cost: 18 verts, 30 with ends. Already one slab, so COARSE drops it to the outward face alone —
+ * 6 verts — and the 0.10 m shadow line it loses there is a tenth of a pixel at that range.
  * @returns {number} vertices appended
  */
 export function appendStringCourse(mb, x, y, z, yaw, width, mat, opts) {
@@ -876,7 +1093,8 @@ export function appendStringCourse(mb, x, y, z, yaw, width, mat, opts) {
   const h = clamp(isNum(o.h) ? o.h : 0.24, 0.06, 1.2);
   const proj = clamp(isNum(o.proj) ? o.proj : 0.10, 0.03, 0.8);
   applyHost(mb, host, 1.12, 0.78);
-  slab(mb, F, -hw, hw, 0, h, SKIN, proj, F_BAND | (o.ends ? F_ENDS : 0));
+  if (lodOf(o) === FACADE_LOD.COARSE) rect(mb, F, -hw, hw, 0, h, SKIN);
+  else slab(mb, F, -hw, hw, 0, h, SKIN, proj, F_BAND | (o.ends ? F_ENDS : 0));
   return vcount(mb) - before;
 }
 
@@ -884,8 +1102,8 @@ export function appendStringCourse(mb, x, y, z, yaw, width, mat, opts) {
  * A parapet standing on the roof edge, capped with coping. (x, y, z) is the wall point at ROOF
  * level; the wall face is flush with the facade below and the parapet thickens INWARD, over the
  * roof, so it never floats off the edge of the extrusion.
- * opts: { t: wall thickness (0.30), ends: boolean (default false) }
- * Cost: 30 verts.
+ * opts: { t: wall thickness (0.30), ends: boolean (default false), lod }
+ * Cost: 30 verts, 18 at FACADE_LOD.COARSE.
  * @returns {number} vertices appended
  */
 export function appendParapet(mb, x, y, z, yaw, width, h, mat, opts) {
@@ -901,6 +1119,14 @@ export function appendParapet(mb, x, y, z, yaw, width, h, mat, opts) {
   const t = clamp(isNum(o.t) ? o.t : 0.30, 0.10, 1.2);
   const e = o.ends ? F_ENDS : 0;
   const capH = Math.min(0.14, hh * 0.3);
+  // COARSE: one leaf, coping included. The 0.14 m cap is a lighter line along the very top of the
+  // building and it is worth keeping at range — but it is worth keeping as the top face of the
+  // wall, not as its own box.
+  if (lodOf(o) === FACADE_LOD.COARSE) {
+    applyHost(mb, host, 1.02, 0.72);
+    slab(mb, F, -hw, hw, 0, hh, -t, SKIN, (F_OUT | F_IN | F_TOP) | e);
+    return vcount(mb) - before;
+  }
   applyHost(mb, host, 0.98, 0.74);
   slab(mb, F, -hw, hw, 0, hh - capH, -t, SKIN, (F_OUT | F_IN) | e);
   applyHost(mb, host, 1.14, 0.70);
@@ -915,8 +1141,9 @@ export function appendParapet(mb, x, y, z, yaw, width, h, mat, opts) {
  * pair of landings. Rear and side elevations only; this is the most expensive builder here.
  * (x, y, z) is the wall point under the CENTRE of the LOWEST landing, at that landing's level.
  *
- * opts: { storey: floor-to-floor (3.4), ladder: boolean (default true) }
- * Cost: ~66 verts per floor plus ~24, e.g. 288 for 4 floors.
+ * opts: { storey: floor-to-floor (3.4), ladder: boolean (default true), lod }
+ * Cost: ~66 verts per floor plus ~24, measured 324 for 4 floors. At FACADE_LOD.COARSE, 18 per
+ * floor and nothing fixed — 72 for the same four.
  * @returns {number} vertices appended
  */
 export function appendFireEscape(mb, rng, x, y, z, yaw, width, floors, mat, opts) {
@@ -933,6 +1160,19 @@ export function appendFireEscape(mb, rng, x, y, z, yaw, width, floors, mat, opts
   const dp = clamp(w * 0.28, 0.95, 1.35);
   const rail = 1.05;
   const side = R() < 0.5 ? -1 : 1;   // which end the flights run from
+
+  // COARSE: the landings, and only the landings. A fire escape at range is a stack of dark
+  // horizontal lines on a brick wall — the rails are 30-70 mm of steel, the flights are a
+  // diagonal inside a shadow, and the drop ladder is below the bottom landing where nothing can
+  // see it. The band here is deck plus rail height, so the stack keeps its full outline.
+  if (lodOf(o) === FACADE_LOD.COARSE) {
+    applyMat(mb, MAT_STEEL);
+    for (let i = 0; i < n; i++) {
+      const v = i * st;
+      slab(mb, F, -hw, hw, v, v + rail, SKIN, dp, F_OUT | F_TOP | F_BOT);
+    }
+    return vcount(mb) - before;
+  }
 
   applyMat(mb, MAT_STEEL);
   for (let i = 0; i < n; i++) {
@@ -978,8 +1218,8 @@ export function appendFireEscape(mb, rng, x, y, z, yaw, width, floors, mat, opts
  * A loading dock on a rear or service elevation: raised apron, roller shutter in a deep reveal,
  * rubber bumpers and a steel weather canopy. (x, y, z) is the wall point at the CENTRE of the
  * opening, at ground level.
- * opts: { canopy: boolean (default true), dock: number platform height (1.15) }
- * Cost: ~132 verts, ~102 without the canopy.
+ * opts: { canopy: boolean (default true), dock: number platform height (1.15), lod }
+ * Cost: ~132 verts, measured 150 with the canopy. At FACADE_LOD.COARSE, 36 and 18.
  * @returns {number} vertices appended
  */
 export function appendLoadingDock(mb, x, y, z, yaw, width, mat, opts) {
@@ -993,6 +1233,21 @@ export function appendLoadingDock(mb, x, y, z, yaw, width, mat, opts) {
   const hw = Math.min(w, 9.0) * 0.5;
   const deck = clamp(isNum(o.dock) ? o.dock : 1.15, 0.6, 1.6);
   const doorH = deck + 3.05;
+
+  // COARSE: the apron and the shutter. The reveal, the rubber bumpers and the shutter's guides
+  // are all under 0.3 m; what survives is the raised platform, which is a real change of ground
+  // level, and the dark rectangle of the door, which is what says "loading dock" at range.
+  if (lodOf(o) === FACADE_LOD.COARSE) {
+    applyHost(mb, host, 0.80, 0.86);
+    slab(mb, F, -hw - 0.30, hw + 0.30, 0, deck, -0.05, 1.35, F_OUT | F_TOP);
+    applyMat(mb, MAT_SHUTTER);
+    rect(mb, F, -hw, hw, deck, doorH, SKIN);
+    if (o.canopy !== false) {
+      applyMat(mb, MAT_STEEL);
+      slab(mb, F, -hw - 0.45, hw + 0.45, doorH + 0.22, doorH + 0.40, SKIN, 1.55, F_OUT | F_TOP | F_BOT);
+    }
+    return vcount(mb) - before;
+  }
 
   // Apron: the raised platform trucks back up to.
   applyHost(mb, host, 0.80, 0.86);
@@ -1047,10 +1302,16 @@ export function entranceStyleFor(profile, height) {
  * available frontage.
  *
  * opts: { profile, height (building height), floorH (ground storey, default 4.6),
- *         retail: force a shopfront, canopy: boolean, awning: boolean }
+ *         retail: force a shopfront, canopy: boolean, awning: boolean, lod }
+ *
+ * `opts` is passed through UNCHANGED to every builder this composes, so one `lod` on the way in
+ * sets the level for the whole frontage. Both levels draw the same values off `rng` in the same
+ * order, so a tile that builds its frontages COARSE places exactly the same lamps, trees and
+ * parked cars afterwards as one that builds them FULL.
  *
  * Measured cost: 292 verts for retail (12 m frontage), 321 for an office tower, 200 for a condo
  * lobby, 96 for a service elevation — all inside the ~400 budget for one building.
+ * At FACADE_LOD.COARSE: 48, 42, 42 and 12.
  * @returns {number} vertices appended
  */
 export function appendGroundFloor(mb, rng, x, y, z, yaw, width, opts) {
@@ -1088,7 +1349,7 @@ export function appendGroundFloor(mb, rng, x, y, z, yaw, width, opts) {
   const raw = style === 'revolving' ? clamp(w * 0.30, 3.0, 5.4)
     : (style === 'service' ? clamp(w * 0.22, 1.1, 2.0) : clamp(w * 0.26, 1.9, 3.4));
   const doorW = Math.max(1.0, Math.min(raw, w - 0.7));
-  appendEntrance(mb, R, x, y, z, yaw, doorW, style, host);
+  appendEntrance(mb, R, x, y, z, yaw, doorW, style, host, o);
   if (o.canopy !== false && (style === 'revolving' || style === 'double') && w >= 4.0) {
     appendCanopy(mb, R, x, y + floorH * 0.78, z, yaw, Math.min(doorW + 1.5, w),
       style === 'revolving' ? 2.4 : 1.8, host, o);

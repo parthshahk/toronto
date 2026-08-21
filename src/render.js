@@ -94,19 +94,45 @@ const MAX_CASCADES = 4;
 // here: main.js drives the near plane from measured clearance and it sits at 0.30-1.60 m, so the
 // log series starts at a distance nothing is ever drawn at, and the uniform half — which is a
 // terrible split — ends up carrying the result. Fitting from a STREET anchor instead is the
-// standard remedy and it is what these three numbers are:
+// standard remedy and it is what these numbers are:
 //
-//   the first split lands at CSM_SPLIT_FRAC of the reach, held inside [MIN, MAX] so that a short
-//   reach cannot collapse cascade 0 onto the camera's nose and a long one cannot stretch it past
-//   the block you are standing in;
+//   cascade 0 ends at CSM_SPLIT0 metres — an ABSOLUTE distance, not a fraction of the reach;
 //   every split after it is GEOMETRIC from there to the reach, which is the series that minimises
 //   the worst ratio, i.e. the softest texel-to-pixel figure anywhere in the frame.
 //
-// 165 m is a Toronto block plus its intersection. Below it a pedestrian sees cascade 1 across the
-// street; above it cascade 0's texels start to show at arm's length.
-const CSM_SPLIT_FRAC = 0.055;
-const CSM_SPLIT_MIN = 60;
-const CSM_SPLIT_MAX = 165;
+// ABSOLUTE, and this is the correction the expansion forced. Because every cascade is fitted to
+// the bounding sphere of its own slice, its texel-to-pixel ratio at the slice's FAR edge is a
+// constant — 0.910 at 1440x900, fov 1.05, 2048 tiles — whatever the split. So the split does not
+// buy sharpness at the far edge of the cascade; it buys it in ABSOLUTE METRES near the camera,
+// which is where a pedestrian actually looks. A fraction of the reach makes that number a
+// function of the time of day, because DAY_SHADOW_DISTANCE buys daylight a longer reach.
+//
+// The three rules, cascade far distance / world metres per texel, worst ratio between splits:
+//
+//   3 cascades, practical split lambda 0.76 (what the pre-expansion build shipped)
+//     blue, reach 1250   108/0.127   288/0.320   1250/1.414                        4.34
+//     day,  reach 2375   200/0.235   515/0.571   2375/2.692                        4.61
+//   4 cascades, first split at 5.5% of the reach
+//     blue, reach 2200   121/0.142   318/0.353    837/0.928   2200/2.441           2.63
+//     day,  reach 2860   157/0.184   414/0.459   1088/1.207   2860/3.173           2.63
+//   4 cascades, first split pinned at 110 m — THIS
+//     blue, reach 2200   110/0.129   299/0.332    810/0.900   2200/2.444           2.71
+//     day,  reach 2860   110/0.129   326/0.363    965/1.077   2860/3.189           2.96
+//
+// Read the near column: the fraction rule made the shadow under a parked car 30% coarser at three
+// in the afternoon than at dusk, for no reason a player could name, and the shipped three-cascade
+// rule made it 85% coarser. Pinning the anchor holds 0.129 m per texel at every preset and every
+// reach — better than all four of those — and pays 2.71 -> 2.96 for it in the worst ratio, which
+// is the texel-per-pixel figure at the near edge of the softest cascade and is nowhere anyone is
+// looking. (The numbers above are the fit itself, read back from renderer.shadowStats.)
+//
+// 110 m is a Toronto block face — King to Adelaide is 110 m, Adelaide to Richmond 112. Below it
+// cascade 1 starts across the street you are standing on; above it cascade 0's texels start to
+// show at arm's length. The bracket exists only so a pathological `distance` cannot order the
+// first split past the last one.
+const CSM_SPLIT0 = 110;
+const CSM_SPLIT_MIN = 40;
+const CSM_SPLIT_MAX = 260;
 
 // --- daylight -------------------------------------------------------------------------------
 // `env.daylight` (0 = blue hour / night, 1 = full sun) is the single switch between the two
@@ -243,16 +269,17 @@ export class Camera {
     // it halves the depth resolution and takes a matching bite out of the flicker.
     //
     // The far plane is the OTHER end of the same expression, and the algebra says it is nearly
-    // free: dz = 2^-24 * z^2 / near * (1 - near / far), so moving far from 5,600 m to 16,000 m
-    // changes the (1 - near/far) factor from 0.999821 to 0.999938 — a 0.012% loss. The far plane
-    // is therefore set by VISIBILITY alone, and visibility is what the expanded extract changed.
+    // free: dz = 2^-24 * z^2 / near * (1 - near / far), so moving far from 5,600 m to 18,600 m
+    // changes the (1 - near/far) factor from 0.999821 to 0.999946 — a 0.012% loss, three orders
+    // of magnitude smaller than what the near plane is worth. The far plane is therefore set by
+    // VISIBILITY alone, and visibility is what the expanded extract changed.
     //
     // 5,600 m was the diagonal of the OLD reachable world. It is now far too short. main.js
     // clamps the camera to x +/-3,704, z -3,548..+4,508, y -60..2,400; the mapped city fills
     // x +/-3,384, z +/-3,228 and rises to 553 m; and city.js draws the lake as a flat sheet out
     // to x +/-8,184 and z -4,428..+10,428, because the harbour has to have a horizon. The
-    // longest sightline that volume admits — the ceiling above the north-west corner looking at
-    // the far south-east corner of the water — is 18,504 m.
+    // longest sightline that volume admits — the ceiling above the north-west corner of the
+    // clamp looking at the far south-east corner of the water — is 18,493 m.
     //
     // MEASURED, at the default lake viewpoint looking south at three pitches: at 5,600 the plane
     // cuts the lake in a band ~20 scanlines deep whose worst row differs from the uncut frame by
@@ -260,10 +287,11 @@ export class Camera {
     // already happening before the expansion — the old note measured from 207 m, where the cut
     // hides in the horizon band, and not from the 300 m the start viewpoint actually uses.
     //
-    // 16,000 m is where the deep-air term in vhFogAmount below has closed the air to 99.7%, so
-    // the cut lands under one 8-bit code value. The two numbers are a PAIR: raising the plane
-    // without the range fog just moves a visible edge further out, and closing the air without
-    // raising the plane leaves the edge inside the haze where it is dimmer but still there.
+    // 18,600 m is that worst-case sightline plus 100 m, so there is no camera the game allows
+    // from which the plane can cut anything at all. It is belt AND braces: the horizon closer in
+    // vhFogAmount below is already at 99.96% opaque by 16 km, so even a plane that did cut would
+    // land under one 8-bit code value — but a bound that is simply longer than the world cannot
+    // be argued with, and it costs 0.008% of the depth resolution to have.
     //
     // WebGL2 has no glClipControl, so true reversed-Z is unavailable: the [-1,1] NDC z is
     // computed in float32 before the fixed-function viewport transform, and a reversed far plane
@@ -273,7 +301,7 @@ export class Camera {
     // main.js drives `near` per frame from the clearance actually around the eye (see its
     // cameraNear()); this is the value used before the city exists and if nothing drives it.
     this.near = 1.0;
-    this.far = 16000;
+    this.far = 18600;
 
     this.view = mat4();
     this.proj = mat4();
@@ -307,7 +335,7 @@ export class Camera {
     // that hands it a metre-scale typo would quietly halve the depth buffer's usable range or
     // clip the whole city away.
     const near = clamp(Number.isFinite(this.near) ? this.near : 1.0, 0.05, 64);
-    let far = Number.isFinite(this.far) ? this.far : 16000;
+    let far = Number.isFinite(this.far) ? this.far : 18600;
     if (far <= near + 1e-3) far = near + 1000;
 
     m4lookAt(this.view, p, t, this.up);
@@ -451,41 +479,72 @@ vec3 vhSkyGradient(vec3 dir, vec3 zen, vec3 hor, vec3 west, vec3 sunDir) {
   return max(col, vec3(0.0));
 }
 
-// --- height fog + deep air ------------------------------------------------------------------
-// TWO layers, because one cannot do both jobs over a 6.8 x 6.5 km map.
+// --- height fog + aerial perspective ---------------------------------------------------------
+// THREE terms, because one cannot do all three jobs over a 6.8 x 6.5 km map that a player can
+// also see 18 km across.
 //
-// LAYER 1, the haze deck. An analytic integral of an exponential density field along the view
+// TERM 1, the haze deck. An analytic integral of an exponential density field along the view
 // ray, so the street grid sits in haze while the towers rise clear of it (CONTRACT §3.2 item 7).
 // p.x = density, p.y = scale height, p.z = base Y, p.w = maximum opacity.
 //
 // The deck's scale height is 48-120 m across the four presets, which is the point — it is a
-// ground-hugging haze, not an atmosphere. The consequence is that it CANNOT close a horizon:
-// the whole vertical optical depth of the afternoon deck is density * H = 0.0075, so a ray from
-// the 2,400 m ceiling to the far corner of the lake 18.5 km away accumulates 0.058 and comes
-// back 4% fogged. Every edge of the drawn world — the far plane, the rim of the water sheet, the
-// last tile the streamer built — is fully legible from any altitude. On a 3 km map you never got
-// far enough from anything for that to show. On this one you do.
+// ground-hugging haze, not an atmosphere. Two consequences follow, and both of them are what
+// the expanded extract exposed. It cannot fog a TOWER: from the 300 m start viewpoint the whole
+// afternoon deck contributes 1.9% of airlight to a roof 2 km away and 4.8% to one at 5 km, so the
+// Financial District and the north edge of the extract came back at very nearly the same contrast
+// and the city read as a flat sheet of confetti rather than as depth. And it cannot close a
+// HORIZON: the deck's entire vertical optical depth is density x H = 0.00749, so the far plane,
+// the rim of the water sheet and the last tile the streamer built are all fully legible from any
+// altitude. On a 3 km map you never got far enough from anything for either to show. On this one
+// you do.
 //
-// LAYER 2, the deep air. What actually hides a horizon is aerial perspective: extinction along
-// the whole sightline, which at these ranges is dominated by scattering out of a column that has
-// no useful vertical structure. Modelling it as a third exponential with a kilometre-scale height
-// would be the physical answer and would also veil the mid-distance, which is exactly what this
-// pass is not allowed to do — the city 1-5 km off the start viewpoint has to stay legible and
-// COLOURED. So the deep air is expressed as optical depth in RANGE only, quadratic in the excess
-// beyond q.x, which makes it identically zero inside q.x and then very steep:
+// TERM 2, aerial perspective — 'beta', extinction per metre of sightline, altitude-independent.
+// This is the term that makes distance READ as distance, and it is the one the expansion needed.
+// It is passed in already multiplied by daylight, and that is a physical statement rather than a
+// convenience: airlight is SUNLIGHT scattered into the line of sight, so at 15:20 a facade 5 km
+// away is half sky-colour and at 23:30 the same facade's lit windows come through nearly intact.
+// Anyone who has looked at a city at night from across a lake has seen exactly that. It is also
+// what makes "blue hour has not drifted" provable rather than merely intended: beta is
+// multiplied by env.daylight on the JS side and by nothing else, and env.daylight is
+// exactly 0 at both Blue hour and Night, so THIS TERM cannot move either of them by one bit.
+// (The q window below did move them, by a measured fraction of a code value — see the fogRange
+// block in the renderer's env defaults for the numbers.)
 //
-//   q.x = 4,200 m  range at which it starts     q.y = 1 / 4,900 m  (one unit of depth per span)
+//   beta = 3.912 / V, where V is the Koschmieder visual range. env.fogVisualRange defaults to
+//   40 km — a clear, dry Toronto summer afternoon — giving 9.78e-5 per metre.
+//
+// TERM 3, the horizon closer, quadratic in the excess range beyond q.x. Nothing physical: it is
+// the term that guarantees no edge of the drawn world is ever visible, at ANY time of day, which
+// is CONTRACT §9.4. Quadratic so that it is small where the city is and unavoidable where it is
+// not; NOT daylight-scaled, because a horizon has to shut at night too.
+//
+//   q.x = 3,000 m  range at which it starts     q.y = 1 / 5,200 m  (one unit of depth per span)
 //   q.z, q.w       the window over which the cap is allowed to open from p.w to fully opaque
 //
-// Measured optical depth added: 0 at 4.2 km, 0.026 at 5 km (2.6%), 0.13 at 6 km, 1.34 at 9.9 km,
-// 2.5 at 12 km, 5.7 at 16 km (99.7%). The whole mapped extent is inside 5.2 km of the start
-// viewpoint, so the city loses at most 4% of its contrast to this and the horizon still shuts.
+// TOTAL AIRLIGHT, all three terms and the cap, evaluated for a ray from the 300 m start viewpoint
+// to a roof at 100 m — which is the shot this build is judged on:
+//
+//     km        0.5    1     2     3     4     5     6     8    10    12    14    16
+//     Afternoon 3.9   7.6  14.4  20.5  27.9  37.9  49.4  72.0  88.9  97.9  99.8  100.0  %
+//     Golden    4.3   8.4  16.0  22.8  31.2  42.4  54.6  76.8  91.3  98.2  99.7  100.0  %
+//     Blue      2.4   4.7   9.2  13.4  20.3  31.5  45.1  71.5  89.1  97.1  99.4   99.9  %
+//     Night     2.0   4.1   7.9  11.7  18.2  29.4  43.3  70.5  88.6  96.9  99.4   99.9  %
+//
+// So the Financial District at 2.0-2.7 km keeps 82% of its own contrast and its colour, the north
+// edge of the extract at 6 km is halfway to the sky and unmistakably far, and the far plane
+// cannot be seen from anywhere. Blue hour and Night sit BELOW the daylight curve past 3 km, which
+// is the aerial-perspective term doing exactly what it should: after sunset there is no sunlight
+// to scatter into the ray, and a lit window five kilometres away comes through.
+//
+// At street level, where a 1.7 m eye looks along a 90 m facade, the same three terms give
+// Afternoon 1.8% at 200 m, 4.5% at 500 m and 12.7% at 1.5 km — the aerial term is a whisper down
+// a street and the deck is what carries the haze, which is the division of labour intended.
 //
 // p.w (fogMax) is a MID-DISTANCE cap: it exists so a skyline 2 km off keeps some of itself and
 // does not flatten into the fog colour. Applied at 16 km it is the opposite of useful — it would
 // hold the far plane's cut at 28% of full contrast forever. So the cap opens over q.z..q.w and
 // the air is allowed to close completely once there is nothing left out there worth seeing.
-float vhFogAmount(vec3 camPos, vec3 world, vec4 p, vec4 q) {
+float vhFogAmount(vec3 camPos, vec3 world, vec4 p, vec4 q, float beta) {
   vec3 d = world - camPos;
   float len = length(d);
   if (len < 1e-4) return 0.0;
@@ -500,10 +559,10 @@ float vhFogAmount(vec3 camPos, vec3 world, vec4 p, vec4 q) {
   float f;
   if (abs(dy) > 1e-3) f = max(p.x, 0.0) * H * (ec - ew) * (len / dy);
   else f = max(p.x, 0.0) * ec * len;
-  // Deep air. Exactly zero inside q.x, so every sightline shorter than that is bit-for-bit what
-  // it was before this term existed — which is the whole street-level image at all four presets.
+  // Aerial perspective, then the horizon closer. The closer is exactly zero inside q.x, so no
+  // sightline shorter than that can be moved by it at any time of day.
   float s = max(len - q.x, 0.0) * max(q.y, 0.0);
-  f = clamp(f + s * s, 0.0, 60.0);
+  f = clamp(f + max(beta, 0.0) * len + s * s, 0.0, 60.0);
   // The mid-distance cap opens toward fully opaque over q.z..q.w. smoothstep guards itself
   // against q.z >= q.w, so a caller cannot invert the window into a divide by zero.
   float cap = mix(clamp(p.w, 0.0, 1.0), 1.0, smoothstep(q.z, max(q.w, q.z + 1.0), len));
@@ -743,16 +802,50 @@ const vec3 VH_DAY_BOUNCE_TINT = vec3(1.22, 1.00, 0.74);
 // separation, and the frame gets its chroma back for nothing.
 const float VH_DAY_HAZE_NEUTRAL = 0.28;
 
+// HORIZON WELD weight, from the sightline length and the same q.z..q.w window the fog cap opens
+// over. One ramp, one statement: beyond q.z the air is allowed to close completely, and what it
+// closes TO is the sky. Deliberately the same window rather than a second one, because two
+// independent ramps over the same pixels is precisely how you get a band.
+float vhAerialWeld(float len, vec4 q) {
+  return smoothstep(q.z, max(q.w, q.z + 1.0), len);
+}
+
 // The daylight aerial-perspective colour. Shared by the scene and water passes so the harbour and
 // the shoreline behind it fog into exactly the same air.
+//
+// The last argument is the HORIZON WELD weight from vhAerialWeld above, and it exists for ONE
+// reason. city.js draws the lake as a flat sheet out to z = +10,428, and from the 2,400 m ceiling
+// that sheet's far edge is 19 km away and BELOW the true horizon, so it is drawn against sky
+// rather than against more water. At full opacity the sheet takes the aerial colour and the sky
+// above it takes the sky gradient, and those are two different colours — measured 48/765 of the
+// RGB range apart across ten scanlines, which is a visible seam and is exactly the "world
+// visibly ends" CONTRACT §9.4 forbids.
+//
+// The physics says what to do about it: airlight is sky radiance scattered into the ray, so at
+// infinite optical depth the haze IS the sky and the artistic uFogColor has to give way. So the
+// aerial colour converges, over the whole q.z..q.w window, to what the SKY SHADER would have
+// drawn in that direction — its gradient, pulled toward uFogColor by the same horizon-haze term
+// SKY_FS applies (0.22 at the horizon, decaying at exp2(-15|up|)). Ten kilometres of ramp is
+// what makes it a gradient instead of a band: a convergence keyed on OPACITY instead compresses
+// the whole transition into the last 3% of it, which over open water lands as eighteen visible
+// scanlines — measured, and tried, before this.
+//
+// MEASURED at the far corner of the water sheet, over the 120 px column that straddles the sheet
+// edge: the largest step between two adjacent scanlines falls from 15.6/765 to 10.6/765 and the
+// largest step over any six from 49.8/765 to 18.9/765, and the row profile stops reversing — it
+// descends monotonically from the sky into the water with no band anywhere. See the sibling note
+// on the horizon-closer window for what this and the window together cost the other presets.
 vec3 vhAerial(vec3 fogColor, vec3 viewDir, vec3 zen, vec3 hor, vec3 west, vec3 sunDir,
-              vec3 keyColor, float day) {
-  vec3 aerial = mix(fogColor, vhSkyGradient(viewDir, zen, hor, west, sunDir), 0.55);
+              vec3 keyColor, float day, float weld) {
+  vec3 sky = vhSkyGradient(viewDir, zen, hor, west, sunDir);
+  vec3 aerial = mix(fogColor, sky, 0.55);
   float d = clamp(day, 0.0, 1.0);
   aerial = mix(aerial, mix(aerial, vec3(vhLum(aerial)), VH_DAY_HAZE_NEUTRAL), d);
   float sunAz = clamp(dot(viewDir, sunDir), 0.0, 1.0);
   float sunAz2 = sunAz * sunAz;
-  return aerial + keyColor * ((0.020 + 0.130 * sunAz2 * sunAz2 * sunAz) * d);
+  aerial += keyColor * ((0.020 + 0.130 * sunAz2 * sunAz2 * sunAz) * d);
+  vec3 skyHaze = mix(sky, fogColor, exp2(-1.442695 * abs(viewDir.y) * 15.0) * 0.22);
+  return mix(aerial, skyHaze, clamp(weld, 0.0, 1.0));
 }
 
 // --- daylight albedo expansion ----------------------------------------------------------------
@@ -1095,6 +1188,17 @@ float vhShadow(vec3 wp, vec3 N, float ndl, float viewDist) {
 //   4 PARKING      open horizontal deck slots, greenish-white strip lighting, mostly open air
 //   5 CIVIC        small punched windows, mostly dark, tungsten — heritage stone character
 const GLSL_FACADE = `
+// The widest a pane edge may be filtered, in CELLS. It is a clamp rather than the raw footprint
+// because a filter wider than the pane itself takes the pane's peak with it, and a window that
+// has lost its peak has stopped being interior light and started being a grey wall.
+//
+// 0.50, not 0.35. The crossfade in vhFacade below hands this function a FINE level whose cell
+// footprint runs from VH_WIN_FOLD to 2 x VH_WIN_FOLD of a pixel, so the fine level's aa is
+// 0.50-1.00 and the old clamp left it under-filtered over that whole span — including at the
+// bottom of it, where the crossfade gives the fine level ALL of the weight. Cost of widening it:
+// an office pane's peak coverage falls from 1.000 to 0.960 at the worst point, which is nothing
+// next to what it buys in temporal stability at 2 km and beyond (see VH_WIN_FOLD).
+const float VH_WIN_AA_MAX = 0.50;
 // One evaluation of the facade lattice at ONE cell size. Returns rgb = emitted interior light,
 // w = GLAZING coverage (1 inside a pane, 0 on a mullion, spandrel, slab or masonry wall) so the
 // caller can keep panes smooth and roughen everything that is not glass.
@@ -1111,7 +1215,7 @@ vec4 vhFacadeCells(int prof, vec2 uvw, vec2 cellSz, vec2 off, float seed,
   vec2 aa = max(aaWorld / sz, vec2(1e-5));
   vec2 cell = floor(g);
   vec2 f = g - cell;
-  vec2 e = min(aa, vec2(0.35));
+  vec2 e = min(aa, vec2(VH_WIN_AA_MAX));
 
   float r = vhHash21(cell + vec2(seed * 91.7, seed * 47.3));          // per cell
   float rf = vhHash21(vec2(cell.y * 0.5 + 3.0, seed * 137.3));        // per floor
@@ -1256,6 +1360,42 @@ void vhFacadeStyle(int prof, float seed, float baseLit,
   lit = clamp(lit, 0.0, 1.0);
 }
 
+// Where the lattice folds, in CELLS PER PIXEL, and how many times it may.
+//
+// A cell is one pane plus one mullion — one period of the signal — so Nyquist puts the hard floor
+// at 1.0 cells per pixel and any real reconstruction filter wants to be well under it. 0.50 holds
+// every cell at two pixels or more. It was 0.62 (1.6 px), which is inside the range where the
+// per-cell lit/unlit draw is still a random field at the sampling rate, and the crossfade spends
+// half its weight on a level finer than that again.
+//
+// Nothing the player stands next to can be touched by this: the first fold happens where a cell
+// first falls under two pixels, which for an office lattice with 2.6-3.6 m bays at 1440x900 is
+// 1.0-1.4 km (it was 1.3-1.7 km at 0.62). Street level, and the whole of the detail-tile radius,
+// is below lod 0 and runs the unfolded lattice exactly as before.
+//
+// MEASURED — the temporal CRAWL of a skyline region, i.e. the RMS change over a half-pixel camera
+// yaw, reported against the same measurement on a 2x supersampled pair, which is the floor a 1x
+// image can reach. Night, where the lattice is the only signal in the frame:
+//
+//                                    postcard, 2.2 km          far corner, 5.5 km
+//     fold 0.62, filter 0.35        0.1088 / 0.0786  1.38     0.0387 / 0.0253  1.53
+//     fold 0.50, filter 0.35        0.1040 / 0.0792  1.31     0.0392 / 0.0253  1.55
+//     fold 0.50, filter 0.50        0.0994 / 0.0784  1.27     0.0360 / 0.0240  1.50
+//
+// And the far corner's residual is NOT the lattice. With the window light switched off entirely
+// the same region measures 0.0116 / 0.0068 — a ratio of 1.71, worse than the lattice's — because
+// what crawls at 5.5 km is the SILHOUETTE, one-pixel roof and wall edges, which is FXAA's problem
+// and not the LOD's: with FXAA off the full-lattice figure is 0.0651 / 0.0375. The frequency LOD
+// holds at six kilometres; it is the thing keeping that number as low as it is.
+const float VH_WIN_FOLD = 0.50;
+
+// How many times the lattice may fold. 4 is 16x cells — a 48 m office bay — which is reached at
+// a facade footprint of 24 m per pixel, i.e. only on walls seen within a couple of degrees of
+// edge-on. Past that the cell stops tracking and the pane filter carries it; letting it keep
+// doubling instead would put one lit-or-unlit cell across a whole tower, which is worse than the
+// aliasing it would be fixing.
+const float VH_WIN_LOD_MAX = 4.0;
+
 vec3 vhFacade(int prof, vec3 world, vec3 N, vec2 uvw, vec2 aaWorld, float baseLit,
               float time, float hAbove, out float glass) {
   float d = dot(world, N);
@@ -1280,7 +1420,7 @@ vec3 vhFacade(int prof, vec3 world, vec3 N, vec2 uvw, vec2 aaWorld, float baseLi
   // gets it, which matters most for the residential lattice: its cells are the largest, so it
   // is the last to fold, and a condo tower keeps its sparse scattered look furthest out.
   float perPixel = max(aaWorld.x / cellSz.x, aaWorld.y / cellSz.y);
-  float lod = clamp(log2(max(perPixel, 1e-5) / 0.62), 0.0, 4.0);
+  float lod = clamp(log2(max(perPixel, 1e-5) / VH_WIN_FOLD), 0.0, VH_WIN_LOD_MAX);
   float l0 = floor(lod);
   float t = lod - l0;
   float m0 = exp2(l0);
@@ -1377,7 +1517,8 @@ uniform vec3 uStreetColor;   // sodium/LED wash on the lowest few metres of ever
 uniform vec3 uFogColor;
 uniform vec3 uTint;
 uniform vec4 uFogParams;
-uniform vec4 uFogRange;   // x = deep-air start (m), y = 1/span, zw = cap-opening window
+uniform vec4 uFogRange;   // x = horizon-closer start (m), y = 1/span, zw = cap-opening window
+uniform float uFogBeta;   // aerial perspective: extinction per metre, ALREADY x daylight
 uniform vec4 uCnTower;       // xy = world XZ of the tower axis, z = base Y, w = mask radius (m)
 uniform float uSkyBounce;    // gain on the directional sky irradiance
 uniform float uNightFactor;
@@ -1679,13 +1820,13 @@ void main() {
   // Per-FRAGMENT view distance. This must not be a varying: the terrain is a handful of large
   // triangles and interpolating distance across them fogs the middle of a plane by the average
   // of its corner distances instead of by what the camera can actually see.
-  float fogAmt = vhFogAmount(uCameraPos, vWorld, uFogParams, uFogRange);
+  float fogAmt = vhFogAmount(uCameraPos, vWorld, uFogParams, uFogRange, uFogBeta);
   vec3 viewDir = viewDist > 1e-4 ? -V : vec3(0.0, 0.0, 1.0);
   // vhAerial carries the daylight in-scatter and the de-blueing of the haze; the density that
   // decides HOW MUCH of it lands is thinned on the JS side (DAY_FOG_DENSITY). Both are gated, so
   // blue hour keeps its indigo aerial perspective exactly.
   vec3 aerial = vhAerial(uFogColor, viewDir, uSkyZenith, uSkyHorizon, uSkyWest, uSunDir,
-    uKeyColor, uDaylight);
+    uKeyColor, uDaylight, vhAerialWeld(viewDist, uFogRange));
   col = mix(col, aerial, fogAmt);
 
   float flash = clamp(uFlash, 0.0, 4.0);
@@ -1900,7 +2041,8 @@ uniform vec3 uAmbientSky;
 uniform vec3 uAmbientGround;
 uniform vec3 uFogColor;
 uniform vec4 uFogParams;
-uniform vec4 uFogRange;   // x = deep-air start (m), y = 1/span, zw = cap-opening window
+uniform vec4 uFogRange;   // x = horizon-closer start (m), y = 1/span, zw = cap-opening window
+uniform float uFogBeta;   // aerial perspective: extinction per metre, ALREADY x daylight
 uniform float uDaylight;
 uniform float uExposure;
 uniform float uTime;
@@ -1980,10 +2122,10 @@ void main() {
 
   vec3 col = body * (vec3(1.0) - fres) + env * fres + spec;
 
-  float fogAmt = vhFogAmount(uCameraPos, vWorld, uFogParams, uFogRange);
+  float fogAmt = vhFogAmount(uCameraPos, vWorld, uFogParams, uFogRange, uFogBeta);
   vec3 viewDir = viewDist > 1e-4 ? -V : vec3(0.0, 0.0, 1.0);
   vec3 aerial = vhAerial(uFogColor, viewDir, uSkyZenith, uSkyHorizon, uSkyWest, uSunDir,
-    uKeyColor, uDaylight);
+    uKeyColor, uDaylight, vhAerialWeld(viewDist, uFogRange));
   col = mix(col, aerial, fogAmt);
   col = max(col, vec3(0.0));
 
@@ -2050,7 +2192,8 @@ in vec3 vWorld;
 uniform vec3 uCameraPos;
 uniform vec3 uShadowColor;
 uniform vec4 uFogParams;
-uniform vec4 uFogRange;   // x = deep-air start (m), y = 1/span, zw = cap-opening window
+uniform vec4 uFogRange;   // x = horizon-closer start (m), y = 1/span, zw = cap-opening window
+uniform float uFogBeta;   // aerial perspective: extinction per metre, ALREADY x daylight
 uniform float uAlpha;
 
 layout(location = 0) out vec4 outColor;
@@ -2059,7 +2202,7 @@ ${GLSL_COMMON}
 void main() {
   // A shaped roll-off: flat-topped up close, then falling off steeply so nothing survives out at
   // the fog line and the horizon does not turn into a grey smear of leftover shadow ink.
-  float f = vhFogAmount(uCameraPos, vWorld, uFogParams, uFogRange);
+  float f = vhFogAmount(uCameraPos, vWorld, uFogParams, uFogRange, uFogBeta);
   float fade = clamp(1.0 - f * 1.35, 0.0, 1.0);
   float s = clamp(uAlpha, 0.0, 1.0) * fade;
   outColor = vec4(mix(vec3(1.0), uShadowColor, s), 1.0);
@@ -2561,6 +2704,48 @@ vec3 vhScene(vec2 uv) {
   return uDecode > 0.5 ? vhDecode(c) : max(c, vec3(0.0));
 }
 
+// TRANSVERSE CHROMATIC ABERRATION, integrated rather than point-sampled.
+//
+// A lens does not TRANSLATE the red image by the aberration figure, it SMEARS it over that
+// length: red focuses long, so a point source lands as a short radial streak, not as a displaced
+// point. Fetching one sample at the far end of that streak is a cheap stand-in and it was a fine
+// one on a 3 km map, where the corners of the frame held near geometry and the offset landed
+// inside the same roof it started on.
+//
+// On a 6.8 x 6.5 km map they do not. At the extreme corner the offset is 2.7 px of red-to-blue
+// separation, and the corner of the frame is now full of city 3-6 km away whose roofs, kerbs and
+// lane dashes are ONE pixel across — so the displaced fetch lands on an unrelated pixel and the
+// three channels stop describing the same object.
+//
+// MEASURED, from the north-east corner of the extract at Afternoon, over the bottom-left quarter
+// of the frame — the fraction of pixels carrying strong chroma that their own neighbours do not,
+// which is what "isolated magenta dot" means as a number:
+//
+//     aberration off  0.059%       point-sampled  0.592%       integrated  0.355%
+//     mean chroma     0.0539                      0.0721                   0.0629
+//
+// Four taps from 0 to the offset, averaged, is the integral the point sample was approximating.
+// The REACH is unchanged — the far tap is exactly where the old single sample was — so the
+// aberration still runs out to the same radius; what changes is that it arrives as a gradient
+// instead of a jump, and a one-pixel feature contributes a quarter of its own colour to each
+// step instead of all of it to one. That is 44% of the excess speckle and 51% of the excess
+// chroma gone. The rest is what a 1.4 px smear of a 1 px feature honestly looks like, and the
+// knob for it is renderer.post.chroma, which this change does not touch.
+//
+// Seven fetches against three, in one full-screen pass at 1440x900: 13.8 ms per frame against
+// 14.2 for the three-tap version, i.e. inside the frame-to-frame spread.
+vec3 vhSceneCA(vec2 uv, vec2 off) {
+  vec3 c0 = vhScene(uv);
+  float r = c0.r;
+  float b = c0.b;
+  for (int i = 1; i <= 3; i++) {
+    vec2 d = off * (float(i) * 0.33333333);
+    r += vhScene(uv + d).r;
+    b += vhScene(uv - d).b;
+  }
+  return vec3(r * 0.25, c0.g, b * 0.25);
+}
+
 void main() {
   vec2 c2 = vUv - 0.5;
   float r2 = dot(c2, c2);
@@ -2568,8 +2753,7 @@ void main() {
   // Chromatic aberration: zero at the optical centre, growing with r^2 toward the corners.
   vec3 scene;
   if (uChroma > 1e-5) {
-    vec2 off = c2 * r2 * uChroma;
-    scene = vec3(vhScene(vUv + off).r, vhScene(vUv).g, vhScene(vUv - off).b);
+    scene = vhSceneCA(vUv, c2 * r2 * uChroma);
   } else {
     scene = vhScene(vUv);
   }
@@ -2712,10 +2896,10 @@ export class Renderer {
 
     this.shadow = {
       distance: 2200,     // metres of camera frustum covered by the cascades
-      // Where the first split lands, as a fraction of the reach, and the bracket it is held in.
-      // Defaults are the CSM_SPLIT_* constants; overriding them here is the one knob that trades
-      // near sharpness against mid-field sharpness without touching the reach.
-      splitFrac: CSM_SPLIT_FRAC,
+      // Where the first split lands, in metres, and the bracket it is held in. Defaults are the
+      // CSM_SPLIT_* constants; overriding them here is the one knob that trades near sharpness
+      // against mid-field sharpness without touching the reach.
+      split0: CSM_SPLIT0,
       splitMin: CSM_SPLIT_MIN,
       splitMax: CSM_SPLIT_MAX,
       strength: 0.74,     // 1 = fully black shadow (before ambient fills it back in)
@@ -2842,15 +3026,38 @@ export class Renderer {
       fogHeight: 55,        // scale height (m): the street grid hazes, the towers rise clear
       fogBase: 4,           // world Y the density is measured at
       fogMax: 0.94,
-      // Deep air (vhFogAmount layer 2). These are metres of SIGHTLINE, not of world, so nothing
-      // here is tied to the bounding box: extend the extract and the same four numbers still say
-      // "the mid-distance is clear, the horizon is shut". main.js's TIME_PRESETS may override
-      // them per preset like any other env field, and writeEnv() carries them through untouched
-      // when a preset does not mention them, which is why all four currently share one air.
-      fogRange: 4200,       // sightline (m) at which deep-air extinction starts to accumulate
-      fogRangeSpan: 4900,   // metres of EXCESS range that add one unit of optical depth
-      fogHorizon: 7000,     // where fogMax starts giving way so the air may close completely
-      fogHorizonEnd: 15000, // and where it has given way entirely — inside the 16 km far plane
+      // AERIAL PERSPECTIVE and the HORIZON CLOSER (vhFogAmount terms 2 and 3). These are metres
+      // of SIGHTLINE, not of world, so nothing here is tied to the bounding box: extend the
+      // extract and the same numbers still say "the mid-distance is clear, the horizon is shut".
+      // main.js's TIME_PRESETS may override them per preset like any other env field, and
+      // writeEnv() carries them through untouched when a preset does not mention them, which is
+      // why all four currently share one air.
+      //
+      // The visual range is the Koschmieder figure — the distance at which a black object falls
+      // to 2% contrast — and 40 km is a clear, dry Toronto summer afternoon. It is the ONE knob
+      // that says how far you can see, and _fogBeta() multiplies it by env.daylight, so it is
+      // identically zero at Blue hour and at Night.
+      fogVisualRange: 40000,
+      // The horizon closer and the window the cap — and with it the horizon weld — opens over.
+      // Both moved in from the 4,200 / 4,900 / 7,000 / 15,000 the pre-expansion build shipped:
+      // the closer starts earlier so there is aerial depth past 4 km at Blue hour and Night,
+      // where the daylight term is identically zero, and the cap window is now wide enough that
+      // the weld arrives as a ten-kilometre gradient instead of an eighteen-scanline band.
+      //
+      // MEASURED cost of moving all four, against the shipped values, grain off, whole frame:
+      //
+      //   street level, every preset          0 pixels differ by more than 2/255
+      //   the lake postcard, Blue hour        mean 0.09/255; 0.96% of pixels over 2, 0.34% over 8
+      //   over the Islands, Blue hour         mean 0.35/255; 4.1% over 2, 2.4% over 8, 0% over 32
+      //   the north-west corner, Blue hour    mean 0.14/255; 1.8% over 2, 0.93% over 8
+      //
+      // The handful of pixels that move a long way — 0.08% of the postcard at worst — are
+      // single-pixel lit windows four to six kilometres out crossing the bloom threshold, which
+      // is a sampling event, not a drift in the preset.
+      fogRange: 3000,       // sightline (m) at which the horizon closer starts to accumulate
+      fogRangeSpan: 5200,   // metres of EXCESS range that add one unit of optical depth
+      fogHorizon: 3000,     // where fogMax starts giving way so the air may close completely
+      fogHorizonEnd: 13000, // and where it has given way entirely — inside the far plane
       nightFactor: 0.86,
       // Base lit fraction. Each lighting profile scales it (offices up, condos and civic well
       // down — see vhFacadeStyle), so this is a master dial rather than a literal percentage.
@@ -3660,7 +3867,7 @@ export class Renderer {
     const n = s.count;
     const size = s.size;
     const near = Math.max(Number.isFinite(cam.near) ? cam.near : 1.0, 1.0);
-    const camFar = Number.isFinite(cam.far) ? cam.far : 16000;
+    const camFar = Number.isFinite(cam.far) ? cam.far : 18600;
     // The 'low' preset has ONE 1024 tile to cover the whole range, so it covers less range or its
     // texels turn to mush: at 20% of a 2,200 m reach they are ~1.0 m, the same figure the single
     // cascade landed on before the reach grew, which is still a readable building shadow on a
@@ -3672,12 +3879,13 @@ export class Renderer {
     const far = Math.max(near + 20, Math.min(reach, camFar));
     const extrude = numOr(cfg.extrude, 10, 4000, 900);
     const blend = numOr(cfg.blend, 0.02, 0.5, 0.16);
-    // Street-anchored geometric splits — see the CSM_SPLIT_* block. `split0` is held below 90% of
-    // the reach as well as inside its own bracket, so a pathological `distance` can never order
-    // the first split past the last one and hand m4ortho an inverted box.
+    // Street-anchored geometric splits — see the CSM_SPLIT_* block. The anchor is an absolute
+    // distance, held below 90% of the reach as well as inside its own bracket, so a pathological
+    // `distance` can never order the first split past the last one and hand m4ortho an inverted
+    // box.
     const split0 = Math.min(
       far * 0.9,
-      clamp(far * numOr(cfg.splitFrac, 0.005, 0.9, CSM_SPLIT_FRAC),
+      clamp(numOr(cfg.split0, 5, 4000, CSM_SPLIT0),
         numOr(cfg.splitMin, 5, 4000, CSM_SPLIT_MIN),
         numOr(cfg.splitMax, 5, 4000, CSM_SPLIT_MAX))
     );
@@ -3990,22 +4198,30 @@ export class Renderer {
     return _fog;
   }
 
-  // The deep-air half of the fog — see vhFogAmount in GLSL_COMMON. Deliberately NOT scaled by
-  // daylight: the four presets are the same air at four hours of the same day, and the visual
-  // range of that air does not move 5x between 15:20 and 23:30. What moves is the haze deck (the
-  // preset's own density) and the colour it is tinted (fogColor + vhAerial), both of which are
-  // already per-preset. Keeping this term common is also what makes "blue hour has not drifted"
-  // provable rather than argued: at blue hour every sightline it touches is already past 90%
-  // opaque from the deck alone, so it changes nothing measurable there.
+  // The horizon closer — vhFogAmount term 3. Deliberately NOT scaled by daylight: a horizon has
+  // to shut at night as well, and CONTRACT §9.4 asks for no viewpoint from which the world
+  // visibly ends. It is exactly zero inside `fogRange`, so nothing inside the mapped city can be
+  // moved by it at any preset.
   _fogRangeParams() {
     const e = this.env;
-    const r0 = numOr(e.fogRange, 0, 200000, 4200);
-    const span = Math.max(1, numOr(e.fogRangeSpan, 1, 200000, 4900));
+    const r0 = numOr(e.fogRange, 0, 200000, 3000);
+    const span = Math.max(1, numOr(e.fogRangeSpan, 1, 200000, 5200));
     _fogRange[0] = r0;
     _fogRange[1] = 1 / span;
-    _fogRange[2] = numOr(e.fogHorizon, 0, 200000, 7000);
-    _fogRange[3] = Math.max(_fogRange[2] + 1, numOr(e.fogHorizonEnd, 0, 200000, 15000));
+    _fogRange[2] = numOr(e.fogHorizon, 0, 200000, 3000);
+    _fogRange[3] = Math.max(_fogRange[2] + 1, numOr(e.fogHorizonEnd, 0, 200000, 13000));
     return _fogRange;
+  }
+
+  // AERIAL PERSPECTIVE — vhFogAmount term 2, extinction per metre of sightline. Koschmieder:
+  // a visual range V means a black target falls to 2% contrast at V, i.e. exp(-beta V) = 0.02,
+  // so beta = 3.912 / V. Multiplied by env.daylight here and nowhere else, which is what makes
+  // the term identically zero at Blue hour and at Night — airlight is scattered SUNLIGHT, and
+  // after sunset there is none of it to scatter. Distant lit windows therefore stay sharp at
+  // night, which is both correct and the reason those two presets cannot drift.
+  _fogBeta() {
+    const V = numOr(this.env.fogVisualRange, 200, 1e7, 40000);
+    return (3.912 / V) * this._daylight();
   }
 
   // Cascade uniforms, shared by the scene and water programs.
@@ -4048,6 +4264,7 @@ export class Renderer {
     s.set('uFogColor', e.fogColor);
     s.set('uFogParams', this._fogParams());
     s.set('uFogRange', this._fogRangeParams());
+    s.set('uFogBeta', this._fogBeta());
     s.set('uCnTower', this._cnTowerParams());
     s.set('uSkyBounce', numOr(e.skyBounce, 0, 6, 1.85));
     s.set('uNightFactor', numOr(e.nightFactor, 0, 1, 0.86));
@@ -4106,6 +4323,7 @@ export class Renderer {
     s.set('uFogColor', e.fogColor);
     s.set('uFogParams', this._fogParams());
     s.set('uFogRange', this._fogRangeParams());
+    s.set('uFogBeta', this._fogBeta());
     s.set('uDaylight', this._daylight());
     s.set('uExposure', this._dayExposure());
     s.set('uTime', numOr(e.time, -1e7, 1e7, 0));
@@ -4124,6 +4342,7 @@ export class Renderer {
     s.set('uShadowColor', e.shadowColor);
     s.set('uFogParams', this._fogParams());
     s.set('uFogRange', this._fogRangeParams());
+    s.set('uFogBeta', this._fogBeta());
   }
 
   /* ------------------------------------------------------------- frame API */

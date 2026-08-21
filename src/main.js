@@ -1149,6 +1149,21 @@ async function boot() {
   });
   unproject = makeUnprojector(G.city.meta && G.city.meta.origin);
 
+  // The CN Tower's lighting rig is masked to a 34 m cylinder around the tower's axis, and
+  // render.js can only carry a literal for that. Point it at the tower this dataset actually
+  // holds. TIME_DEFAULTS is snapshotted before the city loads, so it has to be corrected too or
+  // the next preset change writes the stale position straight back.
+  {
+    const cn = G.city.cnTower;
+    const env = G.renderer.env;
+    if (cn && cn.length >= 4 && env && env.cnTower) {
+      for (let i = 0; i < 4; i++) env.cnTower[i] = cn[i];
+      if (TIME_DEFAULTS && TIME_DEFAULTS.cnTower) {
+        for (let i = 0; i < 4; i++) TIME_DEFAULTS.cnTower[i] = cn[i];
+      }
+    }
+  }
+
   goToViewpoint(0);
   updateCamera(0.016);
   sizeCanvases();

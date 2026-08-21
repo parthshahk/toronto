@@ -186,6 +186,8 @@ const M = {
   // --- aeronautical and navigation emitters (emissive >= 0.50) ------------
   // Amendment 7: these are the only new light sources in the south half. A runway edge light, a
   // threshold bar and a lighthouse lantern are all genuine lamps; the renderer decides when.
+  signYellow: [0.360, 0.268, 0.036, 0, 0, 0.72, 0],    // taxiway location sign face
+  signRed: [0.300, 0.036, 0.030, 0, 0, 0.72, 0],       // runway holding position sign face
   runwayEdge: [1.000, 0.958, 0.880, 0.95, 0, 0.34, 0],
   runwayGreen: [0.120, 1.000, 0.340, 0.92, 0, 0.34, 0], // threshold
   runwayRed: [1.000, 0.120, 0.088, 0.92, 0, 0.34, 0],   // runway end
@@ -3910,4 +3912,116 @@ export function appendSlipway(mb, x, y, z, yaw, w, len, drop) {
     setL(6, 0, 0.22, sz + 0.14); setL(7, L, 0.22 - dr, sz + 0.14);
     hullL(mb, px, py, pz, c, s, F_NOBOT);
   }
+}
+
+/**
+ * Mobile boarding stairs on the apron. Origin is the pavement at the chassis centre; the flight
+ * climbs toward local +X and the top platform is at cabin-door height.
+ */
+export function appendAirstairs(mb, x, y, z, yaw) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const top = 2.55, run = 3.30;
+
+  // Chassis and wheels.
+  setMat(mb, M.alum);
+  boxL(mb, px, py, pz, c, s, -1.90, 0.40, -0.85, 1.55, 0.62, 0.85, F_NOBOT);
+  setMat(mb, M.tyre);
+  for (let i = 0; i < 4; i++) {
+    const lx = (i & 1) ? 1.20 : -1.55, lz = (i & 2) ? 0.80 : -0.80;
+    discX(mb, px, py, pz, c, s, lz > 0 ? 0.86 : -0.86, 0.34, lx, 0.34, 6, lz > 0);
+  }
+  // The flight: eight treads climbing to the platform.
+  setMat(mb, M.galvPale);
+  for (let i = 0; i < 8; i++) {
+    const f0 = i / 8, f1 = (i + 1) / 8;
+    const x0 = -1.70 + run * f0, y0 = 0.62 + (top - 0.62) * f0;
+    const y1 = 0.62 + (top - 0.62) * f1;
+    boxL(mb, px, py, pz, c, s, x0, y1 - 0.05, -0.62, -1.70 + run * f1, y1, 0.62, F_NOBOT);
+    boxL(mb, px, py, pz, c, s, x0, y0, -0.62, x0 + 0.05, y1 - 0.05, 0.62, F_PLATEX);
+  }
+  // Platform and its rails.
+  boxL(mb, px, py, pz, c, s, 1.60, top - 0.06, -0.68, 2.55, top, 0.68, F_NOBOT);
+  setMat(mb, M.galv);
+  for (let k = 0; k < 2; k++) {
+    const sz = (k === 0 ? -1 : 1) * 0.66;
+    for (let i = 0; i < 2; i++) {
+      const yy = top + 0.52 + i * 0.42;
+      beamL(mb, px, py, pz, c, s, -1.66, yy - (top - 0.62) * 0.52, sz, 2.52, yy, sz,
+        0.028, 0.028, F_ALL);
+    }
+    for (let i = 0; i < 4; i++) {
+      const lx = -1.5 + i * 1.35;
+      const base = 0.62 + (top - 0.62) * clamp((lx + 1.70) / run, 0, 1);
+      boxL(mb, px, py, pz, c, s, lx - 0.028, base, sz - 0.028, lx + 0.028, base + 0.96,
+        sz + 0.028, F_SIDES);
+    }
+  }
+  // Bumper pads where it meets the fuselage.
+  setMat(mb, M.tyre);
+  boxL(mb, px, py, pz, c, s, 2.55, top - 0.10, -0.62, 2.68, top + 0.34, 0.62, F_NOBOT);
+}
+
+/**
+ * A baggage tug with `n` carts behind it, drawn up on the apron. The train runs along local -Z
+ * from the tug at the origin.
+ */
+export function appendGSECart(mb, rng, x, y, z, yaw, n) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const cnt = clamp(fin(n, 2) | 0, 0, 4);
+
+  setMat(mb, M.taxiOrange);
+  boxL(mb, px, py, pz, c, s, -0.72, 0.34, -1.30, 0.72, 1.02, 0.95, F_NOBOT);
+  setMat(mb, M.cabinGlass);
+  quadPZ(mb, px, py, pz, c, s, 0.955, -0.60, 1.06, 0.60, 1.62);
+  setMat(mb, M.taxiOrange);
+  boxL(mb, px, py, pz, c, s, -0.62, 1.02, -0.10, 0.62, 1.72, 0.94, F_SIDES | F_PY);
+  setMat(mb, M.tyre);
+  for (let i = 0; i < 4; i++) {
+    const lz = (i & 1) ? 0.62 : -0.92, sg = (i & 2) ? 1 : -1;
+    discX(mb, px, py, pz, c, s, sg * 0.74, 0.32, lz, 0.32, 6, sg > 0);
+  }
+  for (let k = 0; k < cnt; k++) {
+    const oz = -2.30 - k * 3.05;
+    setMat(mb, M.galvPale);
+    boxL(mb, px, py, pz, c, s, -0.82, 0.44, oz - 1.20, 0.82, 0.60, oz + 1.20, F_NOBOT);
+    setMat(mb, M.canvas);
+    boxL(mb, px, py, pz, c, s, -0.80, 0.60, oz - 1.16, 0.80, 1.28 + 0.10 * hash2(px + k, pz),
+      oz + 1.16, F_NOBOT);
+    setMat(mb, M.tyre);
+    for (let i = 0; i < 4; i++) {
+      const lz = oz + ((i & 1) ? 0.92 : -0.92), sg = (i & 2) ? 1 : -1;
+      discX(mb, px, py, pz, c, s, sg * 0.84, 0.26, lz, 0.26, 5, sg > 0);
+    }
+    setMat(mb, M.galv);
+    beamL(mb, px, py, pz, c, s, 0, 0.42, oz + 1.20, 0, 0.42, oz + 1.85, 0.04, 0.04, F_ALL);
+  }
+  if (typeof rng === 'function') rnd(rng);
+}
+
+/**
+ * A frangible airfield sign beside a taxiway: a low panel on two breakaway legs, yellow with a
+ * black border for a location sign, red for a runway holding position. Faces along local +/-X.
+ * Not emissive — the real ones are internally lit, but a lit sign is the renderer's call and
+ * Amendment 7 says detail marks WHAT emits, never WHEN, and this one is too small to matter.
+ */
+export function appendAirfieldSign(mb, x, y, z, yaw, mandatory) {
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const w = mandatory ? 1.35 : 1.05;
+
+  setMat(mb, M.galv);
+  for (let k = 0; k < 2; k++) {
+    const lz = (k === 0 ? -1 : 1) * (w - 0.14);
+    boxL(mb, px, py, pz, c, s, -0.05, 0.0, lz - 0.05, 0.05, 0.42, lz + 0.05, F_SIDES);
+  }
+  setMat(mb, M.dark);
+  boxL(mb, px, py, pz, c, s, -0.07, 0.40, -w, 0.07, 1.06, w, F_NOBOT);
+  setMat(mb, mandatory ? M.signRed : M.signYellow);
+  quadPX(mb, px, py, pz, c, s, 0.075, 0.47, -w + 0.07, 0.99, w - 0.07);
+  quadNX(mb, px, py, pz, c, s, -0.075, 0.47, -w + 0.07, 0.99, w - 0.07);
 }

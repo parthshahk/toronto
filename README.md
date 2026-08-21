@@ -16,33 +16,59 @@ Not an impression of Toronto — built from surveyed open data, and checked agai
 
 | Landmark | Actual | Here |
 |---|---:|---:|
-| Commerce Court West | 239 m | 240 m |
+| CN Tower (with mast) | 553 m | 559 m |
+| Commerce Court West | 239 m | 239 m |
 | Scotia Plaza | 275 m | 277 m |
-| First Canadian Place | 290 m | 287 m |
-| TD Bank Tower | 223 m | 226 m |
+| First Canadian Place | 298 m | 287 m |
+| TD Bank Tower | 223 m | 218 m |
+| Royal Bank Plaza, south | 180 m | 175 m |
 | Rogers Centre | 86 m | 88 m |
 
 The street grid matters as much as the towers. Toronto's core is rotated about 17° west of true
-north, and that rotation is what makes it *feel* like Toronto: **Bay 162.5°, Yonge 162.8°,
-University 160.6°**, with **King 73.8°** and **Queen 73.9°** perpendicular to within 1.3°.
+north, and that rotation is what makes it *feel* like Toronto: **Bay 162.5°, Yonge 162.7°,
+University 160.5°**, with **King 74.1°** and **Queen 74.1°** square to them within 1.6°.
+Length-weighted over every segment of each street in the extract.
 
-**4,654 buildings** with real footprints and heights · **7,926 streets** with real names and widths ·
-real terrain, from the lakeshore climbing 30 m up to Queen · **730 surveyed facade colours**.
+**18,312 buildings** with real footprints and heights · **20,403 streets** with real names and
+widths · real terrain, from the lakeshore climbing 40 m to the north · **1,514 surveyed facade
+colours**.
 
 ## What's in it
 
-Roughly **7 million vertices in 18 draw calls**, covering Spadina to Yonge/Jarvis and Queen St W
-down to the water — 3.1 × 2.2 km.
+**43 km²** — 6.77 × 6.46 km, from Dufferin east to the Don, Dupont south across the harbour to take
+in the whole Toronto Islands chain and Billy Bishop airport.
 
-- **51.6 km of streetcar track** with catenary poles and overhead wire, embedded flush in the asphalt
-- **53.5 km of walkways**, 46,809 road markings, 1,471 crosswalks, 246 km of kerb
-- **~3,500 pedestrians**, 1,612 parked cars, 2,062 street lamps, 982 street trees
-- **4,082 building entrances**, 918 shopfronts, 9,717 balcony bands
-- Rooftop plant, tower-crown signage, construction cranes, the rail corridor, the harbourfront quays
+- **108 km of streetcar track** with 2,414 catenary poles and 117 km of overhead wire, embedded
+  flush in the asphalt
+- **176 km of walkways**, 122,868 road markings, 4,163 crosswalks, 641 km of kerb, 4,203 kerb ramps
+- **10,636 pedestrians**, 3,163 parked cars, 2,728 cobra lamps, 1,995 street trees
+- **15,960 modelled ground floors**, 4,308 shopfronts, 22,501 balcony bands
+- **The Toronto Islands** — 3.44 km² of land across 16 islands, the lagoons and marinas, 10 km of
+  beach, Centreville, and all 8 ferry docks
+- **Billy Bishop** — 2 runways, 35 taxiways, 3 aprons, 13 stands, 243,000 m² of pavement
+- The rail corridor, the harbourfront quay walls, rooftop plant, the Don channel retaining walls
 
-Roads that pass under the rail corridor genuinely duck beneath it. The walkable network is
-**99.6% connected across 373 km**, with zero cliffs and zero holes — you can set off in any
-direction and keep going.
+Roads that pass under the rail corridor genuinely duck beneath it: 77 depressed corridors, 364 ways
+carried over, 131 building passages, 7,462 crossings resolved. `groundY` is finite everywhere —
+**zero holes** — and the walkable network runs to 1,210 km.
+
+## How it runs
+
+43 km² is 26 million vertices. Nothing that size fits in one buffer, so the city is cut into
+**156 tiles of 625 m** and built on demand, cheapest first: stage 0 is massing — the silhouette,
+the ground, the carriageways — out to 5 km, and stage 1 is everything you can only resolve from
+the pavement — markings, kerbs, shopfronts, balconies, furniture, people — out to 780 m. Builds
+run as generators against a 3.5 ms-per-frame budget, so a dense downtown tile costs twenty partial
+frames instead of one long stall, and geometry is evicted least-recently-wanted against an 11 M
+vertex ceiling.
+
+**Level of detail is for distance only.** The block you are standing on is built exactly as it was
+before tiling existed — same facade colours, same window grids, same street furniture. What LOD
+takes away is a kilometre out, where a balcony band is under two pixels.
+
+Every procedural choice is seeded on **world position**, never on array index, so a building looks
+identical whether or not its neighbours happen to be loaded. That is what makes a tile that builds
+alone byte-identical to the same tile built last — and it is what the full city will need.
 
 ## Light
 
@@ -95,7 +121,12 @@ Needs WebGL2 — Chrome, Edge, Firefox or Safari 15+, hardware acceleration on.
 ```bash
 python3 tools/build_city.py    # clip + reproject the massing shapefile, read OSM
 python3 tools/match_osm.py     # attach typology, materials and facade colours
+python3 tools/pack_city.py     # pack the binary sidecar the loader actually reads
 ```
+
+Or `npm run build:city`, which runs all three in order. `data/toronto.json` is the authoring
+format; `data/toronto.bin` is the packed sidecar — both ship, and the loader falls back to the
+JSON with a console warning if the sidecar is missing or stale.
 
 The pipeline has no Python dependencies — the ESRI shapefile and dBASE parsers are written from
 scratch. `tools/build_city.py` expects the source data in `data/raw/` (gitignored, ~400 MB); the

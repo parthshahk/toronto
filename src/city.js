@@ -55,6 +55,10 @@ import {
 import {
   buildHarbour, carveHarbourTerrain, harbourTileHasWater, harbourWaterAt, appendHarbour,
   harbourStats,
+  // THE ISLANDS AND THE AIRPORT. Everything south of the harbour lives in harbour.js too; the
+  // section below only indexes it into tiles and hands it the placement context.
+  islandBounds, appendIslandMass, appendIslandDetail, islandStats, harbourCarFree,
+  islandBuildingHeight,
 } from './harbour.js';
 // SPATIAL TILING. The city is no longer one merged mesh per material class: it is one merged mesh
 // per material class PER TILE, built on demand and thrown away when it goes out of range. See
@@ -1419,6 +1423,12 @@ function terrainNormals(T) {
 function emitTerrainRange(mb, T, grade, i0, i1, j0, j1) {
   const { nx, nz, cell, x0, z0, h } = T;
   const nrm = terrainNormals(T);
+  // ISLANDS: the Toronto Islands are parkland from shore to shore, and only about half of that
+  // is mapped as a park or grass polygon. The rest would draw as the mainland's bare-terrain
+  // grey, which on an island reads as dirt. harbour.js marks the cells (T.isleLand); the ground
+  // itself carries the park albedo there and every mapped polygon still draws over it.
+  const isleLand = T.isleLand || null;
+  let isleMat = -1;
   setMat(mb, M.terrain);
   const px = (i) => x0 + i * cell;
   const pz = (j) => z0 + j * cell;
@@ -1426,6 +1436,10 @@ function emitTerrainRange(mb, T, grade, i0, i1, j0, j1) {
   const ia = Math.max(0, i0), ib = Math.min(nx - 1, i1);
   for (let j = ja; j < jb; j++) {
     for (let i = ia; i < ib; i++) {
+      if (isleLand) {
+        const want = isleLand[j * nx + i] ? 1 : 0;
+        if (want !== isleMat) { isleMat = want; setMat(mb, want ? M.park : M.terrain); }
+      }
       const i00 = (j * nx + i) * 3, i10 = (j * nx + i + 1) * 3;
       const i01 = ((j + 1) * nx + i) * 3, i11 = ((j + 1) * nx + i + 1) * 3;
       const x = px(i), x1 = px(i + 1), z = pz(j), z1 = pz(j + 1);
@@ -5351,6 +5365,9 @@ function placeKerbCars(C, rec) {
       const m = recSample(rec, s);
       const x = m.x + m.sx * o, z = m.z + m.sz * o;
       if (inFootprint(C, x, z, 0.4)) continue;
+      // ISLANDS: private cars are banned on the Toronto Islands, and a kerbside row of them on
+      // Lakeshore Avenue would be the single most obviously wrong thing down there.
+      if (harbourCarFree(C.harbour, x, z)) continue;
       if (!deckFits(C, x, z, surfaceY(C, rec, m, o), PROP_H.parkedCar)) continue;
       if (!C.occ.claim(x, z, 2.6)) continue;
       // Cars face the direction of travel of the lane they sit in. props.js: the car's length
@@ -5367,6 +5384,10 @@ function placeKerbCars(C, rec) {
 
 // Surface lots: rows of stalls aligned to the lot's own longest edge.
 function placeLotCars(C, part, cap) {
+  // ISLANDS: the island car parks are for the park's own service vehicles, and filling them with
+  // commuter cars on a chain of islands you can only reach by ferry is a story hole.
+  if (harbourCarFree(C.harbour, part.bbox ? (part.bbox[0] + part.bbox[2]) * 0.5 : 0,
+    part.bbox ? -(part.bbox[1] + part.bbox[3]) * 0.5 : 0)) return 0;
   const co = part.outer;
   let au = 0, av = 0, bestLen = 0;
   for (let i = 0, j = co.length - 2; i < co.length; j = i, i += 2) {
@@ -6204,6 +6225,33 @@ function placeRailCars(C, raw, lift, profile) {
 // One merged mesh per material class per tile. `water` is deliberately absent: the lake is a
 // single 30 k-vertex sheet that is visible from almost everywhere, has its own shader pass, and
 // would gain nothing from being cut up.
+/* ====================================================== islands and airport == */
+//
+// The south half of the map — the Toronto Islands, the Western and Eastern Gaps and Billy Bishop
+// — is built by harbour.js, which owns the surveyed shoreline and everything on the water. This
+// section is the whole of city.js's side of it: a tile flag, a draw box, and the placement
+// context the island passes need (the occupancy grid, the footprint index, the ground field).
+//
+// Nothing about the islands is special-cased anywhere else in this file. The two other island
+// touch points are marked ISLANDS in place: the cottage height fix in the building prep, and the
+// car-free guard in the two parked-car passes.
+
+// Absolute plan area of a footprint ring, for the island cottage height fix.
+function ringPlanArea(r) {
+  if (!Array.isArray(r) || r.length < 3) return 0;
+  let a = 0;
+  for (let i = 0, j = r.length - 1; i < r.length; j = i++) {
+    if (!isNum(r[i][0]) || !isNum(r[j][0])) continue;
+    a += r[j][0] * r[i][1] - r[i][0] * r[j][1];
+  }
+  return Math.abs(a * 0.5);
+}
+
+// Headroom above the ground a tile of islands has to draw: the lighthouse lantern is the tallest
+// thing down there at 21 m, an approach mast stands over the water, and a canopy tree tops 14 m.
+const ISLE_TILE_UP = 34.0;
+const ISLE_TILE_DOWN = 18.0;
+
 const MESH_CLASSES = ['terrain', 'buildings', 'glass', 'roads', 'sidewalks', 'rails', 'props'];
 
 // Level-of-detail stages, cheapest first. Stage 0 is what a tower contributes to a two-kilometre
@@ -6226,12 +6274,18 @@ const MASS_DROP = 6200;
 const DETAIL_RANGE = 780;
 const DETAIL_DROP = 980;
 
-// Resident-vertex ceiling. 9 M vertices is 468 MB of interleaved vertex data at the contract's
-// 13 floats — measured against the pre-expansion build, which shipped 7.0 M vertices (364 MB) in
-// permanently resident buffers and held 60 fps, so this is 1.29x a configuration that was known
-// good, and it leaves the shadow atlas (3 x 2048^2 depth = 50 MB) and the post chain (~60 MB at
-// 1440x900) comfortable room inside a 1 GB working set.
-const VERTEX_CAP = 9000000;
+// Resident-vertex ceiling. 11 M vertices is 572 MB of interleaved vertex data at 13 floats —
+// 1.57x the pre-expansion build, which shipped 7.0 M vertices (364 MB) in permanently resident
+// buffers and held 60 fps, for 6x the area. It leaves the shadow atlas (3 x 2048^2 depth = 50 MB)
+// and the post chain (~60 MB at 1440x900) comfortable room inside a 1 GB working set.
+//
+// Sized by measurement, not by taste: the densest want set in the city is the Financial District
+// at street level, where MASS_RANGE holds 131 tiles of massing (~51 k vertices each) and
+// DETAIL_RANGE holds 12 tiles of street detail (~379 k each) for 11.2 M vertices. At the old
+// 9 M this overflowed permanently and the tile manager thrashed — see TileManager._adaptLod.
+// The cap is set above that measured peak on purpose: the adaptive LOD scale is a safety valve
+// for the full city, and a safety valve that is load-bearing in ordinary use is not a valve.
+const VERTEX_CAP = 11000000;
 
 // Milliseconds per frame the tile scheduler may spend generating geometry. At 60 fps the frame
 // is 16.7 ms and the renderer wants most of it; 3.5 ms builds a dense downtown tile over about
@@ -6850,7 +6904,11 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     }
     prepped[i] = {
       key: i + 1,
-      h: isNum(b.h) ? b.h : 0,
+      // ISLANDS: on the island cottages the massing extract's height is the tree canopy over the
+      // roof, not the roof. islandBuildingHeight() caps a small island footprint at a plausible
+      // house; everywhere else it returns b.h untouched. See harbour.js.
+      h: islandBuildingHeight(HARBOUR, n ? cx / n : 0, n ? cz / n : 0, ringPlanArea(r0),
+        isNum(b.h) ? b.h : 0),
       y: isNum(b.y) ? b.y : 0,
       cx: n ? cx / n : 0,
       cz: n ? cz / n : 0,
@@ -7239,6 +7297,7 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   const C = {
     mb, groundY, terrainY, grade: gradeField, bIndex, roadIdx, tramIdx, deckIdx,
     rng: makeRng(SEED), stats, pedSeed: PED_SEED, tilePeople: 0,
+    harbour: HARBOUR,
     occ: makeOccupancy(5.0, gx0, gz0,
       Math.ceil((extent.x + 800) / 5) + 1, Math.ceil((extent.z + 800) / 5) + 1),
     // Sites the people pass draws on, recorded by the passes that built them so nobody is
@@ -7390,7 +7449,7 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     grid.tiles[k].f = {
       i0: 0, i1: 0, j0: 0, j1: 0,
       b: [], recs: [], foot: [], sub: [], pass: [], corr: [], rails: [],
-      areas: [], junc: [], parks: [], plazas: [], cn: false, harbour: null,
+      areas: [], junc: [], parks: [], plazas: [], cn: false, harbour: null, isle: false,
     };
     grid.tiles[k].built = [false, false];
   }
@@ -7552,6 +7611,26 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     const gy = groundY(J.x, J.z);
     grid.cover(t, J.x - J.r - 4, J.z - J.r - 4, J.x + J.r + 4, J.z + J.r + 4, gy - 2, gy + 10);
   }
+
+  // --- ISLANDS AND AIRPORT. Not indexed feature by feature: harbour.js holds its own spatial
+  // model of the island edges, the airfield and the ferry routes, and emits per tile box. Every
+  // tile that touches the island rectangle is flagged and given a box big enough for what the
+  // island passes put in it — geometry can overhang a tile edge by a beach width or a tree.
+  const ISLE_BOX = HARBOUR ? islandBounds(HARBOUR) : null;
+  let isleTiles = 0;
+  if (ISLE_BOX) {
+    for (let k = 0; k < grid.tiles.length; k++) {
+      const t = grid.tiles[k];
+      if (t.cx1 < ISLE_BOX[0] || t.cx0 > ISLE_BOX[2]) continue;
+      if (t.cz1 < ISLE_BOX[1] || t.cz0 > ISLE_BOX[3]) continue;
+      t.f.isle = true;
+      isleTiles++;
+      const gy = Math.max(WATER_Y, groundY(t.mx, t.mz));
+      grid.cover(t, t.cx0 - 46, t.cz0 - 46, t.cx1 + 46, t.cz1 + 46,
+        WATER_Y - ISLE_TILE_DOWN, gy + ISLE_TILE_UP);
+    }
+  }
+  stats.isleTiles = isleTiles;
 
   // --- the global captures, cut up by triangle centroid.
   // The quay wall, the pier decks and the boardwalk are structure and belong to the massing
@@ -7846,6 +7925,22 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
    * Build one stage of one tile. A generator, so tiles.js can stop between passes and hand the
    * frame back: a dense downtown tile is twenty partial frames rather than one 60 ms stall.
    */
+  // ISLANDS: everything harbour.js needs to place a prop the way city.js would have placed it —
+  // the same occupancy grid, the same footprint and carriageway tests, the same ground field and
+  // the same audit counters — so an island tree obeys exactly the invariants a street tree does.
+  function islandCtx(builders, F) {
+    return {
+      mb: builders,
+      data,
+      groundY,
+      buildings: F.b,
+      reserve: (kind, x, z, r, roadPad, h) => reserve(C, kind, x, z, r, roadPad, h),
+      claim: (x, z, r) => C.occ.claim(x, z, r),
+      note: (kind) => noteProp(C, kind),
+      inFootprint: (x, z, pad) => inFootprint(C, x, z, pad),
+    };
+  }
+
   function* buildTile(tile, stage, builders) {
     const F = tile.f;
     const first = beginTile(tile, stage);
@@ -7889,6 +7984,11 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       if (F.harbour && F.harbour[S_MASS]) {
         const chunk = F.harbour[S_MASS];
         for (const c in chunk) appendChunk(builders[c], chunk[c]);
+      }
+      // ISLANDS: the shore mantle, the boardwalks and the airfield surface.
+      if (F.isle) {
+        yield;
+        appendIslandMass(HARBOUR, islandCtx(builders, F), tile.cx0, tile.cz0, tile.cx1, tile.cz1);
       }
     } else {
       /* --------------------------------------------------------- ground plane */
@@ -8028,6 +8128,13 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         const chunk = F.harbour[S_DETAIL];
         for (const c in chunk) appendChunk(builders[c], chunk[c]);
       }
+      // ISLANDS: the tree cover, the gardens, the beach, the airfield lights and aircraft, the
+      // ferries, Centreville, the lighthouse and the cottage roofs.
+      if (F.isle) {
+        yield;
+        appendIslandDetail(HARBOUR, islandCtx(builders, F), tile.cx0, tile.cz0, tile.cx1,
+          tile.cz1);
+      }
     }
 
     endTile(tile, stage, first);
@@ -8074,6 +8181,7 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   const meshes = { water: new Mesh(gl, waterMB.data()) };
   stats.meshes.water = waterMB.count;
   waterMB.reset();
+  stats.isle = islandStats(HARBOUR);
   stats.seconds = (now() - t0) / 1000;
   stats.yields = _yields;
   stats.tileSize = TILE_SIZE;
@@ -8281,6 +8389,21 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         HB.marinas + ' marinas, ' + HB.terminals + ' ferry terminals, ' + HB.crossings +
         ' walkways carried over the water; ' + HB.folds + ' folded quay quads');
     }
+
+    // The islands and the airfield: the headline content of the southward expansion, and until
+    // this line existed the only place any of it was reported was a stats object nobody read.
+    const IS = stats.isle;
+    if (IS && IS.islands) {
+      console.log('[city] islands: ' + IS.islands + ' islands over ' +
+        (IS.landArea / 1e6).toFixed(2) + ' km2, ' + Math.round(IS.shoreMetres).toLocaleString() +
+        ' m of shore (' + Math.round(IS.beachMetres).toLocaleString() + ' m beach, ' +
+        Math.round(IS.ripMetres).toLocaleString() + ' m riprap, ' +
+        Math.round(IS.wallMetres).toLocaleString() + ' m wall), ' + IS.bridges + ' bridges, ' +
+        IS.ferryDocks + ' ferry docks, ' + IS.rides + ' rides; Billy Bishop ' + IS.airRunways +
+        ' runways, ' + IS.airTaxiways + ' taxiways, ' + IS.airAprons + ' aprons, ' +
+        IS.airStands + ' stands over ' + Math.round(IS.airPaveArea).toLocaleString() +
+        ' m2 of pavement');
+    }
   }
 
   /**
@@ -8329,6 +8452,15 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     grid,
     classes: MESH_CLASSES,
     stats,
+    // ISLANDS: the harbour/island model, so tools/islands.mjs can audit the shore stations, the
+    // airfield and the bridges against the geometry rather than against its own guesses.
+    harbour: HARBOUR,
+    // Where the tower actually stands, for render.js's uCnTower mask — the LED rib wash, the two
+    // glazed bands and the red aviation beacons are all keyed off it. The renderer carries a
+    // literal default that was correct for the pre-expansion origin and is 1,020 m out under this
+    // one, so the position has to come from the data rather than from a constant.
+    // [x, z, base Y, mask radius].
+    cnTower: [cnX, cnZ, cnBaseY, 34.0],
     groundY,
     buildingAt,
     collide,

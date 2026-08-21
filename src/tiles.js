@@ -244,6 +244,39 @@ export class TileManager {
     this.evictMs = Number.isFinite(o.evictMs) ? o.evictMs : 12000;
     this.maxQueue = Number.isFinite(o.maxQueue) ? o.maxQueue : 512;
 
+    // Adaptive level-of-detail scale — the safety valve that keeps the WANT SET inside the cap.
+    //
+    // Eviction and the builder used to be able to fight each other. If everything in range added
+    // up to more than `vertexCap`, the builder would build a wanted tile, the resident total went
+    // over, and eviction picked the furthest READY stage — which was itself still in range, so it
+    // was re-queued and rebuilt on the next frame, evicting another. Measured downtown with the
+    // camera standing perfectly still: ~210 builds and ~210 evictions per 200 frames, forever,
+    // 131 M vertices evicted and 13,000 buffer uploads before anyone noticed.
+    //
+    // A cap cannot be enforced by throwing away things that are still wanted; the WANT SET itself
+    // has to shrink. So each stage carries a scale on its range, and when the resident total runs
+    // over the cap the most detailed stage that still has room gives up some radius. The tile
+    // eviction then removes is genuinely out of range and is not queued again, and the system
+    // settles instead of oscillating.
+    //
+    // `_lodCeil` remembers the scale at which a stage last overflowed so relaxing cannot walk
+    // straight back into the overflow it just escaped. It is forgiven when the camera has moved
+    // far enough that "how dense is it here" is a different question — half a tile.
+    this.lodStep = Number.isFinite(o.lodStep) ? o.lodStep : 0.04;
+    this._lod = new Float64Array(this.stages.length).fill(1);
+    this._lodCeil = new Float64Array(this.stages.length).fill(1);
+    this._lodCeilCap = this.vertexCap;
+    // Floors: massing is the silhouette and gives up radius only after every detail stage has
+    // already bottomed out, so detail's floor is the lower of the two. They are set low enough
+    // that the valve can ALWAYS reach a want set that fits — a stage whose range has gone to its
+    // floor still keeps the tile the camera is standing in, so convergence is guaranteed for any
+    // cap that can hold one dense tile (~430 k vertices downtown). Reaching either floor means
+    // the cap is badly undersized for the hardware and the skyline will visibly shorten; that is
+    // still the right failure, because the alternative measured at 6 M was a permanent treadmill
+    // of 150 builds and 150 evictions per 200 frames with the camera standing still.
+    this._lodFloor = this.stages.map((s, i) => (i === 0 ? 0.20 : 0.12));
+    this._lodAnchor = [Infinity, Infinity, Infinity];
+
     const nStage = this.stages.length;
     const tiles = this.grid.tiles;
     for (let k = 0; k < tiles.length; k++) {
@@ -265,7 +298,8 @@ export class TileManager {
     this.stats = {
       residentVerts: 0, residentTiles: 0, visibleTiles: 0, drawMeshes: 0,
       built: 0, evicted: 0, evictedVerts: 0, queued: 0, buildMs: 0, lastBuildMs: 0,
-      peakResidentVerts: 0, uploads: 0, freed: 0,
+      peakResidentVerts: 0, uploads: 0, freed: 0, lodScale: 1, lodShrinks: 0, lodRelaxes: 0,
+      evictedWanted: 0,
     };
   }
 
@@ -333,20 +367,89 @@ export class TileManager {
 
   /* ---------------------------------------------------------------- build */
 
+  /** Stage range and release distance after the adaptive scale. */
+  range(s) { return this.stages[s].range * this._lod[s]; }
+  drop(s) { return this.stages[s].drop * this._lod[s]; }
+
   _wantStage(tile, s) {
     // Stage 0 gates every later one: massing is what a tile IS, and detail proud of a wall that
     // was never emitted would float in space.
     for (let k = 0; k <= s; k++) {
-      if (tile.dist > this.stages[k].range) return false;
+      if (tile.dist > this.range(k)) return false;
     }
     return !tile.empty;
   }
 
   _keepStage(tile, s) {
     for (let k = 0; k <= s; k++) {
-      if (tile.dist > this.stages[k].drop) return false;
+      if (tile.dist > this.drop(k)) return false;
     }
     return true;
+  }
+
+  /**
+   * Move the level-of-detail scale one step so the want set fits the cap.
+   *
+   * Shrinks from the most detailed stage down, because detail costs about 7x what massing does
+   * per tile (measured downtown: 379 k vertices a tile against 51 k) and is the half of the
+   * image a distant viewer cannot resolve anyway. Relaxes from the coarsest stage up, so the
+   * skyline comes back before the shopfronts do.
+   */
+  _adaptLod(px, py, pz) {
+    const n = this._lod.length;
+    if (!n) return;
+
+    const res = this.stats.residentVerts;
+    const cap = this.vertexCap;
+
+    // The ceiling records "this scale overflowed HERE, at THIS cap", so it has to be forgiven
+    // whenever either of those stops being true. Without the last of these three the scale is a
+    // one-way ratchet: a squeeze that bottoms the valve out leaves the detail radius short for
+    // the rest of the session even after the pressure lifts. Measured before this was added —
+    // cap restored from 6 M to 11 M, resident 6.8 M against it, and the detail radius stayed at
+    // 351 m of a possible 780 m with zero relax events.
+    const ax = this._lodAnchor;
+    const half = this.grid ? this.grid.size * 0.5 : 312;
+    const dx = px - ax[0], dy = py - ax[1], dz = pz - ax[2];
+    const moved = !(dx * dx + dy * dy + dz * dz < half * half);
+    const capChanged = cap !== this._lodCeilCap;
+    const roomy = res < cap * 0.6 && !this._job && this._queue.length === 0;
+    if (moved || capChanged || roomy) {
+      for (let s = 0; s < n; s++) this._lodCeil[s] = 1;
+      this._lodCeilCap = cap;
+      if (moved) { ax[0] = px; ax[1] = py; ax[2] = pz; }
+    }
+    if (res > cap) {
+      for (let s = n - 1; s >= 0; s--) {
+        if (this._lod[s] > this._lodFloor[s] + 1e-6) {
+          this._lodCeil[s] = this._lod[s];
+          this._lod[s] = Math.max(this._lodFloor[s], this._lod[s] - this.lodStep);
+          this.stats.lodShrinks++;
+          break;
+        }
+      }
+    } else if (res < cap && !this._job && this._queue.length === 0) {
+      // Only with the want set fully satisfied — relaxing while tiles are still queued would
+      // widen the target before the last one had been reached.
+      //
+      // The test is against the whole cap and not some fraction of it. A deadband here looks
+      // like prudence and is actually a trap: downtown at full detail the want set rests at
+      // 10.98 M of the 11 M cap, so a relax threshold of 0.75 x cap can never be reached and the
+      // scale, once knocked down, stays down — measured stuck at 0.74 (577 m of a possible
+      // 780 m) with 2.4 M vertices of headroom going unused. Oscillation is prevented by the
+      // ceiling instead, which is the mechanism that actually knows where the edge was: one
+      // relax overshoots by a single step, the shrink puts it back, and the ceiling then pins it
+      // there.
+      for (let s = 0; s < n; s++) {
+        const ceil = Math.max(this._lodFloor[s], this._lodCeil[s] - this.lodStep);
+        if (this._lod[s] < Math.min(1, ceil) - 1e-6) {
+          this._lod[s] = Math.min(1, ceil, this._lod[s] + this.lodStep * 0.5);
+          this.stats.lodRelaxes++;
+          break;
+        }
+      }
+    }
+    this.stats.lodScale = this._lod[n - 1];
   }
 
   _startJob(tile, stage) {
@@ -456,10 +559,16 @@ export class TileManager {
             continue;
           }
         }
-        // Ranked by DISTANCE first — the furthest geometry is the least useful — with the stage
-        // only breaking ties, so memory pressure never strips the detail off the block the
-        // player is standing on while a tile five kilometres away keeps its massing.
-        if (needVerts > 0) over.push(t, s, t.dist * 4 + s);
+        // Ranked so that everything OUT of range goes before anything still in it: evicting a
+        // wanted stage guarantees it is queued again on the next frame, which is the treadmill
+        // _adaptLod exists to prevent. Within each group the furthest geometry is the least
+        // useful, with the stage only breaking ties, so memory pressure never strips the detail
+        // off the block the player is standing on while a tile five kilometres away keeps its
+        // massing.
+        if (needVerts > 0) {
+          const spare = this._keepStage(t, s) ? 0 : 1e9;
+          over.push(t, s, spare + t.dist * 4 + s);
+        }
       }
     }
     if (needVerts <= 0 || freed >= needVerts) return freed;
@@ -470,6 +579,7 @@ export class TileManager {
       const k = idx[i];
       const rec = over[k].st[over[k + 1]];
       if (rec.state !== STATE_READY) continue;
+      if (this._keepStage(over[k], over[k + 1])) this.stats.evictedWanted++;
       const n = this._release(over[k], over[k + 1]);
       freed += n;
       this.stats.evicted++;
@@ -502,7 +612,7 @@ export class TileManager {
     let resident = 0;
     let meshes = 0;
 
-    const maxRange = this.stages.length ? this.stages[0].drop : 0;
+    const maxRange = this.stages.length ? this.drop(0) : 0;
     for (let k = 0; k < tiles.length; k++) {
       const t = tiles[k];
       // Level of detail is measured against the CORE cell (plus the tile's real height range),
@@ -549,6 +659,10 @@ export class TileManager {
 
     const budget = Number.isFinite(budgetMs) ? budgetMs : this.budgetMs;
     if (budget > 0) this._pump(budget, clock);
+
+    // Shrink the want set BEFORE evicting, so whatever eviction takes is genuinely out of range
+    // and will not simply be rebuilt on the next frame.
+    this._adaptLod(px, py, pz);
 
     let over = this.stats.residentVerts - this.vertexCap;
     if (over > 0) this._evict(over);
