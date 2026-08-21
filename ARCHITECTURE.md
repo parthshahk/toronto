@@ -5,7 +5,8 @@ Reference for working on the code. The [README](README.md) covers what the proje
 ## Coordinate system
 
 **X = east, Y = up, Z = south.** Right-handed, true metres. Origin at the centre of the data
-extent (-79.38850, 43.64400). Yaw 0 faces **+Z**, increasing toward **+X**, so
+extent — currently (-79.387, 43.635), and **read from `meta.origin`, never assumed**: the extent
+has already moved once and everything that hard-coded the old centre broke silently. Yaw 0 faces **+Z**, increasing toward **+X**, so
 `forward = (sin yaw, 0, cos yaw)` and `right = cross(forward, up)` — at yaw 0 that is **-X**.
 
 Source data is EPSG:3857 (Web Mercator), which inflates horizontal distance by `1/cos(latitude)` —
@@ -27,18 +28,27 @@ Source files go in `data/raw/` (gitignored, ~400 MB):
 
 `build_city.py` clips the 210 MB city-wide shapefile to the bounding box, reprojects, interpolates
 terrain, and reads the OSM street/rail/water layers. `match_osm.py` matches OSM building polygons
-onto massing footprints to attach typology, material and surveyed colour. `pack_city.py` packs the
-result into the binary sidecar the loader actually reads.
+onto massing footprints to attach typology, material and surveyed colour. `attach_pois.py` reads
+the OSM **node** extract and attaches the shop units, house numbers, storey counts and roof shapes
+to buildings, and the standalone street furniture to `pois[]`. `pack_city.py` packs the result into
+the binary sidecar the loader actually reads.
 
-    npm run build:city     # all three, in order
+    python3 tools/build_city.py
+    python3 tools/match_osm.py
+    python3 tools/attach_pois.py
+    python3 tools/pack_city.py
+    npm run build:city     # all four, in order
     npm run pack:city      # just the sidecar, after hand-editing the JSON
+
+`attach_pois.py` needs `data/raw/osm_nodes.json`. Without it the ground floor and the street
+furniture are entirely synthesised and **nothing warns** — see the sidecar note below.
 
 ### `data/toronto.bin`
 
 The JSON is the **authoring** format — readable, diffable, what the Python writes. It is a poor
-transport format: 11.8 MB of text, 3.3 MB gzipped, and `JSON.parse` has to allocate ~493,000
-two-element arrays before the first frame can start. The sidecar carries exactly the same
-information as typed arrays:
+transport format: 13.5 MB of text, and `JSON.parse` has to allocate ~493,000 two-element arrays
+before the first frame can start. The sidecar carries exactly the same information as typed
+arrays:
 
     magic 'TOR2' · uint32 headerLen · header JSON · 4-byte-aligned typed-array blocks
 
@@ -49,9 +59,22 @@ integer units chosen so that dividing reproduces **exactly** the double the JSON
 to. Float32 would not: 22.7 m becomes 22.700000762939453, which is enough to move a building
 across one of `pickClass`'s height thresholds.
 
-Measured: 11.8 MB → 3.3 MB raw, 3.3 MB → 1.9 MB gzipped, and 61 ms of `JSON.parse` → 6 ms of
-typed-array walk. `city.js` falls back to the JSON with a console warning if the sidecar is
-missing or stale, so the app runs from a fresh `build_city.py` without it.
+Measured: 13.5 MB → 4.1 MB raw, and 61 ms of `JSON.parse` → 6 ms of typed-array walk. `city.js`
+falls back to the JSON with a console warning if the sidecar is missing or stale, so the app runs
+from a fresh `build_city.py` without it. The console line on a healthy boot reads
+`[city] data: bin, 4.10 MB decoded` — if it says `falling back to JSON`, re-run
+`python3 tools/pack_city.py`.
+
+The sidecar carries the surveyed **unit** and **POI** blocks as well as the geometry: a
+`buildings.unitsPer` run-length array plus parallel `units.*` blocks (category enum, value
+dictionary, segment index, the position along that segment as `u16` thousandths, and dictionary
+indices for name, brand and house number), and `pois.x/z` as `int32` centimetres against a kind
+enum and a name dictionary. **A stale `toronto.bin` is silently wrong rather than broken:** it
+decodes cleanly and simply reports zero surveyed units, zero POIs and zero real storey counts, so
+the city builds with an entirely synthesised ground floor and nothing warns. If
+`stats.facades.unitsSurveyed` and `stats.survey.total` come back 0, the sidecar predates
+`attach_pois.py`. Browsers also cache it aggressively — a hard reload is part of testing a
+regenerated sidecar.
 
 ### `data/toronto.json`
 
@@ -59,12 +82,29 @@ missing or stale, so the app runs from a fresh `build_city.py` without it.
 meta      { origin{lon,lat}, bbox, extent{x,z}, lake_msl, sources[] }
 terrain   { nx, nz, cell, h[] }        // metres above lake datum, row-major, +z south
 buildings [ { h, y, r[[x,z]...],       // height, terrain base, rings (outer + holes)
-              t, c[r,g,b], m, n } ]    // lighting profile, surveyed colour, material, name
+              t, c[r,g,b], m, n,       // lighting profile, surveyed colour, material, name
+              hn, lv, rs,              // house number, REAL storey count, roof shape
+              u[ { c, v, s, t, n, b, h, o } ] } ]   // the units on its frontage — see below
 roads     [ { c, w, n, lay, b, tun, p[[x,z]...] } ]
 areas     [ { k, p } ]   rails [ { k, p } ]
 shore     [ { role, p } ]              // clipped from the OSM Lake Ontario multipolygon
 waterfront[ { k, n, p } ]              // pier | quay | breakwater | groyne | retaining_wall | …
+pois      [ { k, x, z, n } ]           // standalone surveyed nodes, in LOCAL METRES
 ```
+
+**`buildings[].u` is the ground floor.** Each unit is a real surveyed premises: `c` the category
+key (`shop`/`amenity`/`office`/`healthcare`/`craft`/`tourism`/`leisure`/`historic`), `v` its value
+(`cafe`, `clothes`, `bank`, `hairdresser`, …), `s` the index of the footprint ring **segment** it
+sits on and `t` its parameter `0..1` along that segment, `n` its name, `b` its brand, `h` its house
+number, `o` whether it has opening hours. Units arrive ordered along the frontage, which is what
+lets `city.js` lay a block face out as a run of premises rather than as one repeated shopfront.
+
+**`pois[]` is the street furniture**, already projected to local metres by `tools/attach_pois.py`:
+21,974 nodes — 8,032 trees, 3,717 crossings, 2,000 bike parking, 1,862 benches, 1,403 lamps, 1,142
+hydrants, 842 bins, 573 signals, plus stops, postboxes, bike share, bollards, fountains and
+billboards. These were the whole reason the ground plane used to be invented: the first three
+Overpass extracts contained only ways and relations, and in OSM almost everything that makes a
+street recognisable is a **node**.
 
 **`lay` is a signed layer, and the sign is load-bearing.** Negative means the way passes *under*
 something. Treating any non-zero layer as a bridge builds 750 underpasses as flyovers, and dropping
@@ -91,10 +131,10 @@ Tower's mast, and the only route to them that does not mean regenerating `toront
 
 ## Vertex format
 
-13 interleaved floats, non-indexed triangles, counter-clockwise front faces (back-face culling is on):
+14 interleaved floats, non-indexed triangles, counter-clockwise front faces (back-face culling is on):
 
 ```
-px py pz   nx ny nz   r g b   emissive  tintable  rough  profile
+px py pz   nx ny nz   r g b   emissive  tintable  rough  profile  uv
 ```
 
 - `rough` — 0 mirror, 1 matte. Drives GGX specular and reflection strength.
@@ -102,6 +142,10 @@ px py pz   nx ny nz   r g b   emissive  tintable  rough  profile
   `0` envelope (no windows) · `1` office · `2` residential · `3` retail · `4` parking · `5` civic
 - `emissive` — on profile 0 it must be exactly `0` or `≥ 0.50`; values between are reserved as
   facade window hints.
+- `uv` — the glyph atlas coordinate, two 12-bit fields packed into one float and written through
+  `MeshBuilder.uv()`. Only text quads use it; every other vertex leaves it at 0. `profile = 6`
+  marks a vertex as a glyph, which is why the sign class is drawn by its own program rather than
+  by the scene shader.
 
 `MeshBuilder.color(r, g, b, emissive = 0, tintable = 0, rough = 0.85, profile = 0)`.
 
@@ -115,7 +159,8 @@ px py pz   nx ny nz   r g b   emissive  tintable  rough  profile
 | `city.js` | `toronto.bin` → analysis, per-tile geometry, grade separation, collision, walkability, the world boundary |
 | `tiles.js` | the spatial grid, the LOD stages, the build scheduler and the eviction cache |
 | `props.js` | street furniture, vegetation, vehicles, pedestrians |
-| `facades.js` | entrances, shopfronts, balconies, cornices — at two levels of detail |
+| `facades.js` | entrances, shopfronts, balconies, cornices, the surveyed unit model — at two levels of detail |
+| `text.js` | the SDF glyph atlas, rasterised at boot from a system font with Canvas 2D, and the run layout that turns a string into quads |
 | `harbour.js` | quay walls, piers, slips, waterfront walkways, the islands, Billy Bishop |
 | `input.js` | keyboard/mouse/pointer-lock, dual-layout aliasing, the touch feeds |
 | `touch.js` | the Maps-style multi-touch camera, on-screen controls, the walk-mode thumbstick |
@@ -348,6 +393,79 @@ grade now matches the rest of the ladder to within 1% of mean luminance instead 
 into script. Every HUD anchor, the on-screen buttons and the thumbstick are measured from the safe
 box rather than the glass, so nothing lands under a notch, a rounded corner or a home indicator. On
 a device with no insets all four read 0 and the layout collapses back to exactly the desktop one.
+
+## The ground floor
+
+From the air the city is right; on foot it used to be filler, and the reason was that the extract
+had no nodes in it. It does now, and the ground storey is built from what the survey actually says
+is there.
+
+**Block faces, not buildings.** `city.js` finds each building's street-facing frontages, then lays
+them out as a run of **units** — the premises between two party walls — rather than repeating one
+shopfront along the wall. Where `buildings[].u` has surveyed premises for that frontage, they are
+placed at their real `s`/`t` position along the ring and in their real order; the gaps between them
+are filled with a synthesised unit whose trade is hashed on **world position**, so a block builds
+identically whether or not its neighbours are loaded. `facades.js` turns each unit into glazing, a
+bulkhead, a sign band, a recessed or flush entry, an awning and a shutter box, all chosen by trade
+from one frozen `STYLES` table.
+
+**Lettering is a separate LOD stage.** A 250 mm shop name is a smear past 150 m, so the glyphs are
+stage 2 (`SIGN_RANGE`), built after massing and detail and dropped first. The signage pass re-runs
+the same layout with `textOnly`, and because every appearance decision inside `appendUnitFront` is
+hashed on world position it lands on exactly the fascias the detail stage built. Glyph quads are
+not an opaque material class — `render.js` draws them with its own program through `drawText()`,
+which `CityTiles.forEachMesh` flushes behind the last opaque class.
+
+**Names are real or generic, never invented.** A surveyed unit is lettered with its actual name
+(6,805 of them carry one). An unsurveyed unit gets an all-caps generic trade word — `BAKERY`,
+`HARDWARE`, `DRY CLEANING` — from `TRADE_WORDS`. Nothing ever fabricates a proper noun, so a sign
+you can read is a sign you can trust. **Measured over the whole map: 70,755 units built over
+485,728 m of frontage, of which 7,029 are surveyed — 9.9% of all units, or 30.8% of the 22,805
+that trade.** The other 90% is deliberate, plausible filler per Amendment 9.
+
+Storey heights come from `buildings[].lv` where the survey has it (4,305 buildings), derived from
+total height otherwise (14,006), and **rejected** where the tag implies an impossible floor-to-floor
+(2,462) — the levels tag was lifted by matching an OSM polygon to a massing record within 34 m and
+that match is sometimes the building next door.
+
+## Local lights
+
+Street lamps used to be geometry and nothing else. `render.js` has carried a clustered forward
+light rig the whole time and no caller ever registered anything with it, so `lightStats.registered`
+sat at **0** and the only light in a night frame was the sky: the road measured RGB (1, 1, 2) —
+luma 0.006 — while the shopfronts above it glowed. Walking Queen Street at 23:30 read as a power
+cut.
+
+`city.js` now records every luminaire it places at its **lens** — never at the foot of the mast,
+which would light the mast — through `noteLight()`, and `update()` hands the accumulated set to
+`renderer.setLights()` on the frames where a tile actually added one. Registrations are keyed on
+quantised world position, so a tile that is evicted and rebuilt does not grow the list and the set
+is identical whichever order the tiles arrived in. `city.lights` exposes it for the harness.
+
+Whole map: **32,537 luminaires** — 23,723 shopfront spills, 6,039 pedestrian poles, 2,555 cobra
+heads, 220 heritage acorns. The renderer culls, ranks and clusters them and uploads at most 512 a
+frame; the CPU cost of the gather is 0.6–1.2 ms.
+
+Two placement bugs fell out of wiring this up, both invisible until the lamps actually emitted:
+
+- **`LAMP_SPACING` had no `pedestrian` entry**, so every pedestrianised street in the city — the
+  Distillery lanes, the Queens Quay promenade, the squares and mews — got no luminaire at all.
+- Worse, `reserve()` refuses any site that lands **on a carriageway**, and a pedestrianised way is
+  still a carriageway *record*. Even after adding the pitch, every post along one was refused by
+  the test meant to keep masts out of traffic. Pedestrian ways now pass `roadPad = -1`, the same
+  convention the other props that legitimately stand on a roadway use.
+
+Together those took acorn lamps from 92 to 216 and pedestrian poles from 4,720 to 5,243, and the
+ground on Trinity Street at night from luma 0.006 to 0.131. The Distillery was also outside every
+`ACORN_ZONE`, which is why the one quarter downtown that is lit entirely by heritage globes had
+none; it has a zone now.
+
+Measured on Queen West at Night, sampling the carriageway every metre along the street: **under a
+lamp, luma 0.151 mean and 0.591 peak; between lamps, 0.081 mean and 0.040 floor** — a 1.9× mean
+ratio and a 15× peak-to-floor, with the road warm (RGB 42, 36, 20) under sodium and neutral between.
+
+Amendment 7 holds: the rig uploads **0** lights at Afternoon, 512 from Golden hour on. Nothing in
+`city.js` decides *when* a lamp is lit — it says only that a luminaire exists at a point.
 
 ## Tiling and level of detail
 

@@ -187,6 +187,73 @@ def main():
     blocks.add('buildings.col', 'i32', col)
     blocks.add('buildings.name', 'i32', name_ids(buildings))
 
+    # ---------------------------------------------------- the surveyed ground floor
+    # tools/attach_pois.py writes four new fields per building, and they are the whole reason
+    # the ground floor can be real: `hn` the street number, `lv` the surveyed storey count,
+    # `rs` the roof shape, and `u` the premises on the frontage with the footprint SEGMENT and
+    # the parameter along it that says where each one is.
+    #
+    # Everything below preserves the sidecar's exact-decode property. House numbers, names,
+    # brands and enum values are strings and go through dictionaries, so they come back
+    # character for character. `t` is written by attach_pois.py to three decimals, so an integer
+    # count of thousandths divided by 1000 lands on exactly the double that parsing "0.253"
+    # gives; the same argument puts the POI coordinates in whole centimetres, which is the two
+    # decimals attach_pois.py rounds them to.
+    hnums, hnum_index = dictionary(
+        [b.get('hn') for b in buildings] +
+        [u.get('h') for b in buildings for u in (b.get('u') or [])]
+    )
+    header['dicts']['houseNumbers'] = hnums
+    blocks.add('buildings.hnum', 'i32',
+               [hnum_index.get(b.get('hn'), -1) if isinstance(b.get('hn'), str) else -1
+                for b in buildings])
+    # Levels: 0 means "not surveyed". attach_pois.py already clamps to 1..120.
+    blocks.add('buildings.levels', 'u8',
+               [max(0, min(255, int(b.get('lv', 0) or 0))) for b in buildings])
+    header['dicts']['roofShape'] = enum_block(buildings, 'rs', 'buildings.roof')
+
+    units = []
+    units_per = []
+    for b in buildings:
+        uu = b.get('u') or []
+        units_per.append(len(uu))
+        units.extend(uu)
+    header['counts']['units'] = len(units)
+    blocks.add('buildings.unitsPer', 'i32', units_per)
+    unit_names, unit_name_index = dictionary(
+        [u.get('n') for u in units] + [u.get('b') for u in units]
+    )
+    header['dicts']['unitNames'] = unit_names
+    header['dicts']['unitCategory'] = enum_block(units, 'c', 'units.cat')
+    unit_values, unit_value_index = dictionary([u.get('v') for u in units])
+    header['dicts']['unitValues'] = unit_values
+    blocks.add('units.val', 'i32', [unit_value_index.get(u.get('v'), -1) for u in units])
+    blocks.add('units.seg', 'i32', [int(u.get('s', 0)) for u in units])
+    blocks.add('units.t', 'u16',
+               [max(0, min(65535, int(round(float(u.get('t', 0.0)) * 1000.0)))) for u in units])
+    blocks.add('units.name', 'i32',
+               [unit_name_index.get(u.get('n'), -1) if isinstance(u.get('n'), str) else -1
+                for u in units])
+    blocks.add('units.brand', 'i32',
+               [unit_name_index.get(u.get('b'), -1) if isinstance(u.get('b'), str) else -1
+                for u in units])
+    blocks.add('units.house', 'i32',
+               [hnum_index.get(u.get('h'), -1) if isinstance(u.get('h'), str) else -1
+                for u in units])
+    blocks.add('units.hours', 'u8', [1 if u.get('o') else 0 for u in units])
+
+    # ------------------------------------------------------------ standalone POIs
+    pois = data.get('pois', [])
+    header['counts']['pois'] = len(pois)
+    header['dicts']['poiKind'] = enum_block(pois, 'k', 'pois.kind')
+    blocks.add('pois.x', 'i32', [int(round(float(p.get('x', 0.0)) * 100.0)) for p in pois])
+    blocks.add('pois.z', 'i32', [int(round(float(p.get('z', 0.0)) * 100.0)) for p in pois])
+    poi_names, poi_name_index = dictionary([p.get('n') for p in pois])
+    header['dicts']['poiNames'] = poi_names
+    blocks.add('pois.name', 'i32',
+               [poi_name_index.get(p.get('n'), -1) if isinstance(p.get('n'), str) else -1
+                for p in pois])
+
     # ---------------------------------------------------------------------- roads
     roads = data.get('roads', [])
     header['counts']['roads'] = len(roads)
@@ -228,6 +295,14 @@ def main():
           % (header['counts']['buildings'], header['counts']['roads'], header['counts']['areas'],
              header['counts']['rails'], header['counts']['shore'],
              header['counts']['waterfront'], escapes))
+    print('  %s units on %s buildings, %s standalone POIs, %s house numbers, %s storey counts, '
+          '%s roof shapes'
+          % (header['counts']['units'],
+             sum(1 for b in buildings if b.get('u')),
+             header['counts']['pois'],
+             sum(1 for b in buildings if isinstance(b.get('hn'), str)),
+             sum(1 for b in buildings if b.get('lv')),
+             sum(1 for b in buildings if isinstance(b.get('rs'), str))))
     print('  header %.1f KB, payload %.1f MB' % (len(head) / 1024.0,
                                                  blocks.offset / 1048576.0))
     print('  %.2f MB -> %.2f MB (%.0f%% of the JSON)'

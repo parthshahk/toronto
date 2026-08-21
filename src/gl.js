@@ -1,12 +1,62 @@
 // src/gl.js — WebGL2 plumbing: context creation, a Shader wrapper with
 // type-dispatched uniform setting, static/dynamic interleaved triangle meshes, and a fast
-// zero-allocation MeshBuilder. Vertex format (NORMATIVE, 11 floats, non-indexed triangles):
-//   [ px, py, pz,  nx, ny, nz,  r, g, b,  emissive, tintable ]
+// zero-allocation MeshBuilder.
+//
+// VERTEX FORMAT (NORMATIVE, 14 floats, non-indexed triangles):
+//
+//   offset  bytes  attribute  location  contents
+//   ------  -----  ---------  --------  --------------------------------------------------
+//        0     12  aPos          0      px, py, pz          world metres
+//       12     12  aNormal       1      nx, ny, nz          unit, outward
+//       24     12  aColor        2      r, g, b             linear albedo (never lit, never AO'd)
+//       36     16  aMat          3      emissive, tintable, rough, profile
+//       52      4  aUv           4      PACKED texture coordinate — see below
+//
 // Winding: counter-clockwise = front face (the renderer culls BACK faces).
+//
+// WHY aUv IS ONE FLOAT AND NOT TWO. Text in the world (src/text.js) needs a texture coordinate
+// into the runtime glyph atlas, and nothing else in the city needs one — every other surface is
+// vertex-coloured or procedural. But the format is shared: the resident set runs at the tile
+// manager's 11 M-vertex cap, so a vec2 UV would add 88 MB of vertex data and 15% of the vertex
+// fetch bandwidth of the whole city to serve well under 1% of its vertices. One float halves
+// that to 44 MB and 7.7%.
+//
+// The channel still carries a full [0,1]^2 coordinate: u and v are quantised to 12 bits each and
+// packed as u * 4096 + v, which tops out at 2^24 - 1 and is therefore EXACT in a float32 (24-bit
+// mantissa) — nothing is lost in the buffer, in the attribute fetch or in the highp decode. The
+// only loss is the quantisation itself, 1/4095 of the atlas, which on the 1008 x 792 atlas
+// text.js builds is a quarter of a texel at a glyph CORNER; the decode happens in the vertex stage
+// and the varying interpolates the decoded vec2, so nothing accumulates across the quad.
+//
+// Decode with GLSL_UV below (vhUnpackUv), which is exported from here so the pack and the unpack
+// can never drift apart. Vertices that never call MeshBuilder.uv() carry 0, which decodes to
+// (0, 0) and is ignored by every shader that does not sample a texture.
+//
 // Zero dependencies.
 
-export const VERT_FLOATS = 13;
-export const ATTR = { pos: 0, normal: 1, color: 2, mat: 3 };
+export const VERT_FLOATS = 14;
+export const ATTR = { pos: 0, normal: 1, color: 2, mat: 3, uv: 4 };
+
+// 12 bits per axis. UV_STEPS * UV_SCALE + UV_STEPS = 16,777,215 = 2^24 - 1, the largest integer
+// a float32 represents exactly.
+export const UV_STEPS = 4095;
+export const UV_SCALE = 4096;
+
+/** Quantise a [0,1]^2 texture coordinate into the single float aUv carries. */
+export function packUv(u, v) {
+  const uu = u <= 0 ? 0 : (u >= 1 ? UV_STEPS : Math.round(u * UV_STEPS));
+  const vv = v <= 0 ? 0 : (v >= 1 ? UV_STEPS : Math.round(v * UV_STEPS));
+  return uu * UV_SCALE + vv;
+}
+
+// The matching decode, for any shader that samples with aUv. Exact for every value packUv emits:
+// the divide is by a power of two, so floor() lands on the integer u and the remainder is v.
+export const GLSL_UV = [
+  'vec2 vhUnpackUv(float p) {',
+  '  float u = floor(p * (1.0 / ' + UV_SCALE.toFixed(1) + '));',
+  '  return vec2(u, p - u * ' + UV_SCALE.toFixed(1) + ') * (1.0 / ' + UV_STEPS.toFixed(1) + ');',
+  '}',
+].join('\n');
 
 const STRIDE = VERT_FLOATS * 4;
 const EPS = 1e-8;
@@ -169,6 +219,7 @@ export class Shader {
     gl.bindAttribLocation(prog, ATTR.normal, 'aNormal');
     gl.bindAttribLocation(prog, ATTR.color, 'aColor');
     gl.bindAttribLocation(prog, ATTR.mat, 'aMat');
+    gl.bindAttribLocation(prog, ATTR.uv, 'aUv');
     gl.linkProgram(prog);
 
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
@@ -264,6 +315,8 @@ function bindVertexFormat(gl) {
   gl.vertexAttribPointer(ATTR.color, 3, gl.FLOAT, false, STRIDE, 24);
   gl.enableVertexAttribArray(ATTR.mat);
   gl.vertexAttribPointer(ATTR.mat, 4, gl.FLOAT, false, STRIDE, 36);
+  gl.enableVertexAttribArray(ATTR.uv);
+  gl.vertexAttribPointer(ATTR.uv, 1, gl.FLOAT, false, STRIDE, 52);
 }
 
 export class Mesh {
@@ -375,6 +428,7 @@ export class MeshBuilder {
     this._data = new Float32Array(4096);
     this._n = 0;
     this._r = 1; this._g = 1; this._b = 1; this._e = 0; this._t = 0; this._rg = 0.85; this._pf = 0;
+    this._uv = 0;
   }
 
   get count() {
@@ -395,6 +449,14 @@ export class MeshBuilder {
     return this;
   }
 
+  // Texture coordinate for the vertices emitted after this call, packed into aUv (see the file
+  // header). Deliberately NOT reset by color(): the two channels are independent, and every
+  // module that predates the UV channel simply never calls this and emits 0.
+  uv(u, v) {
+    this._uv = packUv(u, v);
+    return this;
+  }
+
   _grow(need) {
     let cap = this._data.length;
     while (cap < need) cap *= 2;
@@ -411,6 +473,7 @@ export class MeshBuilder {
     d[n + 3] = nx; d[n + 4] = ny; d[n + 5] = nz;
     d[n + 6] = this._r; d[n + 7] = this._g; d[n + 8] = this._b;
     d[n + 9] = this._e; d[n + 10] = this._t; d[n + 11] = this._rg; d[n + 12] = this._pf;
+    d[n + 13] = this._uv;
     this._n = n + VERT_FLOATS;
     return this;
   }
@@ -651,6 +714,7 @@ export class MeshBuilder {
       dst[k + 10] = src[i + 10];
       dst[k + 11] = src[i + 11];
       dst[k + 12] = src[i + 12];
+      dst[k + 13] = src[i + 13];
       k += VERT_FLOATS;
     }
     this._n = k;
@@ -668,6 +732,7 @@ export class MeshBuilder {
   reset() {
     this._n = 0;
     this._r = 1; this._g = 1; this._b = 1; this._e = 0; this._t = 0; this._rg = 0.85; this._pf = 0;
+    this._uv = 0;
     return this;
   }
 }

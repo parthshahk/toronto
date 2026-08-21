@@ -493,6 +493,41 @@
   window.addEventListener('contextmenu', (e) => { e.preventDefault(); });
 })();
 </script>
-<script type="module" src="./src/main.js?v=1787326556"></script>
+<!-- CACHE BUSTING, ALL OF IT IN ONE PLACE.
+
+     The version query on main.js only ever busted main.js. Every module it imports uses a bare
+     relative specifier ('./city.js'), which resolves to an unversioned URL, so a browser holding
+     a cached copy of one of them happily pairs it with a freshly fetched main.js. That is not a
+     development annoyance, it is a correctness bug in production: GitHub Pages serves assets with
+     max-age=600, so for ten minutes after a deploy a returning visitor can run new main.js against
+     old city.js. It fails exactly as you would expect — a ReferenceError deep inside a tile build,
+     from a line that no longer exists.
+
+     An import map fixes it with no build step and no dependency: the specifier each module already
+     writes is remapped to the versioned URL. A browser resolves a relative specifier against the
+     importing module and then matches the result against this map, and a relative KEY is itself
+     resolved against the document base — so these keys land correctly under a subpath (Pages serves
+     this at /toronto/) as well as at the domain root. Absolute "/src/..." keys would not.
+
+     WHEN YOU CHANGE ANY MODULE, bump V in all the URLs here (they must all match). -->
+<script type="importmap">
+{
+  "imports": {
+    "./src/city.js": "./src/city.js?v=1787341008",
+    "./src/facades.js": "./src/facades.js?v=1787341008",
+    "./src/gl.js": "./src/gl.js?v=1787341008",
+    "./src/harbour.js": "./src/harbour.js?v=1787341008",
+    "./src/input.js": "./src/input.js?v=1787341008",
+    "./src/main.js": "./src/main.js?v=1787341008",
+    "./src/math.js": "./src/math.js?v=1787341008",
+    "./src/props.js": "./src/props.js?v=1787341008",
+    "./src/render.js": "./src/render.js?v=1787341008",
+    "./src/text.js": "./src/text.js?v=1787341008",
+    "./src/tiles.js": "./src/tiles.js?v=1787341008",
+    "./src/touch.js": "./src/touch.js?v=1787341008"
+  }
+}
+</script>
+<script type="module" src="./src/main.js?v=1787341378"></script>
 </body>
 </html>

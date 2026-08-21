@@ -43,6 +43,7 @@
 // the winding and are always unit length; there is no hand-written normal to get wrong.
 
 import { clamp, TAU } from './math.js';
+import { appendText, textWidth, ALIGN, VALIGN } from './text.js';
 
 /* =============================================================== materials = */
 // [ r, g, b, emissive, tintable, rough, profile ]
@@ -74,9 +75,15 @@ const M = {
   binRecycle: [0.036, 0.070, 0.094, 0, 0, 0.55, 0], // recycling stream
   binHood: [0.046, 0.048, 0.052, 0, 0, 0.44, 0],
   greenP: [0.038, 0.100, 0.055, 0, 0, 0.55, 0],
-  signGreen: [0.028, 0.084, 0.050, 0, 0, 0.70, 0],  // street-name blade
+  signGreen: [0.028, 0.084, 0.050, 0, 0, 0.70, 0],  // provincial/regional route blade
   signWhite: [0.230, 0.233, 0.238, 0, 0, 0.72, 0],
   signRed: [0.250, 0.040, 0.034, 0, 0, 0.70, 0],
+  // Toronto's own street blade: white reflective sheet, blue legend and a blue border, with the
+  // heritage districts (Old Town, the Distillery, Yorkville) on a brown ground instead. The
+  // LETTERING is drawn by text.js into the signage mesh; these are the plates it sits on.
+  bladeWhite: [0.244, 0.247, 0.252, 0, 0, 0.66, 0],
+  bladeBlue: [0.022, 0.040, 0.112, 0, 0, 0.62, 0],
+  bladeBrown: [0.062, 0.040, 0.026, 0, 0, 0.70, 0],
   cabGrey: [0.086, 0.088, 0.090, 0, 0, 0.72, 0],
   cabGreen: [0.048, 0.068, 0.052, 0, 0, 0.72, 0],
   cabBeige: [0.110, 0.104, 0.088, 0, 0, 0.74, 0],
@@ -127,6 +134,14 @@ const M = {
   railGreen: [0.030, 0.058, 0.040, 0, 0, 0.66, 0],
   railMaroon: [0.086, 0.030, 0.032, 0, 0, 0.66, 0],
   chalk: [0.070, 0.068, 0.064, 0, 0, 0.92, 0],
+
+  // --- surveyed street furniture (the OSM node classes) --------------------
+  ttcRed: [0.252, 0.032, 0.030, 0, 0, 0.58, 0],         // TTC stop flag and subway pylon
+  ttcCream: [0.196, 0.192, 0.178, 0, 0, 0.76, 0],
+  vendFront: [0.046, 0.048, 0.054, 0, 0, 0.30, 0],      // vending machine glazing surround
+  slate: [0.058, 0.059, 0.062, 0, 0, 0.88, 0],          // asphalt shingle / slate roof
+  clayTile: [0.108, 0.058, 0.040, 0, 0, 0.86, 0],       // clay pantile
+  roofTin: [0.104, 0.106, 0.111, 0, 0, 0.48, 0],        // standing-seam metal roof
 
   // --- waterfront (CONTRACT §8.3) -----------------------------------------
   // Harbour hardware is a small, specific material set: cast iron that has been painted black
@@ -858,20 +873,89 @@ export function appendTrafficSignal(mb, x, y, z, yaw, armLen) {
   boxL(mb, px, py, pz, c, s, -0.075, 1.00, -0.30, 0.075, 1.22, -0.16, F_NOBOT);
 }
 
-// Street-name blades plus a regulatory plate. rng picks the plate.
-export function appendSignPost(mb, rng, x, y, z, yaw) {
+// Cap height of the legend on a street blade, and the margin each end of it. A Toronto blade is
+// 200 mm deep with a ~110 mm upper-case legend and a 12 mm blue border; at 0.115 m a name is
+// still four pixels of cap height from across the intersection, which is where you read it from.
+const BLADE_CAP = 0.115;
+const BLADE_MARGIN = 0.13;
+const BLADE_MIN = 0.62;
+const BLADE_MAX = 1.72;
+const BLADE_H = 0.20;
+
+/** How long a blade carrying `name` has to be, in metres. Pure — city.js sizes text to match. */
+export function bladeLength(font, name) {
+  const w = (font && typeof name === 'string' && name)
+    ? textWidth(font, name, BLADE_CAP) : 0.62;
+  return clamp(w + BLADE_MARGIN * 2, BLADE_MIN, BLADE_MAX);
+}
+
+// One blade: the white plate, its blue border returned round the edge, and the legend.
+// `alongZ` true means the blade lies along local Z, so its faces point along local +/-X; false is
+// the crossing one. `v0` is the underside of the plate and `half` is half its length.
+function blade(mb, px, py, pz, c, s, alongZ, v0, half, name, o) {
+  const t = 0.014;
+  const brown = !!(o && o.heritage);
+  setMat(mb, brown ? M.bladeBrown : M.bladeWhite);
+  if (alongZ) boxL(mb, px, py, pz, c, s, -t, v0, -half, t, v0 + BLADE_H, half, F_BLADEX);
+  else boxL(mb, px, py, pz, c, s, -half, v0, -t, half, v0 + BLADE_H, t, F_BLADEZ);
+  // The border, as two thin ribs proud of the plate rather than a painted margin: geometry reads
+  // at every time of day and a colour band on a coplanar face cannot.
+  setMat(mb, brown ? M.bladeWhite : M.bladeBlue);
+  const b = 0.017;
+  for (let k = 0; k < 2; k++) {
+    const vy = k === 0 ? v0 + 0.006 : v0 + BLADE_H - 0.006 - b;
+    if (alongZ) {
+      boxL(mb, px, py, pz, c, s, -t - 0.004, vy, -half, t + 0.004, vy + b, half, F_BLADEX);
+    } else {
+      boxL(mb, px, py, pz, c, s, -half, vy, -t - 0.004, half, vy + b, t + 0.004, F_BLADEZ);
+    }
+  }
+  if (!o || !o.textMb || !o.font || !name) return;
+  // Both faces get the legend, because a blade is read from either side of the street.
+  const ux = alongZ ? s : c;                 // world direction of the blade's long axis
+  const uz = alongZ ? c : -s;
+  const nx = alongZ ? c : s;                 // world direction of its face normal
+  const nz = alongZ ? -s : c;
+  const cy = py + v0 + BLADE_H * 0.5;
+  const face = t + 0.006;
+  const col = brown ? [0.235, 0.238, 0.244] : [0.020, 0.036, 0.104];
+  for (let k = 0; k < 2; k++) {
+    const sg = k === 0 ? 1 : -1;
+    appendText(o.textMb, o.font, name, {
+      x: px + nx * face * sg, y: cy, z: pz + nz * face * sg,
+      rx: ux * sg, ry: 0, rz: uz * sg,
+      nx: nx * sg, ny: 0, nz: nz * sg,
+      h: BLADE_CAP, align: ALIGN.CENTER, vAlign: VALIGN.MIDDLE,
+      maxWidth: half * 2 - BLADE_MARGIN * 2, minScale: 0.55, lift: 0.004,
+      r: col[0], g: col[1], b: col[2], rough: 0.62,
+    });
+  }
+}
+
+/**
+ * Street-name blades plus a regulatory plate. rng picks the plate — exactly one draw, whatever
+ * else is asked for, so a caller sharing one seeded stream across a tile is unaffected by
+ * whether this post happened to be named.
+ *
+ * opts: { a, b: the two street names (a runs along local Z, b across it), font, textMb, heritage }
+ * Omit opts and it is the plain post it always was, sized to a default blade.
+ */
+export function appendSignPost(mb, rng, x, y, z, yaw, opts) {
   const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
   const a = fin(yaw, 0);
   const c = Math.cos(a), s = Math.sin(a);
+  const o = opts || null;
+  const nameA = (o && typeof o.a === 'string') ? o.a : '';
+  const nameB = (o && typeof o.b === 'string') ? o.b : '';
+  const font = o ? o.font : null;
 
   setMat(mb, M.galv);
   mb.cylinder(px, py - 0.05, pz, 0.048, 0.042, 3.00, 4, a + Math.PI / 4, false);
   discY(mb, px, py + 2.95, pz, 0.055, 4, a + Math.PI / 4, true);
 
   // Crossed blades, the way Toronto hangs a street name over each approach.
-  setMat(mb, M.signGreen);
-  boxL(mb, px, py, pz, c, s, -0.013, 2.55, -0.50, 0.013, 2.78, 0.50, F_BLADEX);
-  boxL(mb, px, py, pz, c, s, -0.46, 2.28, -0.013, 0.46, 2.51, 0.013, F_BLADEZ);
+  blade(mb, px, py, pz, c, s, true, 2.55, bladeLength(font, nameA) * 0.5, nameA, o);
+  blade(mb, px, py, pz, c, s, false, 2.28, bladeLength(font, nameB) * 0.5, nameB, o);
 
   const roll = rnd(rng);
   if (roll < 0.72) {
@@ -4024,4 +4108,350 @@ export function appendAirfieldSign(mb, x, y, z, yaw, mandatory) {
   setMat(mb, mandatory ? M.signRed : M.signYellow);
   quadPX(mb, px, py, pz, c, s, 0.075, 0.47, -w + 0.07, 0.99, w - 0.07);
   quadNX(mb, px, py, pz, c, s, -0.075, 0.47, -w + 0.07, 0.99, w - 0.07);
+}
+
+/* ================================================ surveyed street furniture */
+// Everything below exists because data/toronto.json now carries 21,974 surveyed OSM NODES. These
+// are the classes the old procedural pass had no builder for at all — a subway entrance, a TTC
+// stop flag, a drinking fountain, a billboard — plus the wall-mounted fixtures the unit survey
+// turns out to be full of (231 vending machines, 65 ATMs, 58 payphones), which are premises in
+// OSM and street furniture in real life.
+//
+// Same rules as the rest of this file: albedo and roughness only, profile 0, emissive above 0.50
+// only where the real object is a lamp or an internally lit panel (CONTRACT Amendment 7).
+
+/**
+ * A real roof form standing on a flat extrusion cap. `w` runs along local X, `d` along local Z,
+ * `h` is the rise above (x, y, z) — which is the CENTRE of the cap, at cap level.
+ *
+ * The extrusion underneath keeps its flat cap: this sits ON it rather than replacing it, so a
+ * footprint whose ring the massing pass already triangulated needs no second treatment and there
+ * is never a hole where the two disagree. The eaves overhang by OVERHANG on all four sides,
+ * which is what stops a pitched roof reading as a folded lid.
+ *
+ * shape: 'gabled' | 'hipped' | 'half-hipped' | 'pyramidal' | 'skillion' | 'saltbox' |
+ *        'mansard' | 'round' | 'dome'. Anything else is treated as gabled.
+ * Cost: 24 verts pyramidal, 30 gabled, 36 hipped, 42 skillion, ~150 round.
+ * @returns {number} vertices appended
+ */
+export function appendPitchedRoof(mb, x, y, z, yaw, w, d, h, shape, mat) {
+  if (!mb) return 0;
+  const before = mb.count;
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const OVERHANG = 0.28;
+  const hw = clamp(fin(w, 6) * 0.5, 0.8, 90) + OVERHANG;
+  const hd = clamp(fin(d, 6) * 0.5, 0.8, 90) + OVERHANG;
+  const rise = clamp(fin(h, 2.4), 0.6, 22);
+  const k = typeof shape === 'string' ? shape : 'gabled';
+  setMat(mb, mat || M.slate);
+
+  // The fascia band under the eaves: the roof would otherwise float over the wall by OVERHANG
+  // with open air visible under it from the street.
+  const eave = 0.16;
+  boxL(mb, px, py, pz, c, s, -hw, -eave, -hd, hw, 0, hd, F_SIDES | F_NY);
+
+  if (k === 'pyramidal' || k === 'dome') {
+    const ap = k === 'dome' ? rise * 1.25 : rise;
+    triL(mb, px, py, pz, c, s, hw, 0, -hd, -hw, 0, -hd, 0, ap, 0);
+    triL(mb, px, py, pz, c, s, -hw, 0, hd, hw, 0, hd, 0, ap, 0);
+    triL(mb, px, py, pz, c, s, hw, 0, hd, hw, 0, -hd, 0, ap, 0);
+    triL(mb, px, py, pz, c, s, -hw, 0, -hd, -hw, 0, hd, 0, ap, 0);
+    return mb.count - before;
+  }
+
+  if (k === 'skillion' || k === 'saltbox' || k === 'quadruple_saltbo') {
+    // A saltbox is a gable with one long side; modelled as a mono-pitch plus the short back
+    // wall, which is what it reads as from the street.
+    quadL(mb, px, py, pz, c, s, -hw, 0, -hd, -hw, 0, hd, hw, rise, hd, hw, rise, -hd);
+    triL(mb, px, py, pz, c, s, -hw, 0, hd, hw, 0, hd, hw, rise, hd);
+    triL(mb, px, py, pz, c, s, hw, 0, -hd, -hw, 0, -hd, hw, rise, -hd);
+    quadL(mb, px, py, pz, c, s, hw, 0, hd, hw, 0, -hd, hw, rise, -hd, hw, rise, hd);
+    return mb.count - before;
+  }
+
+  if (k === 'round') {
+    // A barrel vault along local Z: a lathe of quads plus the two end lunettes.
+    const seg = 9;
+    let ax = hw, ay = 0;
+    for (let i = 1; i <= seg; i++) {
+      const t = (i / seg) * Math.PI;
+      const bx = Math.cos(t) * hw, by = Math.sin(t) * rise;
+      quadL(mb, px, py, pz, c, s, ax, ay, hd, ax, ay, -hd, bx, by, -hd, bx, by, hd);
+      triL(mb, px, py, pz, c, s, 0, 0, hd, ax, ay, hd, bx, by, hd);
+      triL(mb, px, py, pz, c, s, ax, ay, -hd, 0, 0, -hd, bx, by, -hd);
+      ax = bx; ay = by;
+    }
+    return mb.count - before;
+  }
+
+  // Gabled, and the hipped family. A hip pulls the ridge in from each end; a half-hip pulls it
+  // in half as far and leaves a small gable above it, which at this scale reads as a short hip.
+  let inset = 0;
+  if (k === 'hipped') inset = Math.min(hw, hd * 0.48);
+  else if (k === 'half-hipped' || k === 'mansard') inset = Math.min(hw * 0.55, hd * 0.30);
+  const rz = hd - inset;
+
+  quadL(mb, px, py, pz, c, s, hw, 0, hd, hw, 0, -hd, 0, rise, -rz, 0, rise, rz);
+  quadL(mb, px, py, pz, c, s, -hw, 0, -hd, -hw, 0, hd, 0, rise, rz, 0, rise, -rz);
+  if (inset > 0.02) {
+    triL(mb, px, py, pz, c, s, -hw, 0, hd, hw, 0, hd, 0, rise, rz);
+    triL(mb, px, py, pz, c, s, hw, 0, -hd, -hw, 0, -hd, 0, rise, -rz);
+  } else {
+    triL(mb, px, py, pz, c, s, -hw, 0, hd, hw, 0, hd, 0, rise, hd);
+    triL(mb, px, py, pz, c, s, hw, 0, -hd, -hw, 0, -hd, 0, rise, -hd);
+  }
+  return mb.count - before;
+}
+
+/**
+ * A TTC subway entrance: the low parapet walls round the stair head, three visible steps down
+ * into the dark, a flat canopy on two posts and the red pylon that carries the station name.
+ * The stair descends into geometry rather than into a hole in the terrain — the ground plane is
+ * a continuous sheet and cutting it per entrance is not worth a hole nobody can fall through.
+ *
+ * `name` letters the pylon when a font and a signage builder are supplied in opts.
+ * Cost: ~250 verts. @returns {number} vertices appended
+ */
+export function appendSubwayEntrance(mb, x, y, z, yaw, name, opts) {
+  if (!mb) return 0;
+  const before = mb.count;
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const o = opts || null;
+  const hw = 1.35, dp = 2.30;
+
+  // Parapets: three sides, open toward +X (the street).
+  setMat(mb, M.concrete);
+  boxL(mb, px, py, pz, c, s, -0.30, 0, -hw, dp, 0.98, -hw + 0.26, F_NOBOT);
+  boxL(mb, px, py, pz, c, s, -0.30, 0, hw - 0.26, dp, 0.98, hw, F_NOBOT);
+  boxL(mb, px, py, pz, c, s, -0.30, 0, -hw, -0.04, 0.98, hw, F_NOBOT);
+  setMat(mb, M.railSilver);
+  for (let k = 0; k < 2; k++) {
+    const lz = k === 0 ? -hw + 0.13 : hw - 0.13;
+    boxL(mb, px, py, pz, c, s, -0.30, 0.98, lz - 0.03, dp, 1.04, lz + 0.03, F_NOBOT);
+  }
+
+  // The stair: three treads and then a dark plane. Nothing below ground level.
+  setMat(mb, M.concrete);
+  for (let i = 0; i < 3; i++) {
+    const x0 = dp - (i + 1) * 0.34;
+    boxL(mb, px, py, pz, c, s, x0, -0.02 - i * 0.17, -hw + 0.26, x0 + 0.34,
+      0.04 - i * 0.17, hw - 0.26, F_PY | F_PX);
+  }
+  setMat(mb, M.dark);
+  quadPX(mb, px, py, pz, c, s, -0.02, -0.50, -hw + 0.26, 0.98, hw - 0.26);
+
+  // Canopy on two posts, and the pylon.
+  setMat(mb, M.poleGrey);
+  for (let k = 0; k < 2; k++) {
+    const lz = k === 0 ? -hw + 0.16 : hw - 0.16;
+    boxL(mb, px, py, pz, c, s, dp - 0.16, 0, lz - 0.06, dp - 0.04, 2.62, lz + 0.06, F_SIDES);
+  }
+  setMat(mb, M.alum);
+  boxL(mb, px, py, pz, c, s, -0.44, 2.62, -hw - 0.16, dp + 0.16, 2.78, hw + 0.16, F_NOBOT);
+  setMat(mb, M.ttcRed);
+  boxL(mb, px, py, pz, c, s, dp + 0.10, 0, -0.30, dp + 0.28, 3.35, 0.30, F_NOBOT);
+  setMat(mb, M.dark);
+  boxL(mb, px, py, pz, c, s, dp + 0.06, 2.55, -0.26, dp + 0.32, 3.25, 0.26, F_PLATEX);
+
+  if (o && o.textMb && o.font && typeof name === 'string' && name) {
+    const nx = c, nz = -s;                                  // world direction of local +X
+    const ux = -s, uz = -c;                                 // world direction of local +Z
+    for (let k = 0; k < 2; k++) {
+      const sg = k === 0 ? 1 : -1;
+      const lx = k === 0 ? dp + 0.34 : dp + 0.04;           // just outside each face of the plate
+      appendText(o.textMb, o.font, name, {
+        x: px + nx * lx, y: py + 2.90, z: pz + nz * lx,
+        rx: ux * sg, ry: 0, rz: uz * sg, nx: nx * sg, ny: 0, nz: nz * sg,
+        h: 0.13, align: ALIGN.CENTER, vAlign: VALIGN.MIDDLE,
+        maxWidth: 0.50, minScale: 0.5, lift: 0.006,
+        r: 0.240, g: 0.243, b: 0.248, rough: 0.60,
+      });
+    }
+  }
+  return mb.count - before;
+}
+
+/**
+ * A TTC stop: the pole and the red flag sign, with the route number lettered on it. This is the
+ * single most common transit object on the street — 304 bus stops and 287 streetcar stops in the
+ * survey — and until now the city had shelters and no stops.
+ * Cost: ~90 verts. @returns {number} vertices appended
+ */
+export function appendStopFlag(mb, x, y, z, yaw, label, opts) {
+  if (!mb) return 0;
+  const before = mb.count;
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const o = opts || null;
+
+  setMat(mb, M.poleGrey);
+  mb.cylinder(px, py - 0.05, pz, 0.045, 0.040, 2.95, 6, a, false);
+  discY(mb, px, py + 2.90, pz, 0.040, 6, a, true);
+  setMat(mb, M.ttcRed);
+  boxL(mb, px, py, pz, c, s, -0.012, 2.06, -0.22, 0.012, 2.76, 0.22, F_BLADEX);
+  setMat(mb, M.ttcCream);
+  boxL(mb, px, py, pz, c, s, -0.018, 2.12, -0.17, 0.018, 2.44, 0.17, F_PLATEX);
+
+  if (o && o.textMb && o.font && typeof label === 'string' && label) {
+    const nx = c, nz = -s;
+    const ux = -s, uz = -c;
+    for (let k = 0; k < 2; k++) {
+      const sg = k === 0 ? 1 : -1;
+      appendText(o.textMb, o.font, label, {
+        x: px + nx * 0.026 * sg, y: py + 2.28, z: pz + nz * 0.026 * sg,
+        rx: ux * sg, ry: 0, rz: uz * sg, nx: nx * sg, ny: 0, nz: nz * sg,
+        h: 0.15, align: ALIGN.CENTER, vAlign: VALIGN.MIDDLE,
+        maxWidth: 0.30, minScale: 0.5, lift: 0.005,
+        r: 0.030, g: 0.032, b: 0.036, rough: 0.62,
+      });
+    }
+  }
+  return mb.count - before;
+}
+
+/** A cast drinking fountain: pedestal, bowl and bubbler. 62 verts. */
+export function appendDrinkingFountain(mb, x, y, z, yaw) {
+  if (!mb) return 0;
+  const before = mb.count;
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  setMat(mb, M.castIron);
+  mb.cylinder(px, py - 0.03, pz, 0.19, 0.15, 0.86, 7, a, false);
+  setMat(mb, M.railSilver);
+  mb.cylinder(px, py + 0.83, pz, 0.24, 0.24, 0.10, 7, a, true);
+  setMat(mb, M.dark);
+  discY(mb, px, py + 0.905, pz, 0.18, 7, a, true);
+  setMat(mb, M.chrome);
+  mb.cylinder(px + Math.cos(a) * 0.11, py + 0.93, pz - Math.sin(a) * 0.11, 0.02, 0.02, 0.10, 4, a, true);
+  return mb.count - before;
+}
+
+/** A hoarding-scale advertising billboard on two posts. ~90 verts. */
+export function appendBillboard(mb, rng, x, y, z, yaw) {
+  if (!mb) return 0;
+  const before = mb.count;
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const w = rr(rng, 2.6, 3.4);
+  const h = rr(rng, 1.7, 2.3);
+  const base = 2.4;
+  setMat(mb, M.galv);
+  for (let k = 0; k < 2; k++) {
+    const lz = (k === 0 ? -1 : 1) * (w - 0.5);
+    boxL(mb, px, py, pz, c, s, -0.07, 0, lz - 0.07, 0.07, base + 0.3, lz + 0.07, F_SIDES);
+  }
+  setMat(mb, M.dark);
+  boxL(mb, px, py, pz, c, s, -0.09, base, -w, 0.09, base + h, w, F_NOBOT);
+  // The poster itself: an internally lit panel, so it is a genuine emitter and the renderer
+  // decides when it is on.
+  setMat(mb, M.adPanel);
+  quadPX(mb, px, py, pz, c, s, 0.095, base + 0.09, -w + 0.09, base + h - 0.09, w - 0.09);
+  return mb.count - before;
+}
+
+/** A Morris-column advertising drum. ~80 verts. */
+export function appendAdColumn(mb, x, y, z) {
+  if (!mb) return 0;
+  const before = mb.count;
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  setMat(mb, M.castIron);
+  mb.cylinder(px, py - 0.04, pz, 0.62, 0.58, 0.42, 10, 0, false);
+  setMat(mb, M.adPanel);
+  mb.cylinder(px, py + 0.38, pz, 0.58, 0.58, 2.30, 10, 0, false);
+  setMat(mb, M.castIron);
+  mb.cylinder(px, py + 2.68, pz, 0.66, 0.30, 0.44, 10, 0, true);
+  return mb.count - before;
+}
+
+/** A glass-fronted vending machine set against a wall; local +X faces the street. 48 verts. */
+export function appendVendingMachine(mb, rng, x, y, z, yaw) {
+  if (!mb) return 0;
+  const before = mb.count;
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const w = rr(rng, 0.50, 0.62);
+  setMat(mb, M.vendFront);
+  boxL(mb, px, py, pz, c, s, 0, 0, -w, 0.72, 1.86, w, F_NOBOT);
+  setMat(mb, M.adPanel);
+  quadPX(mb, px, py, pz, c, s, 0.725, 0.42, -w + 0.06, 1.72, w - 0.06);
+  return mb.count - before;
+}
+
+/** A payphone hood on a post. 44 verts. */
+export function appendPayphone(mb, x, y, z, yaw) {
+  if (!mb) return 0;
+  const before = mb.count;
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  setMat(mb, M.poleGrey);
+  boxL(mb, px, py, pz, c, s, -0.05, 0, -0.05, 0.05, 1.02, 0.05, F_SIDES);
+  setMat(mb, M.alum);
+  boxL(mb, px, py, pz, c, s, -0.16, 1.02, -0.31, 0.24, 1.92, 0.31, F_NOBOT);
+  setMat(mb, M.dark);
+  quadPX(mb, px, py, pz, c, s, 0.245, 1.16, -0.25, 1.80, 0.25);
+  return mb.count - before;
+}
+
+/**
+ * A bike corral: `n` of Toronto's ring-and-post racks in a row along local Z, at the real
+ * 0.9 m pitch. OSM maps a whole corral as one node, so one node is a rack of bikes, not a ring.
+ * @returns {number} vertices appended
+ */
+export function appendBikeCorral(mb, x, y, z, yaw, n) {
+  if (!mb) return 0;
+  const before = mb.count;
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const k = clamp(Math.round(fin(n, 1)), 1, 6) | 0;
+  for (let i = 0; i < k; i++) {
+    const lz = (i - (k - 1) * 0.5) * 0.92;
+    appendBikeRing(mb, px + lz * s, py, pz + lz * c, a);
+  }
+  return mb.count - before;
+}
+
+/** A timber utility pole with a crossarm — the OSM man_made=utility_pole class. ~70 verts. */
+export function appendUtilityPole(mb, x, y, z, yaw, h) {
+  if (!mb) return 0;
+  const before = mb.count;
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const a = finAngle(yaw, 0);
+  const c = Math.cos(a), s = Math.sin(a);
+  const hh = clamp(fin(h, 9.0), 4.0, 14.0);
+  setMat(mb, M.pileTimber);
+  mb.cylinder(px, py - 0.10, pz, 0.135, 0.098, hh, 6, a, false);
+  discY(mb, px, py + hh - 0.10, pz, 0.098, 6, a, true);
+  boxL(mb, px, py, pz, c, s, -0.055, hh - 1.10, -1.05, 0.055, hh - 0.98, 1.05, F_NOBOT);
+  setMat(mb, M.glass);
+  for (let i = 0; i < 3; i++) {
+    const lz = (i - 1) * 0.82;
+    boxL(mb, px, py, pz, c, s, -0.05, hh - 0.98, lz - 0.05, 0.05, hh - 0.83, lz + 0.05, F_NOBOT);
+  }
+  return mb.count - before;
+}
+
+/** A low civic fountain basin with a still water disc and a centre jet. ~90 verts. */
+export function appendFountainBasin(mb, x, y, z, r) {
+  if (!mb) return 0;
+  const before = mb.count;
+  const px = fin(x, 0), py = fin(y, 0), pz = fin(z, 0);
+  const rr0 = clamp(fin(r, 1.4), 0.6, 6.0);
+  setMat(mb, M.granite);
+  mb.cylinder(px, py - 0.04, pz, rr0, rr0, 0.46, 12, 0, false);
+  mb.cylinder(px, py + 0.42, pz, rr0, rr0 - 0.16, 0.06, 12, 0, true);
+  // The water: dark, mirror-smooth and NOT emissive — it is a surface, not a lamp.
+  setMat(mb, M.glass);
+  discY(mb, px, py + 0.34, pz, rr0 - 0.17, 12, 0, true);
+  setMat(mb, M.granite);
+  mb.cylinder(px, py + 0.34, pz, rr0 * 0.18, rr0 * 0.12, 0.34, 8, 0, true);
+  return mb.count - before;
 }

@@ -31,7 +31,7 @@
 // and city.js guarantees that no profile-0 surface carries facade-hint emissive, so the shader
 // can never paint an office grid onto the Rogers Centre dome.
 
-import { Mesh, MeshBuilder } from './gl.js';
+import { Mesh, MeshBuilder, VERT_FLOATS } from './gl.js';
 import { clamp, lerp, smoothstep, makeRng, TAU } from './math.js';
 import {
   appendCobraLamp, appendAcornLamp, appendPedestrianLamp, appendCatenaryPole,
@@ -44,11 +44,21 @@ import {
   appendFerryDock, appendRailCar, appendPatioSet, appendSandwichBoard, appendDumpster,
   appendACondenser, appendFlagPole, appendScaffold,
   appendPedestrian, appendPedestrianGroup, appendCyclist, appendDogWalker,
+  // Surveyed street furniture: the classes the OSM node extract turned out to hold and the
+  // procedural pass had no builder for at all.
+  appendPitchedRoof, appendSubwayEntrance, appendStopFlag, appendDrinkingFountain,
+  appendBillboard, appendAdColumn, appendBikeCorral, appendUtilityPole, appendFountainBasin,
+  appendVendingMachine, appendPayphone,
 } from './props.js';
 import {
-  appendGroundFloor, appendBalconyBand, appendCornice, appendStringCourse, appendFireEscape,
+  appendBalconyBand, appendCornice, appendStringCourse, appendFireEscape,
   appendLoadingDock, appendParapet, facadeAudit, resetFacadeAudit,
+  // The block-face and unit model (CONTRACT §6.2, extended for the surveyed unit data).
+  appendUnitFront, appendCornerEntrance, appendWallFixture, unitKindOf, unitStyle,
 } from './facades.js';
+// SIGNAGE. Glyph geometry for shop fascias, house numbers and street blades. It goes into its
+// own material class because render.js draws it with its own blended decal pass.
+import { getFont, TEXT_RANGE, TEXT_DROP } from './text.js';
 // HARBOURFRONT (CONTRACT §8.3). The surveyed shoreline, the quay wall and everything on the
 // water live in their own module; city.js only calls into it, at the four points marked
 // "harbourfront" below.
@@ -157,6 +167,9 @@ const WIRE_SAG = 0.16;
 
 const LAMP_SPACING = { motorway: 55, major: 28, minor: 40 };
 const ACORN_SPACING = 55;
+// Pedestrian streets and squares. Tighter than a side street's 40 m because the post is short and
+// the whole width is walked, so the pools have to overlap rather than merely dot the route.
+const PED_LAMP_SPACING = 32;
 const TREE_SPACING = 54;
 const BIN_SPACING = 260;
 const BENCH_SPACING = 430;
@@ -177,10 +190,17 @@ const LOT_FILL = 0.55;
 
 // Heritage lighting districts, local metres (X east, Z south): St Lawrence / Old Town, the
 // Distillery approach, and the Front St / Union frontage.
+// Heritage lighting districts: where the city fits acorn globes instead of cobra heads. Circles
+// in local metres, [x, z, radius].
 const ACORN_ZONES = [
   [1180, -430, 470],
   [1490, -250, 300],
   [180, -220, 330],
+  // THE DISTILLERY DISTRICT. Toronto's largest surviving Victorian industrial quarter and the one
+  // place downtown that is lit entirely by heritage globes — Trinity Street, Tank House Lane,
+  // Gristmill Lane and Case Goods Lane are pedestrian setts with acorn posts down both sides. It
+  // was outside every zone above, which left the whole quarter with no street lighting at all.
+  [2205, -1700, 210],
 ];
 
 // Streets that actually carry painted bike lanes downtown.
@@ -2984,6 +3004,59 @@ function noteProp(C, kind) {
   C.stats.props[kind] = (C.stats.props[kind] || 0) + 1;
 }
 
+/**
+ * Record a real light source at its LENS — the point light goes where the luminaire is, never at
+ * the foot of its post (render.js setLights(), which says so explicitly: a light at the base of a
+ * mast lights the mast).
+ *
+ * WHY THIS EXISTS. Until now a street lamp was geometry and nothing else. The renderer has had a
+ * clustered local-light rig the whole time and no caller ever registered anything with it, so
+ * `lightStats.registered` sat at 0 and the night image had exactly one light in it: the sky. The
+ * road went black, the lamps glowed without illuminating, and walking Queen Street at 23:30 read
+ * as a power cut rather than as Toronto.
+ *
+ * DETERMINISM AND TILES. Tiles build lazily, in any order, and a tile that is evicted and rebuilt
+ * runs this again. The key is quantised WORLD POSITION plus kind (CONTRACT §8.4 — never an array
+ * index), so the same lamp registers once no matter how many times its tile is rebuilt and the
+ * set is identical whichever order the tiles arrived in.
+ *
+ * TIME OF DAY. Nothing here decides WHEN a lamp is on (CONTRACT Amendment 7); it says only that a
+ * luminaire exists at this point. The renderer's own night ramp owns the switch, and the rig is
+ * measurably dark at Afternoon: 0 lights uploaded, against 512 at Night.
+ */
+function noteLight(C, kind, x, y, z) {
+  if (!C.lampList || !isNum(x) || !isNum(y) || !isNum(z)) return;
+  const key = kind + '|' + Math.round(x * 4) + '|' + Math.round(y * 4) + '|' + Math.round(z * 4);
+  if (C.lampKey.has(key)) return;
+  C.lampKey.add(key);
+  C.lampList.push({ x, y, z, kind });
+  C.lampsDirty = true;
+}
+
+/*
+ * The three lamp builders, each paired with the light it actually casts.
+ *
+ * These exist so a luminaire's GEOMETRY and its LENS POSITION are written in one place. The offsets
+ * below are read straight off props.js: a cobra's LED head spans local x 2.28..3.36 at mast + 0.70,
+ * a pedestrian head spans 0.56..0.96 at mast + 0.06, and an acorn's globe sits 0.56 m below its
+ * finial. props.js's local frame puts "forward" at (cos yaw, -sin yaw) in world XZ — the same
+ * convention the boom-aim audit above uses.
+ */
+function lampCobra(C, mb, x, base, z, yaw, mast) {
+  appendCobraLamp(mb, x, base, z, yaw, mast);
+  noteLight(C, 'cobra', x + Math.cos(yaw) * 2.82, base + mast + 0.70, z - Math.sin(yaw) * 2.82);
+}
+
+function lampPedestrian(C, mb, x, base, z, yaw, mast) {
+  appendPedestrianLamp(mb, x, base, z, yaw, mast);
+  noteLight(C, 'ped', x + Math.cos(yaw) * 0.76, base + mast + 0.06, z - Math.sin(yaw) * 0.76);
+}
+
+function lampAcorn(C, mb, x, base, z, mast) {
+  appendAcornLamp(mb, x, base, z, mast);
+  noteLight(C, 'acorn', x, base + mast - 0.56, z);
+}
+
 function inAcornZone(x, z) {
   for (let i = 0; i < ACORN_ZONES.length; i++) {
     const a = ACORN_ZONES[i];
@@ -5408,6 +5481,9 @@ const PROP_H = {
   sandwichBoard: 1.3, patioSet: 2.6, dumpster: 2.0, scaffold: 6.8, crane: 96.0, flagPole: 12.5,
   parkedCar: 2.1, lotCar: 2.1, railCar: 5.2, ferryDock: 4.0, boat: 6.0, grate: 0.1, manhole: 0.1,
   pedestrian: 2.1, cyclist: 2.2, dogWalker: 2.1,
+  // Surveyed classes (data/toronto.json pois[]).
+  drinkingFountain: 1.1, fountainBasin: 1.0, billboard: 5.0, adColumn: 3.3, utilityPole: 12.0,
+  stopFlag: 3.1, subwayEntrance: 3.6, vendingMachine: 2.0, payphone: 2.1,
 };
 
 // Soffit interpolation along one filed segment: [ax, az, bx, bz, halfWidth, soffitA, soffitB].
@@ -5490,7 +5566,7 @@ function placeDeckLamps(C, rec) {
     const yaw = Math.atan2(m.sz * sg, -m.sx * sg);
     const tipX = x + Math.cos(yaw) * 3.3, tipZ = z - Math.sin(yaw) * 3.3;
     if (Math.hypot(tipX - m.x, tipZ - m.z) >= Math.hypot(x - m.x, z - m.z)) C.stats.boomsMisaimed++;
-    appendCobraLamp(mbP, x, y, z, yaw, want);
+    lampCobra(C, mbP, x, y, z, yaw, want);
     noteProp(C, 'cobraLamp');
     C.stats.deck.deckLamps++;
     C.auditDeck.push(x, z, y, top);
@@ -5512,17 +5588,38 @@ function placeFurniture(C, rec) {
   // An elevated carriageway is lit from its own deck, not from the ground eight metres below it.
   if (rec.bridge) { placeDeckLamps(C, rec); return; }
 
-  const spacing = heritage ? ACORN_SPACING : LAMP_SPACING[cls];
+  // A PEDESTRIAN STREET IS STILL LIT. `LAMP_SPACING` had no 'pedestrian' entry, so every
+  // pedestrianised way in the city — Trinity Street and the Distillery lanes, the Queens Quay
+  // promenade, the Kensington closures, every square and mews — fell out of this branch entirely
+  // and got no luminaire of any kind. At night those became the darkest ground in the world while
+  // the shops either side of them glowed, which is the exact inverse of what they look like. They
+  // are lit from posts at pedestrian scale, so they get the pitch a footway gets, not an
+  // arterial's.
+  //
+  // 'pedestrian' ONLY, deliberately. The extract also carries 14,185 'foot' ways and 3,289
+  // 'service' ways, and neither wants this: a footway is the pavement beside a carriageway that
+  // is already lit from its own masts, and a service way is a Toronto laneway, which really is
+  // unlit. Lighting either would double every arterial's lamps and put a post down every alley.
+  const pedWay = cls === 'pedestrian';
+  const spacing = pedWay ? PED_LAMP_SPACING : (heritage ? ACORN_SPACING : LAMP_SPACING[cls]);
   if (spacing && rec.len > spacing * 0.6) {
-    const kerb = hw + 1.55;
+    // On a carriageway the post stands BEYOND the kerb, on the pavement. On a pedestrian street
+    // there is no carriageway to stand clear of and the whole width is walked, so the post sits
+    // just inside the edge — pushing it out by 1.55 m there would plant it in the shopfronts.
+    const kerb = pedWay ? Math.max(0.9, hw - 0.75) : hw + 1.55;
     let side = 1;
     for (let s = spacing * 0.5; s < rec.len; s += spacing) {
       const m = recSample(rec, s);
       const o = kerb * side;
       side = -side;
       const x = m.x + m.sx * o, z = m.z + m.sz * o;
-      let kind = heritage ? 'acornLamp' : (cls === 'minor' ? 'pedestrianLamp' : 'cobraLamp');
-      let mast = heritage ? 4.6 : (cls === 'minor' ? 5.2 : (cls === 'motorway' ? 12.0 : 9.6));
+      // THE METRONOME STOPS WHERE THE SURVEY STARTS. 1,403 lamp positions are real; on the
+      // streets they cover, the fixed pitch would put a second mast between every pair of them.
+      if (surveyCovers(C, 'lamp', x, z)) { C.stats.survey.suppressed++; continue; }
+      let kind = heritage ? 'acornLamp'
+        : ((cls === 'minor' || pedWay) ? 'pedestrianLamp' : 'cobraLamp');
+      let mast = heritage ? 4.6
+        : ((cls === 'minor' || pedWay) ? 5.2 : (cls === 'motorway' ? 12.0 : 9.6));
       let over = LAMP_OVER[kind];
       // Under a deck the fixture is not skipped, it is SHORTENED: the real Lake Shore runs low
       // mast lighting under the Gardiner, and a dark street under an expressway is its own bug.
@@ -5535,10 +5632,15 @@ function placeFurniture(C, rec) {
         mast = Math.min(mast, fit);
         C.stats.deck.propsShortened++;
       }
-      const y = reserve(C, kind, x, z, 0.85, 0.35, mast + over);
+      // roadPad -1 on a pedestrian street: reserve() refuses any site that lands ON a carriageway,
+      // and a pedestrianised way is still a carriageway RECORD, so every post along one was being
+      // refused by the test meant to keep masts out of traffic. There is no traffic to keep them
+      // out of here — the paved width IS the walking surface — so the test is skipped, exactly as
+      // it is for the other props that legitimately stand on a roadway.
+      const y = reserve(C, kind, x, z, 0.85, pedWay ? -1 : 0.35, mast + over);
       if (!isNum(y)) continue;
       const base = y + kerbSeat(C, x, z);
-      if (kind === 'acornLamp') { appendAcornLamp(mbP, x, base, z, mast); continue; }
+      if (kind === 'acornLamp') { lampAcorn(C, mbP, x, base, z, mast); continue; }
       // The boom reaches from the kerb back out over the carriageway.
       const sg = o < 0 ? -1 : 1;
       const yaw = Math.atan2(m.sz * sg, -m.sx * sg);
@@ -5546,8 +5648,8 @@ function placeFurniture(C, rec) {
       // city has its lamps hanging over the shopfronts.
       const tipX = x + Math.cos(yaw) * 3.3, tipZ = z - Math.sin(yaw) * 3.3;
       if (Math.hypot(tipX - m.x, tipZ - m.z) >= Math.hypot(x - m.x, z - m.z)) C.stats.boomsMisaimed++;
-      if (kind === 'pedestrianLamp') appendPedestrianLamp(mbP, x, base, z, yaw, mast);
-      else appendCobraLamp(mbP, x, base, z, yaw, mast);
+      if (kind === 'pedestrianLamp') lampPedestrian(C, mbP, x, base, z, yaw, mast);
+      else lampCobra(C, mbP, x, base, z, yaw, mast);
     }
   }
 
@@ -5563,43 +5665,49 @@ function placeFurniture(C, rec) {
 
     // Every piece faces the street: local +X is "out" by the props.js contract, and out of a
     // sidewalk means across the kerb.
-    const gen = (kind, pitch, phase, radius, fn) => {
+    // `survey` is the POI class that OWNS this furniture class. Where a surveyed item of that
+    // class is already within its suppression radius, the fixed-pitch pass stands down; the
+    // result is that a street the survey reached is furnished from the survey and a street it
+    // did not is furnished plausibly, with no visible boundary between them.
+    const gen = (kind, pitch, phase, radius, survey, fn) => {
       if (pitch <= 0 || rec.len < pitch * 0.35) return;
       for (let s = phase % pitch; s < rec.len; s += pitch) {
         const m = recSample(rec, s);
         const x = m.x + m.sx * o, z = m.z + m.sz * o;
+        if (survey && surveyCovers(C, survey, x, z)) { C.stats.survey.suppressed++; continue; }
         const y = reserve(C, kind, x, z, radius, 0.35);
         if (!isNum(y)) continue;
+        C.stats.survey.fallback++;
         fn(x, y + kerbSeat(C, x, z), z, Math.atan2(m.sz * sgn, -m.sx * sgn));
       }
     };
 
-    gen('litterBin', BIN_SPACING, 18 + sd * 47, 0.72,
+    gen('litterBin', BIN_SPACING, 18 + sd * 47, 0.72, 'bin',
       (x, y, z, yaw) => appendLitterBin(mbP, x, y, z, yaw));
-    gen('bench', BENCH_SPACING, 55 + sd * 63, 1.15, (x, y, z, yaw) => {
+    gen('bench', BENCH_SPACING, 55 + sd * 63, 1.15, 'bench', (x, y, z, yaw) => {
       appendBench(mbP, x, y, z, yaw);
       C.benches.push({ x, y, z, yaw });
     });
-    gen('bikeRing', RING_SPACING, 33 + sd * 31, 0.45,
+    gen('bikeRing', RING_SPACING, 33 + sd * 31, 0.45, 'bikepark',
       (x, y, z, yaw) => appendBikeRing(mbP, x, y, z, yaw));
-    gen('hydrant', HYDRANT_SPACING, 12 + sd * 35, 0.42,
+    gen('hydrant', HYDRANT_SPACING, 12 + sd * 35, 0.42, 'hydrant',
       (x, y, z, yaw) => appendHydrant(mbP, x, y, z, yaw));
-    gen('planter', PLANTER_SPACING, 76 + sd * 84, 0.9,
+    gen('planter', PLANTER_SPACING, 76 + sd * 84, 0.9, '',
       (x, y, z) => appendPlanter(mbP, rng, x, y, z, 1.05 + rng() * 0.5));
-    gen('parkingMachine', METER_SPACING, 41 + sd * 56, 0.45,
+    gen('parkingMachine', METER_SPACING, 41 + sd * 56, 0.45, '',
       (x, y, z, yaw) => appendParkingMachine(mbP, x, y, z, yaw));
-    gen('newsBox', NEWSBOX_SPACING, 96 + sd * 107, 0.45,
+    gen('newsBox', NEWSBOX_SPACING, 96 + sd * 107, 0.45, '',
       (x, y, z, yaw) => appendNewsBox(mbP, rng, x, y, z, yaw));
-    gen('mailbox', MAILBOX_SPACING, 140 + sd * 215, 0.6,
+    gen('mailbox', MAILBOX_SPACING, 140 + sd * 215, 0.6, 'postbox',
       (x, y, z, yaw) => appendMailbox(mbP, x, y, z, yaw));
-    gen('utilityBox', CABINET_SPACING, 118 + sd * 134, 0.9,
+    gen('utilityBox', CABINET_SPACING, 118 + sd * 134, 0.9, 'cabinet',
       (x, y, z, yaw) => appendUtilityBox(mbP, rng, x, y, z, yaw));
     if (rec.commercial && cls !== 'minor') {
-      gen('streetTree', TREE_SPACING, 9 + sd * 13, 1.30,
+      gen('streetTree', TREE_SPACING, 9 + sd * 13, 1.30, 'tree',
         (x, y, z) => appendStreetTree(mbP, rng, x, y, z, 0.88 + rng() * 0.5));
     }
     if (cls === 'major' && rec.commercial) {
-      gen('bollard', 380, 21 + sd * 19, 0.35, (x, y, z) => appendBollard(mbP, x, y, z));
+      gen('bollard', 380, 21 + sd * 19, 0.35, 'bollard', (x, y, z) => appendBollard(mbP, x, y, z));
     }
 
     // Gutter hardware. The catch basin sits against the kerb face; it and the manhole below are
@@ -5628,13 +5736,320 @@ function placeFurniture(C, rec) {
   }
 }
 
+/* =========================================== surveyed street furniture == */
+//
+// data/toronto.json now carries 21,974 standalone OSM NODES in local metres — 8,032 trees, 3,717
+// crossings, 2,000 bike parking stands, 1,862 benches, 1,403 street lamps, 1,142 hydrants, 842
+// bins, 573 signals, and the transit stops, postboxes, bollards, fountains and billboards between
+// them. Everything below puts them where they REALLY ARE. The procedural pass that used to place
+// all of it on a fixed pitch is kept, because the survey covers a fraction of the map and a
+// street that suddenly loses its lamps is worse than a street lit on a metronome — but it is
+// SUPPRESSED wherever the survey speaks, so the two never appear side by side and the seam
+// between them is not visible (CONTRACT Amendment 9).
+
+// kind -> how the class is placed. `prop` is the counter name (and the PROP_H entry that decides
+// whether it fits under a deck), `r` its occupancy radius, `road` the carriageway pad (negative
+// for the classes that legitimately stand on one).
+const POI_PLACE = {
+  tree: { prop: 'streetTree', r: 1.25, road: 0.5 },
+  lamp: { prop: 'pedestrianLamp', r: 0.85, road: 0.35 },
+  bench: { prop: 'bench', r: 1.10, road: 0.35 },
+  bin: { prop: 'litterBin', r: 0.70, road: 0.35 },
+  recycling: { prop: 'litterBin', r: 0.70, road: 0.35 },
+  hydrant: { prop: 'hydrant', r: 0.42, road: 0.35 },
+  bikepark: { prop: 'bikeRing', r: 0.85, road: 0.35 },
+  bikeshare: { prop: 'bikeRing', r: 1.60, road: 0.35 },
+  postbox: { prop: 'mailbox', r: 0.60, road: 0.35 },
+  bollard: { prop: 'bollard', r: 0.35, road: -1 },
+  cabinet: { prop: 'utilityBox', r: 0.90, road: 0.35 },
+  flagpole: { prop: 'flagPole', r: 0.55, road: 0.35 },
+  water: { prop: 'drinkingFountain', r: 0.45, road: 0.35 },
+  fountain: { prop: 'fountainBasin', r: 1.80, road: 0.6 },
+  billboard: { prop: 'billboard', r: 1.20, road: 0.5 },
+  adcolumn: { prop: 'adColumn', r: 0.80, road: 0.4 },
+  pole: { prop: 'utilityPole', r: 0.55, road: 0.35 },
+  busstop: { prop: 'stopFlag', r: 0.50, road: 0.30 },
+  tramstop: { prop: 'stopFlag', r: 0.50, road: -1 },
+  subway: { prop: 'subwayEntrance', r: 2.60, road: 0.8 },
+};
+
+// How far a surveyed item of a class reaches when it silences the procedural pass. Roughly the
+// pitch the procedural pass uses for that class, so one surveyed lamp switches off the metronome
+// lamp that would have stood where it does and no further.
+const POI_SUPPRESS = {
+  lamp: 24, tree: 13, bench: 12, bin: 14, hydrant: 26, bikepark: 12, postbox: 34,
+  cabinet: 17, bollard: 9, flagpole: 22,
+};
+
+/** Is there a surveyed item of `kind` within `r` of (x, z)? */
+function surveyedNear(C, kind, x, z, r) {
+  const idx = C.poiIdx;
+  if (!idx || !(r > 0)) return false;
+  const r2 = r * r;
+  let hit = false;
+  idx.query(x, z, r, (p) => {
+    if (hit || p.k !== kind) return;
+    const dx = p.x - x, dz = p.z - z;
+    if (dx * dx + dz * dz < r2) { hit = true; return false; }
+  });
+  return hit;
+}
+
+/** The procedural pass asks this before every item it would place on a fixed pitch. */
+function surveyCovers(C, cls, x, z) {
+  const r = POI_SUPPRESS[cls];
+  return r ? surveyedNear(C, cls, x, z, r) : false;
+}
+
+// Yaw for a surveyed item: it should face the street it stands beside, which is the direction
+// from the nearest carriageway centreline out to the item.
+function poiYaw(C, x, z) {
+  let best = 30 * 30;
+  let bx = 0, bz = 0, got = false;
+  C.roadIdx.query(x, z, 30, (sg) => {
+    const dx = sg[2] - sg[0], dz = sg[3] - sg[1];
+    const l2 = dx * dx + dz * dz;
+    let t = 0;
+    if (l2 > EPS) t = clamp(((x - sg[0]) * dx + (z - sg[1]) * dz) / l2, 0, 1);
+    const qx = sg[0] + dx * t, qz = sg[1] + dz * t;
+    const d2 = (x - qx) * (x - qx) + (z - qz) * (z - qz);
+    if (d2 < best) { best = d2; bx = x - qx; bz = z - qz; got = true; }
+  });
+  if (!got) return hash2(x, z, 91) * TAU - Math.PI;
+  const l = Math.hypot(bx, bz);
+  if (!(l > EPS)) return hash2(x, z, 91) * TAU - Math.PI;
+  // props.js: local +X points along (cos yaw, -sin yaw), and "out" for a kerbside prop is away
+  // from the carriageway.
+  return Math.atan2(-bz / l, bx / l);
+}
+
+/**
+ * Build one tile's worth of surveyed furniture. Runs BEFORE the procedural pass so the real
+ * positions claim their sites first and the fixed-pitch pass fills only what is left.
+ */
+function placeSurveyedFurniture(C, list) {
+  if (!list || !list.length) return;
+  const mbP = C.mb.props;
+  const rng = C.rng;
+  const S = C.stats.survey;
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    const spec = POI_PLACE[p.k];
+    if (!spec) continue;
+    const x = p.x, z = p.z;
+    const y = reserve(C, spec.prop, x, z, spec.r, spec.road);
+    if (!isNum(y)) { S.refused++; continue; }
+    const base = y + kerbSeat(C, x, z);
+    const yaw = poiYaw(C, x, z);
+    switch (p.k) {
+      case 'tree':
+        appendStreetTree(mbP, rng, x, base, z, 0.86 + hash2(x, z, 11) * 0.55);
+        break;
+      case 'lamp': {
+        // The surveyed node does not say what kind of lamp it is, so the same rule the
+        // procedural pass uses decides: a cobra head on an arterial, a pedestrian pole on a side
+        // street, an acorn in the heritage districts.
+        const rec = nearestRoadRec(C, x, z, 26);
+        const heritage = inAcornZone(x, z);
+        const arterial = !!rec && (rec.cls === 'major' || rec.cls === 'motorway');
+        if (heritage) lampAcorn(C, mbP, x, base, z, 4.6);
+        else if (arterial) lampCobra(C, mbP, x, base, z, yaw, 9.6);
+        else lampPedestrian(C, mbP, x, base, z, yaw, 5.2);
+        break;
+      }
+      case 'bench':
+        appendBench(mbP, x, base, z, yaw);
+        C.benches.push({ x, y: base, z, yaw });
+        break;
+      case 'bin':
+      case 'recycling':
+        appendLitterBin(mbP, x, base, z, yaw);
+        break;
+      case 'hydrant':
+        appendHydrant(mbP, x, base, z, yaw);
+        break;
+      case 'bikepark':
+        appendBikeCorral(mbP, x, base, z, yaw + Math.PI * 0.5,
+          1 + Math.floor(hash2(x, z, 13) * 2));
+        break;
+      case 'bikeshare':
+        appendBikeCorral(mbP, x, base, z, yaw + Math.PI * 0.5, 4);
+        appendParkingMachine(mbP, x + Math.cos(yaw) * 0.1, base, z - Math.sin(yaw) * 0.1, yaw);
+        break;
+      case 'postbox':
+        appendMailbox(mbP, x, base, z, yaw);
+        break;
+      case 'bollard':
+        appendBollard(mbP, x, base, z);
+        break;
+      case 'cabinet':
+        appendUtilityBox(mbP, rng, x, base, z, yaw);
+        break;
+      case 'flagpole':
+        appendFlagPole(mbP, x, base, z, 7 + hash2(x, z, 17) * 6);
+        break;
+      case 'water':
+        appendDrinkingFountain(mbP, x, base, z, yaw);
+        break;
+      case 'fountain':
+        appendFountainBasin(mbP, x, base, z, 1.2 + hash2(x, z, 19) * 1.1);
+        break;
+      case 'billboard':
+        appendBillboard(mbP, rng, x, base, z, yaw);
+        break;
+      case 'adcolumn':
+        appendAdColumn(mbP, x, base, z);
+        break;
+      case 'pole':
+        appendUtilityPole(mbP, x, base, z, yaw, 8.5 + hash2(x, z, 23) * 2.5);
+        break;
+      case 'busstop':
+      case 'tramstop':
+        appendStopFlag(mbP, x, base, z, yaw, stopLabel(p), { font: C.font, textMb: C.mb[SIGN_CLASS] });
+        // The people pass reads a station's frame, not just its position: a flag is a 0.4 m post
+        // rather than a 16 m shelter, so the queue beside it is short.
+        C.stations.push({ x, y: base, z, yaw, len: 1.2 });
+        if (p.n) C.stats.facades.textBlades++;
+        break;
+      case 'subway':
+        appendSubwayEntrance(mbP, x, base, z, yaw, p.n || '',
+          { font: C.font, textMb: C.mb[SIGN_CLASS] });
+        break;
+      default:
+        break;
+    }
+    S.placed++;
+    S.byKind[p.k] = (S.byKind[p.k] || 0) + 1;
+  }
+}
+
+// A route number for a stop flag. OSM gives a stop a NAME ("King St West at Spadina Ave"), which
+// is far too long for a 340 mm flag; what is actually printed on one is the route number, so the
+// digits are taken from the name where it has them and the flag is left blank otherwise.
+function stopLabel(p) {
+  const n = typeof p.n === 'string' ? p.n : '';
+  const m = n.match(/\b(\d{1,3}[A-Z]?)\b/);
+  return m ? m[1] : '';
+}
+
+/**
+ * Mid-block crossings, from the 3,717 surveyed highway=crossing nodes. The junction pass already
+ * paints every crossing at an intersection; these are the ones between them — the pedestrian
+ * crossovers on Queen, King and College that are a genuine Toronto street feature and were
+ * simply absent.
+ */
+function placeSurveyedCrossings(C, list) {
+  if (!list || !list.length) return;
+  const mb = C.mb.roads;
+  const S = C.stats.survey;
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    if (p.k !== 'crossing') continue;
+    S.crossingNodes++;
+    const rec = nearestRoadRec(C, p.x, p.z, 16);
+    if (!rec || rec.bridge || rec.foot || rec.cls === 'motorway' || rec.hw < 3.2) {
+      S.crossingsOffRoad++;
+      continue;
+    }
+    const st = recStation(rec, p.x, p.z);
+    if (!isNum(st.s) || Math.abs(st.off) > rec.hw + 3.0) { S.crossingsOffRoad++; continue; }
+    // Not on top of a junction: those are painted from the junction geometry, and painting them
+    // twice is a z-fight with itself.
+    let near = false;
+    for (let k = 0; k < rec.junc.length; k++) {
+      if (Math.abs(rec.junc[k].s - st.s) < rec.junc[k].r + 6.5) { near = true; break; }
+    }
+    if (near) { S.crossingsAtJunction++; continue; }
+    const hw = rec.hw;
+    const half = 1.55;
+    if (st.s < half + 1 || st.s > rec.len - half - 1) continue;
+    setMat(mb, M.paintWhite);
+    let u = -hw + 0.35;
+    let bars = 0;
+    while (u + ZEBRA_BAR < hw - 0.35) {
+      C.stats.ground.markings += emitStripe(C, rec, st.s - half, st.s + half, u, u + ZEBRA_BAR);
+      u += ZEBRA_BAR + ZEBRA_GAP;
+      bars++;
+    }
+    if (!bars) continue;
+    C.stats.ground.crosswalks++;
+    S.crossings++;
+    // The pedestrian crossover's own pair of illuminated X signs, one each side.
+    for (let d = 0; d < 2; d++) {
+      const sg = d === 0 ? 1 : -1;
+      const m = recSample(rec, st.s);
+      const px = m.x + m.sx * (hw + 1.5) * sg;
+      const pz = m.z + m.sz * (hw + 1.5) * sg;
+      const y = reserve(C, 'signPost', px, pz, 0.5, 0.3);
+      if (!isNum(y)) continue;
+      appendSignPost(C.mb.props, C.rng, px, y + kerbSeat(C, px, pz), pz,
+        Math.atan2(m.sz * sg, -m.sx * sg), null);
+    }
+  }
+}
+
+/** Station and signed offset of a point against a road record's centreline. */
+const _station = { s: 0, off: 0, d: 0 };
+function recStation(rec, x, z) {
+  let best = Infinity;
+  _station.s = NaN;
+  _station.off = 0;
+  for (let k = 1; k < rec.pts.length; k++) {
+    const a = rec.pts[k - 1], b = rec.pts[k];
+    const dx = b[0] - a[0], dz = b[1] - a[1];
+    const l2 = dx * dx + dz * dz;
+    if (!(l2 > EPS)) continue;
+    const t = clamp(((x - a[0]) * dx + (z - a[1]) * dz) / l2, 0, 1);
+    const qx = a[0] + dx * t, qz = a[1] + dz * t;
+    const d2 = (x - qx) * (x - qx) + (z - qz) * (z - qz);
+    if (d2 >= best) continue;
+    best = d2;
+    const l = Math.sqrt(l2);
+    _station.s = rec.s[k - 1] + t * l;
+    _station.off = ((x - qx) * (-dz / l) + (z - qz) * (dx / l));
+    _station.d = Math.sqrt(d2);
+  }
+  return _station;
+}
+
+// A street name as a BLADE carries it. Toronto abbreviates on the sign — QUEEN ST W, not Queen
+// Street West — and the abbreviation is what makes a 900 mm plate legible from the far kerb.
+const BLADE_ABBREV = [
+  [/\bStreet\b/gi, 'ST'], [/\bAvenue\b/gi, 'AVE'], [/\bRoad\b/gi, 'RD'],
+  [/\bBoulevard\b/gi, 'BLVD'], [/\bDrive\b/gi, 'DR'], [/\bCrescent\b/gi, 'CRES'],
+  [/\bPlace\b/gi, 'PL'], [/\bCourt\b/gi, 'CRT'], [/\bTerrace\b/gi, 'TERR'],
+  [/\bParkway\b/gi, 'PKWY'], [/\bSquare\b/gi, 'SQ'], [/\bTrail\b/gi, 'TR'],
+  [/\bLane\b/gi, 'LANE'], [/\bCircle\b/gi, 'CIR'], [/\bGardens\b/gi, 'GDNS'],
+  [/\bHeights\b/gi, 'HTS'], [/\bQuay\b/gi, 'QUAY'],
+  [/\bWest\b/gi, 'W'], [/\bEast\b/gi, 'E'], [/\bNorth\b/gi, 'N'], [/\bSouth\b/gi, 'S'],
+  [/\bSaint\b/gi, 'ST'],
+];
+
+function bladeText(name) {
+  if (typeof name !== 'string' || !name) return '';
+  let s = name;
+  for (let i = 0; i < BLADE_ABBREV.length; i++) s = s.replace(BLADE_ABBREV[i][0], BLADE_ABBREV[i][1]);
+  s = s.replace(/\s+/g, ' ').trim().toUpperCase();
+  return s.length > 22 ? s.slice(0, 22) : s;
+}
+
 // Signal heads and a street-name blade at the junctions that warrant them.
 function placeJunctionProps(C, J) {
   const mbP = C.mb.props;
   const sx = J.x + Math.cos(J.signAng) * (J.r + 5.0);
   const sz = J.z - Math.sin(J.signAng) * (J.r + 5.0);
   const sy = reserve(C, 'signPost', sx, sz, 0.5, 0.3);
-  if (isNum(sy)) appendSignPost(mbP, C.rng, sx, sy + kerbSeat(C, sx, sz), sz, J.signAng);
+  if (isNum(sy)) {
+    // THE BLADES. This is what makes a corner identifiable: white plate, blue legend, the name
+    // abbreviated the way the real ones are, sized to the name it carries.
+    const a = bladeText(J.names[0] || '');
+    const b = bladeText(J.names[1] || '');
+    appendSignPost(mbP, C.rng, sx, sy + kerbSeat(C, sx, sz), sz, J.signAng, {
+      a, b, font: C.font, textMb: C.mb[SIGN_CLASS], heritage: inAcornZone(J.x, J.z),
+    });
+    if (a) C.stats.facades.textBlades++;
+    if (b) C.stats.facades.textBlades++;
+  }
   if (!J.signal) return;
   const dirs = J.dirs;
   const want = Math.min(dirs.length / 2, 2);
@@ -5903,11 +6318,801 @@ function pickEdge(b, wantU, wantV, minLen) {
   return ok;
 }
 
+/* ============================================================ roof shapes == */
+
+// Which roof forms are worth building. 'flat' is what the extrusion already is, and anything
+// this table does not know is treated as a gable — the commonest pitched roof by a long way, and
+// a much smaller lie than leaving a mansard flat.
+const ROOF_SHAPES = {
+  gabled: 'gabled', hipped: 'hipped', 'half-hipped': 'half-hipped', pyramidal: 'pyramidal',
+  mansard: 'mansard', gambrel: 'gabled', saltbox: 'saltbox', quadruple_saltbo: 'saltbox',
+  skillion: 'skillion', 'shed': 'skillion', 'lean_to': 'skillion',
+  round: 'round', dome: 'dome', onion: 'dome', cone: 'pyramidal', pitched: 'gabled',
+  side_hipped: 'hipped', crosspitched: 'gabled', double_saltbox: 'saltbox',
+};
+
+// A roof needs a footprint a roof could sit on. Past this the record is a shed, a warehouse or a
+// stacked massing slab, and a 60 m gable over it is worse than the flat lid it replaces.
+const ROOF_MAX_SPAN = 46;
+
+function roofShapeOf(b) {
+  if (!b.roof || b.roof === 'flat') return '';
+  return ROOF_SHAPES[b.roof] || 'gabled';
+}
+
 /**
- * The whole ground-floor and articulation treatment for one building: an entrance (a shopfront on
- * retail, a revolving drum on an office tower, a glazed pair on a condo, a steel door on an
- * envelope), balcony bands on residential towers, cornices and string courses on masonry, a fire
- * escape on older brick, a loading dock on service stock, and a parapet on anything tall.
+ * The oriented box a pitched roof stands in: the ridge runs along the footprint's LONGEST edge,
+ * because that is what a roof does and because an axis-aligned box would sit 17 degrees off the
+ * street grid this whole city is built on.
+ */
+const _rbox = { cx: 0, cz: 0, yaw: 0, w: 0, d: 0 };
+function roofBox(part) {
+  if (!part) return false;
+  const co = part.outer;
+  const n = co.length;
+  if (n < 6) return false;
+  let au = 1, av = 0, bestL = 0;
+  for (let i = 0, j = n - 2; i < n; j = i, i += 2) {
+    const du = co[i] - co[j], dv = co[i + 1] - co[j + 1];
+    const l = du * du + dv * dv;
+    if (l > bestL) { bestL = l; au = du; av = dv; }
+  }
+  const l = Math.sqrt(bestL);
+  if (!(l > EPS)) return false;
+  au /= l; av /= l;
+  const nu = -av, nv = au;
+  let p0 = Infinity, p1 = -Infinity, q0 = Infinity, q1 = -Infinity;
+  for (let i = 0; i < n; i += 2) {
+    const pp = co[i] * au + co[i + 1] * av;
+    const qq = co[i] * nu + co[i + 1] * nv;
+    if (pp < p0) p0 = pp;
+    if (pp > p1) p1 = pp;
+    if (qq < q0) q0 = qq;
+    if (qq > q1) q1 = qq;
+  }
+  const along = p1 - p0, across = q1 - q0;
+  if (!(along > 0.8) || !(across > 0.8)) return false;
+  if (along > ROOF_MAX_SPAN || across > ROOF_MAX_SPAN) return false;
+  const pc = (p0 + p1) * 0.5, qc = (q0 + q1) * 0.5;
+  const u = au * pc + nu * qc;
+  const v = av * pc + nv * qc;
+  _rbox.cx = u;
+  _rbox.cz = -v;
+  _rbox.w = across;
+  _rbox.d = along;
+  // props.js: local +Z is world (sin yaw, cos yaw). The ridge runs along the long axis, whose
+  // world direction is (au, -av) because plan v = -z.
+  _rbox.yaw = Math.atan2(au, -av);
+  return true;
+}
+
+function roofRise(b, box) {
+  const span = Math.min(box.w, box.d);
+  const k = roofShapeOf(b);
+  if (k === 'skillion' || k === 'saltbox') return clamp(box.w * 0.20, 0.7, 3.4);
+  if (k === 'pyramidal' || k === 'dome') return clamp(span * 0.46, 1.4, 9.0);
+  if (k === 'round') return clamp(box.w * 0.42, 1.0, 6.5);
+  return clamp(span * 0.36, 1.2, 6.5);
+}
+
+/* ================================================== the block-face model == */
+//
+// THE PROBLEM THIS SOLVES. buildFacade() used to treat ONE frontage per building — the single
+// footprint edge nearest a road — and cap the treated length at 24 m. A 60 m block face on Queen
+// West got one shopfront and 36 m of blank wall, no building had a corner entrance, and whether
+// the ground floor was retail at all was decided by the NIGHT-LIGHTING profile, which for most
+// buildings had been guessed from height. A condo or office tower with a retail podium — which is
+// most of downtown's actual retail — got a lobby door and no shops.
+//
+// What replaces it: EVERY street-facing edge of the footprint, along its whole length, subdivided
+// into UNITS. Where the survey carries units (3,261 buildings, 8,451 units) they go where they
+// really are, in order, with the frontage between and around them filled plausibly; where it does
+// not, the whole frontage is synthesised from the same table, so the seam is invisible
+// (CONTRACT Amendment 9).
+
+// How far a carriageway may be from an edge and still make it a frontage. Toronto's downtown
+// setback is nearly zero on the retail streets and 6-12 m on the residential ones; 34 m also
+// picks up the far side of a wide sidewalk and a forecourt without picking up the next street.
+const FRONT_ROAD_MAX = 26;
+const FRONT_MIN_LEN = 2.4;         // shorter edges are chamfers and light wells, not elevations
+const FRONT_MAX_FACES = 3;         // a corner site has two; a mid-block island has three
+const FRONT_MAX_TOTAL = 104;       // metres of frontage treated on one building, worst case
+const FRONT_END_MARGIN = 0.30;     // the quoin at each end of a block face
+
+// Unit widths. TARGET is the median Toronto storefront: the 1900-1930 commercial stock that
+// makes up Queen, King, College and Dundas was subdivided on a 20-25 foot lot.
+const UNIT_MIN = 2.7;
+const UNIT_MAX = 17.0;
+const UNIT_TARGET = 7.8;
+// A surveyed unit whose slot would come out wider than this is a POI attached to a long frontage
+// rather than a unit filling it; the slot is capped and the rest becomes filler.
+const UNIT_SURVEY_MAX = 15.0;
+// Two surveyed records closer together than this along the frontage are one premises.
+const UNIT_MERGE = 2.4;
+
+// How close two footprint edges' shared vertex has to be to a surveyed unit for that unit to be
+// read as a CORNER entrance, and how close the corner has to be to the junction of two streets
+// for a synthesised one.
+const CORNER_UNIT_R = 3.2;
+const CORNER_MIN_LEN = 4.0;
+
+// Metres of shopfront per crowd anchor. The people pass places one figure per anchor with a 42%
+// draw, which is the density the old one-anchor-per-building code produced on a typical
+// 15-24 m retail building.
+const RETAIL_ANCHOR = 16.0;
+
+// Streets whose ground floor is retail almost everywhere, LONGEST PREFIX WINS — which is why
+// Queens Quay has to be able to beat Queen. Not decoration: this is the difference between a
+// Queen West that is shops and a Queen West that is walls.
+const RETAIL_STREETS = [
+  ['Queen', 0.42], ['King', 0.38], ['Yonge', 0.46], ['Spadina', 0.36], ['Dundas', 0.38],
+  ['College', 0.36], ['Bloor', 0.42], ['Bathurst', 0.26], ['Church', 0.28], ['Front', 0.24],
+  ['Adelaide', 0.16], ['Richmond', 0.16], ['Wellington', 0.14], ['Ossington', 0.34],
+  ['Parliament', 0.30], ['Gerrard', 0.30], ['Baldwin', 0.34], ['Augusta', 0.36],
+  ['Kensington', 0.36], ['Harbord', 0.26], ['Roncesvalles', 0.34], ['Broadview', 0.26],
+  ['Danforth', 0.36], ['Queens Quay', 0.18], ['Bay', 0.22], ['Jarvis', 0.14],
+  ['Sherbourne', 0.16], ['Carlton', 0.24], ['Elm', 0.22],
+];
+
+// Synthesised unit mix, as a cumulative distribution. The weights are the shape of the SURVEY —
+// 996 restaurants, 717 fast food, 496 cafes, 280 clothes, 232 vacant, 196 convenience, 181
+// hairdressers, 121 banks — so a synthesised block face has the same trade mix as a surveyed one
+// and the two cannot be told apart by what is on them.
+const SYNTH_MIX = [
+  ['food', 0.255], ['goods', 0.145], ['service', 0.115], ['apparel', 0.075],
+  ['grocery', 0.070], ['salon', 0.062], ['vacant', 0.055], ['office', 0.050],
+  ['bar', 0.044], ['clinic', 0.038], ['culture', 0.030], ['bank', 0.024],
+  ['pharmacy', 0.018], ['gym', 0.010], ['hotel', 0.005], ['civic', 0.004],
+];
+
+/**
+ * What the front door of a building with no shop on it looks like. The old pass took this from
+ * the night-lighting profile alone; that is still the best signal available where the survey is
+ * silent, but it is now only used for the ONE unit that is the entrance, not for the whole
+ * elevation.
+ */
+function entranceKind(b) {
+  if (b.profile === 0 || b.profile === 4) return 'depot';
+  if (b.profile === 5) return 'civic';
+  if (b.h >= 26) return 'lobby';
+  if (b.h <= 13 && b.area < 420) return 'house';
+  return 'lobby';
+}
+
+// WHAT A SYNTHESISED SHOP CALLS ITSELF. A blank fascia next to a lettered one is the loudest
+// possible seam between surveyed and invented (CONTRACT Amendment 9), and inventing business
+// names would be worse than a blank board — it would put fiction on a map that is otherwise
+// survey. So a unit with no surveyed name gets its TRADE on the fascia, which is what a very
+// large share of real Toronto storefronts carry anyway: CONVENIENCE, BARBER, DRY CLEANING,
+// PHARMACY, FOR LEASE. No invented identity, no logo, no brand.
+const TRADE_WORDS = {
+  food: ['CAFE', 'RESTAURANT', 'PIZZA', 'SUSHI', 'DINER', 'BAKERY', 'TAKE-OUT', 'ESPRESSO BAR',
+    'NOODLE HOUSE', 'SANDWICHES', 'JUICE BAR', 'BURGERS', 'SHAWARMA', 'TAQUERIA', 'PHO',
+    'ROTI SHOP', 'BUBBLE TEA', 'DUMPLINGS', 'BREAKFAST', 'PATISSERIE'],
+  bar: ['PUB', 'TAVERN', 'COCKTAIL BAR', 'BREWERY', 'SPORTS BAR', 'LOUNGE', 'WINE BAR'],
+  grocery: ['CONVENIENCE', 'VARIETY', 'SUPERMARKET', 'FRESH MARKET', 'GROCERY', 'FRUIT MARKET',
+    'SMOKE SHOP', 'CANNABIS', 'BULK FOODS', 'BUTCHER'],
+  bank: ['BANK', 'CREDIT UNION', 'CURRENCY EXCHANGE'],
+  pharmacy: ['PHARMACY', 'DRUG MART', 'APOTHECARY'],
+  clinic: ['DENTAL', 'MEDICAL CLINIC', 'WALK-IN CLINIC', 'OPTICAL', 'PHYSIOTHERAPY',
+    'VETERINARY', 'CHIROPRACTIC'],
+  salon: ['HAIR SALON', 'BARBER', 'NAILS', 'DAY SPA', 'BEAUTY BAR', 'MASSAGE', 'TATTOO'],
+  apparel: ['CLOTHING', 'SHOES', 'VINTAGE', 'MENSWEAR', 'JEWELLERY', 'BOUTIQUE', 'THRIFT',
+    'DENIM', 'OUTERWEAR'],
+  goods: ['BOOKS', 'HARDWARE', 'FLORIST', 'PET SUPPLY', 'ELECTRONICS', 'GIFTS', 'FURNITURE',
+    'BICYCLES', 'RECORDS', 'STATIONERY', 'TOYS', 'ART SUPPLY', 'HOUSEWARES', 'OPTICIAN'],
+  service: ['DRY CLEANING', 'LAUNDROMAT', 'PRINT SHOP', 'TAILOR', 'TRAVEL', 'SHOE REPAIR',
+    'KEY CUTTING', 'POSTAL OUTLET', 'PHONE REPAIR'],
+  office: ['OFFICES', 'LAW OFFICE', 'REAL ESTATE', 'ACCOUNTING', 'INSURANCE'],
+  gym: ['FITNESS', 'YOGA STUDIO', 'GYM', 'MARTIAL ARTS', 'SPIN STUDIO'],
+  hotel: ['HOTEL', 'INN', 'SUITES'],
+  culture: ['GALLERY', 'THEATRE', 'STUDIO', 'CINEMA', 'MUSEUM'],
+  civic: ['COMMUNITY CENTRE', 'LIBRARY', 'POST OFFICE'],
+  vacant: ['FOR LEASE', 'SPACE AVAILABLE', 'RETAIL FOR RENT'],
+  vehicle: ['PARKING', 'GARAGE ENTRANCE', 'LOADING'],
+};
+
+/** The name on a unit's fascia: the surveyed one, or the trade where the survey is silent. */
+function fasciaName(kind, surveyed, x, z) {
+  if (surveyed) return surveyed;
+  const w = TRADE_WORDS[kind];
+  if (!w) return '';
+  return w[Math.min(w.length - 1, (hash2(x, z, 47) * w.length) | 0)];
+}
+
+function synthKind(x, z, salt) {
+  let r = hash2(x, z, salt);
+  for (let i = 0; i < SYNTH_MIX.length; i++) {
+    r -= SYNTH_MIX[i][1];
+    if (r <= 0) return SYNTH_MIX[i][0];
+  }
+  return 'goods';
+}
+
+/**
+ * REAL STOREY HEIGHTS. b.lv carries the surveyed storey count for 6,928 buildings; use it rather
+ * than deriving floors from total height, so the ground storey, the string course, the balcony
+ * pitch and the fire-escape landings line up with the real building instead of with an average.
+ *
+ * A ground storey is taller than the floors above it — GROUND_K times, and more on retail — so
+ * h = groundH + (levels - 1) * storeyH with groundH = storeyH * GROUND_K solves for storeyH.
+ *
+ * GUARDED, because the levels tag was lifted by matching an OSM polygon to a massing record
+ * within 34 m and that match is sometimes the building next door: the tenth percentile of h/lv in
+ * this dataset is 1.10 m and the ninetieth is 9.89 m, neither of which is a storey. A count that
+ * implies a floor-to-floor outside PLAUSIBLE is dropped and the profile default is used instead,
+ * which is also what the renderer's own window lattice assumes.
+ */
+const STOREY_DEFAULT = [3.60, 3.92, 3.06, 4.45, 3.10, 4.35];   // by lighting profile
+const STOREY_MIN = 2.45;
+const STOREY_MAX = 6.20;
+
+function storeyModel(b) {
+  if (b.levels) return;
+  const h = b.h > 0 ? b.h : 0;
+  const groundK = (b.profile === 3 || b.units) ? 1.42 : 1.18;
+  const def = STOREY_DEFAULT[b.profile] || 3.60;
+  if (b.lv > 0 && h > 1.5) {
+    const sh = h / (b.lv - 1 + groundK);
+    if (sh >= STOREY_MIN && sh <= STOREY_MAX) {
+      b.levels = b.lv;
+      b.storeyH = sh;
+      b.groundH = sh * groundK;
+      b.levelsFromData = true;
+      return;
+    }
+  }
+  const n = Math.max(1, Math.round((h - def * groundK) / def) + 1);
+  b.levels = n;
+  b.storeyH = clamp(h / (n - 1 + groundK), STOREY_MIN, STOREY_MAX);
+  b.groundH = b.storeyH * groundK;
+  b.levelsFromData = false;
+}
+
+/** The nearest carriageway RECORD to a point, with its distance. Null past `maxR`. */
+const _nrec = { rec: null, d: Infinity };
+function nearestRoadRec(C, x, z, maxR) {
+  let best = maxR * maxR;
+  let idx = -1;
+  C.roadIdx.query(x, z, maxR, (s) => {
+    const d2 = distToSeg2(x, z, s[0], s[1], s[2], s[3]);
+    if (d2 < best) { best = d2; idx = s[7]; }
+  });
+  _nrec.rec = idx >= 0 && C.recs ? C.recs[idx] : null;
+  _nrec.d = idx >= 0 ? Math.sqrt(best) : Infinity;
+  return _nrec.rec;
+}
+
+// The world positions of a building's surveyed units, flat [x, z, ...]. An edge that carries one
+// of these IS a frontage whatever the road index says: a mapper put a shop on it.
+const _uxz = [];
+function unitPoints(b) {
+  _uxz.length = 0;
+  if (!b.units) return 0;
+  for (let k = 0; k < b.units.length; k++) {
+    if (!unitPosition(b, b.units[k])) continue;
+    _uxz.push(_upos[0], _upos[1]);
+  }
+  return _uxz.length >> 1;
+}
+
+/**
+ * Every street-facing edge of a footprint, ordered best frontage first, each with its world
+ * endpoints, its outward normal, the nearest carriageway and how far away it is.
+ *
+ * THE WHOLE EDGE is treated, not a 24 m stub: `len` is its real length and the unit layout below
+ * fills all of it. Capped at FRONT_MAX_FACES elevations (one more where the survey has premises,
+ * because then the extra face is a fact rather than a guess) and FRONT_MAX_TOTAL metres per
+ * building, which is what stops a 1.8 km-perimeter rail shed costing more than the whole
+ * Financial District.
+ */
+function collectFrontages(C, b, out) {
+  out.length = 0;
+  const part = b.mainPart;
+  if (!part) return 0;
+  const co = part.outer;
+  const n = co.length;
+  if (n < 6) return 0;
+  const nUnits = unitPoints(b);
+  // A building the survey has premises on gets a longer leash: the premises are proof that there
+  // is a street there, even where the carriageway centreline happens to be further away than the
+  // ordinary test allows (a wide forecourt, a plaza, a road the extract clipped).
+  const reach = nUnits ? FRONT_ROAD_MAX * 1.6 : FRONT_ROAD_MAX;
+  const faceCap = nUnits ? FRONT_MAX_FACES + 1 : FRONT_MAX_FACES;
+  const cand = [];
+  for (let i = 0; i < n; i += 2) {
+    const len = ringEdge(part, i);
+    if (len < FRONT_MIN_LEN) continue;
+    const j = (i + 2) % n;
+    const au = co[i], av = co[i + 1];
+    const bu = co[j], bv = co[j + 1];
+    const nu = _edge.nu, nv = _edge.nv;
+    // Sampled at three stations, because a long edge can run past the end of the street it
+    // fronts and the midpoint alone would either miss it or claim all of it.
+    let bd = Infinity;
+    let rec = null;
+    for (let k = 0; k < 3; k++) {
+      const t = 0.2 + k * 0.3;
+      const u = au + (bu - au) * t, v = av + (bv - av) * t;
+      const px = u + nu * 3.2, pz = -(v + nv * 3.2);
+      const r = nearestRoadRec(C, px, pz, reach);
+      if (_nrec.d < bd) { bd = _nrec.d; rec = r; }
+    }
+    // Does a surveyed unit sit on this edge?
+    let hits = 0;
+    if (nUnits) {
+      const ax = au, az = -av;
+      const tx = (bu - au) / len, tz = -(bv - av) / len;
+      for (let k = 0; k < _uxz.length; k += 2) {
+        const dx = _uxz[k] - ax, dz = _uxz[k + 1] - az;
+        const sPos = clamp(dx * tx + dz * tz, 0, len);
+        const qx = ax + tx * sPos, qz = az + tz * sPos;
+        if (Math.hypot(_uxz[k] - qx, _uxz[k + 1] - qz) < 5.0) hits++;
+      }
+    }
+    if (!isFinite(bd) && !hits) continue;
+    if (!rec && !hits) continue;
+    cand.push({
+      i,
+      len,
+      ax: au, az: -av, bx: bu, bz: -bv,
+      // Unit tangent from A to B, in world.
+      tx: (bu - au) / len, tz: -(bv - av) / len,
+      nu, nv,
+      x: (au + bu) * 0.5, z: -(av + bv) * 0.5,
+      yaw: Math.atan2(nv, nu),
+      d: isFinite(bd) ? bd : reach, rec, hits,
+      retail: false, units: [],
+    });
+  }
+  if (!cand.length) return 0;
+  // Edges the survey has premises on first, then nearest carriageway, then longest: on a corner
+  // site both elevations are frontages and the primary one is whichever street is closer.
+  cand.sort((p, q) => (q.hits - p.hits) || (p.d - q.d) || (q.len - p.len));
+  let total = 0;
+  for (let k = 0; k < cand.length && out.length < faceCap; k++) {
+    if (total + cand[k].len > FRONT_MAX_TOTAL && out.length && !cand[k].hits) break;
+    out.push(cand[k]);
+    total += cand[k].len;
+  }
+  return out.length;
+}
+
+/** Is this frontage's ground floor retail? The survey decides when it can; otherwise a hash. */
+function frontageRetail(C, b, fr) {
+  if (b.units && b.units.length) return true;
+  const rec = fr.rec;
+  if (!rec || rec.bridge || !rec.name) return false;
+  if (rec.cls === 'motorway' || rec.cls === 'service' || rec.cls === 'foot') return false;
+  if (fr.d > 26 || fr.len < 4.5) return false;
+  let p = rec.commercial ? 0.30 : 0.08;
+  if (rec.cls === 'major') p += 0.16;
+  if (rec.heritage) p += 0.14;
+  let hit = -1;
+  for (let i = 0; i < RETAIL_STREETS.length; i++) {
+    const k = RETAIL_STREETS[i][0];
+    if (rec.name.indexOf(k) !== 0) continue;
+    if (hit < 0 || k.length > RETAIL_STREETS[hit][0].length) hit = i;
+  }
+  if (hit >= 0) p += RETAIL_STREETS[hit][1];
+  if (b.profile === 3) p += 0.40;
+  else if (b.profile === 2) p += 0.12;         // condo podium
+  else if (b.profile === 1) p += 0.08;         // office podium
+  else if (b.profile === 0 || b.profile === 4) p -= 0.34;
+  else if (b.profile === 5) p -= 0.10;
+  if (b.h > 100) p -= 0.06;
+  if (b.area < 55) p -= 0.20;
+  // One draw per FRONTAGE, not per unit: a block face is continuous retail or it is not, and
+  // deciding unit by unit produces a checkerboard no street has ever looked like.
+  return hash2(fr.x, fr.z, 37) < clamp(p, 0, 0.96);
+}
+
+/**
+ * Where a surveyed unit actually is, in world metres. `u.s` indexes a SEGMENT of the building's
+ * first raw ring and `u.t` runs along it — see tools/attach_pois.py — so the position comes off
+ * the raw ring rather than off the welded, re-wound plan ring the extrusion uses, and the two
+ * can never drift apart.
+ * @returns {boolean} false if the record cannot be resolved
+ */
+const _upos = [0, 0];
+function unitPosition(b, u) {
+  const ring = b.rings && b.rings[0];
+  if (!Array.isArray(ring) || ring.length < 2) return false;
+  const si = (u.s | 0);
+  if (si < 0 || si >= ring.length) return false;
+  const a = ring[si], c = ring[(si + 1) % ring.length];
+  if (!a || !c || !isNum(a[0]) || !isNum(c[0])) return false;
+  const t = isNum(u.t) ? clamp(u.t, 0, 1) : 0.5;
+  _upos[0] = a[0] + (c[0] - a[0]) * t;
+  _upos[1] = a[1] + (c[1] - a[1]) * t;
+  return true;
+}
+
+/**
+ * Attach every surveyed unit to the frontage it sits on, as a distance ALONG that frontage.
+ * Projection rather than index arithmetic: the plan ring is welded and may be reversed relative
+ * to the raw one, so the only reliable link between the two is geometry.
+ */
+function assignUnits(b, fronts) {
+  if (!b.units || !b.units.length || !fronts.length) return 0;
+  let placed = 0;
+  for (let k = 0; k < b.units.length; k++) {
+    const u = b.units[k];
+    if (!unitPosition(b, u)) continue;
+    const px = _upos[0], pz = _upos[1];
+    let best = 26.0, bi = -1, bs = 0;
+    for (let f = 0; f < fronts.length; f++) {
+      const fr = fronts[f];
+      const dx = px - fr.ax, dz = pz - fr.az;
+      const s = clamp(dx * fr.tx + dz * fr.tz, 0, fr.len);
+      const qx = fr.ax + fr.tx * s, qz = fr.az + fr.tz * s;
+      const d = Math.hypot(px - qx, pz - qz);
+      if (d < best) { best = d; bi = f; bs = s; }
+    }
+    if (bi < 0) continue;
+    fronts[bi].units.push({
+      s: bs, kind: unitKindOf(u.c, u.v), value: u.v,
+      name: typeof u.n === 'string' ? u.n : '',
+      brand: typeof u.b === 'string' ? u.b : '',
+      house: typeof u.h === 'string' ? u.h : '',
+      x: px, z: pz, surveyed: true,
+    });
+    placed++;
+  }
+  // Sort along the frontage, then MERGE anything closer together than a unit can be. Slot
+  // boundaries are midpoints, so two units s apart give slots of s/2 each; below UNIT_MERGE the
+  // slot collapses under put()'s minimum and the unit is silently lost. OSM routinely maps a
+  // shop, its entrance and its ATM as three nodes a metre apart, and what is wanted there is one
+  // shopfront, not three that do not fit.
+  let merged = 0;
+  for (let f = 0; f < fronts.length; f++) {
+    const us = fronts[f].units;
+    us.sort((p, q) => p.s - q.s);
+    let w = 0;
+    for (let k = 0; k < us.length; k++) {
+      if (w > 0 && us[k].s - us[w - 1].s < UNIT_MERGE) {
+        // Keep whichever record carries more: a name beats no name, a shop beats a fixture.
+        const prev = us[w - 1];
+        const better = (us[k].name && !prev.name) ||
+          (prev.kind === 'fixture' && us[k].kind !== 'fixture');
+        if (better) us[w - 1] = us[k];
+        merged++;
+        continue;
+      }
+      us[w++] = us[k];
+    }
+    us.length = w;
+  }
+  _assignMerged = merged;
+  return placed;
+}
+
+// How many surveyed records the last assignUnits() call folded into a neighbour.
+let _assignMerged = 0;
+
+/**
+ * Turn one frontage into a run of SLOTS that covers it end to end.
+ *
+ * Surveyed units keep their real position: each takes the span midway to its neighbours, capped
+ * at UNIT_SURVEY_MAX so a single cafe cannot claim eighty metres of warehouse. Everything left
+ * over — the ends of the block, the gaps between capped slots, and the whole frontage of a
+ * building the survey never reached — is filled with synthesised units of about UNIT_TARGET,
+ * whose kinds come out of the same distribution the survey has. That is what makes the seam
+ * between surveyed and invented invisible (CONTRACT Amendment 9).
+ */
+// The slot marker for the one entrance a non-retail frontage carves out of its party wall.
+// CONTRACT §6.2: every building gets at least one door on a street-facing elevation.
+const ENTRY_SLOT = Object.freeze({ entrance: true });
+
+// Per-unit width jitter, reused rather than allocated per frontage.
+const _wjit = new Float64Array(16);
+
+// Unit kinds that are NOT a trading shopfront: a party wall, a lobby, a house door, a service
+// elevation, a civic entrance, a garage opening. They get no crowd outside them and are not
+// counted as retail.
+const NON_TRADE = {
+  blank: 1, lobby: 1, house: 1, depot: 1, civic: 1, vehicle: 1, fixture: 1,
+};
+
+function layoutUnits(b, fr, retail, entrance, out) {
+  out.length = 0;
+  const a0 = FRONT_END_MARGIN;
+  const a1 = fr.len - FRONT_END_MARGIN;
+  if (a1 - a0 < 1.2) return 0;
+  let entryDone = !entrance;
+
+  const put = (s0, s1, rec) => {
+    if (s1 - s0 < 0.9) return;
+    out.push({ s0, s1, rec });
+  };
+  // Synthesise a run of units across a gap.
+  const fill = (s0, s1) => {
+    const span = s1 - s0;
+    if (span < 0.9) return;
+    if (!retail) {
+      // A party wall, with the building's own front door cut into the first stretch long enough
+      // to hold one. Everything either side of it is the cheapest thing in the table.
+      if (!entryDone && span >= 2.2) {
+        entryDone = true;
+        const dw = clamp(span * 0.24, Math.min(2.4, span - 0.2), 5.0);
+        const c = s0 + span * (0.28 + hash2(fr.ax + s0, fr.az, 43) * 0.44);
+        const u0 = clamp(c - dw * 0.5, s0, s1 - dw);
+        put(s0, u0, null);
+        put(u0, u0 + dw, ENTRY_SLOT);
+        put(u0 + dw, s1, null);
+        return;
+      }
+      put(s0, s1, null);
+      return;
+    }
+    const n = clamp(Math.round(span / UNIT_TARGET), 1, 12);
+    const w = span / n;
+    if (w < UNIT_MIN && n > 1) { put(s0, s1, null); return; }
+    // Lot widths VARY. Eight identical 7.5 m units in a row is the single most mechanical thing
+    // a synthesised block face can do, and the 1900-1930 commercial stock this is standing in
+    // for was subdivided lot by lot. The jitter is hashed on the world position of each division
+    // and renormalised so the run still covers the span exactly.
+    let acc = 0;
+    for (let i = 0; i < n; i++) {
+      _wjit[i] = 0.74 + hash2(fr.ax + s0 + i * w, fr.az + i * 3.1, 53) * 0.52;
+      acc += _wjit[i];
+    }
+    let u0 = s0;
+    for (let i = 0; i < n; i++) {
+      const wi = span * (_wjit[i] / acc);
+      put(u0, i === n - 1 ? s1 : u0 + wi, null);
+      u0 += wi;
+    }
+  };
+
+  const us = fr.units;
+  if (!us.length) {
+    fill(a0, a1);
+    return out.length;
+  }
+
+  // Boundaries midway between neighbours, then each surveyed slot capped around its own point.
+  let cursor = a0;
+  for (let i = 0; i < us.length; i++) {
+    const s = clamp(us[i].s, a0, a1);
+    const prev = i > 0 ? clamp(us[i - 1].s, a0, a1) : a0;
+    const next = i < us.length - 1 ? clamp(us[i + 1].s, a0, a1) : a1;
+    let lo = i === 0 ? a0 : (prev + s) * 0.5;
+    let hi = i === us.length - 1 ? a1 : (s + next) * 0.5;
+    if (lo < cursor) lo = cursor;
+    if (hi < lo) hi = lo;
+    if (hi - lo > UNIT_SURVEY_MAX) {
+      const half = UNIT_SURVEY_MAX * 0.5;
+      const c = clamp(s, lo + half, hi - half);
+      lo = Math.max(lo, c - half);
+      hi = Math.min(hi, c + half);
+    }
+    if (lo - cursor > 0.9) fill(cursor, lo);
+    else if (lo > cursor) lo = cursor;
+    put(lo, hi, us[i]);
+    cursor = hi;
+  }
+  if (a1 - cursor > 0.9) fill(cursor, a1);
+  // CONTRACT §6.2: a street-facing elevation that is the building's PRIMARY one must carry its
+  // entrance, whatever it is made of. If no span was long enough to carve one out of, the widest
+  // synthesised slot simply becomes the door.
+  if (!entryDone) {
+    let wi = -1, ww = 0;
+    for (let i = 0; i < out.length; i++) {
+      if (out[i].rec) continue;
+      const w = out[i].s1 - out[i].s0;
+      if (w > ww) { ww = w; wi = i; }
+    }
+    if (wi >= 0) out[wi].rec = ENTRY_SLOT;
+  }
+  return out.length;
+}
+
+/* ================================================================= facades == */
+
+// One frontage's worth of scratch, reused: the facade pass runs for every building in a tile and
+// allocating two arrays per building is a garbage-collection pause per tile.
+const _fronts = [];
+const _slots = [];
+
+/**
+ * The block face: every unit along one street-facing edge, built where the survey says it is.
+ */
+function buildFrontage(C, b, fr, primary, signsOnly) {
+  let doors = 0;
+  const mb = signsOnly ? C.mb[SIGN_CLASS] : C.mb.buildings;
+  const F = C.stats.facades;
+  const retail = fr.retail;
+  const H = clamp(b.groundH, 2.7, Math.min(6.4, Math.max(2.7, b.h - 0.4)));
+  const sill = C.groundY(fr.x, fr.z) + ROAD_Y + CURB * 0.55;
+  const yaw = fr.yaw;
+  const n = layoutUnits(b, fr, retail, primary, _slots);
+  if (!n) return 0;
+  let anchor = 0;
+
+  const font = C.font;
+  const textMb = C.mb[SIGN_CLASS];
+  const opts = {
+    kind: 'goods', name: '', house: '', brand: '', font, textMb,
+    endL: true, endR: false, mat: b.mat, audit: F, textOnly: !!signsOnly,
+  };
+  if (!signsOnly) setMat(mb, b.mat);
+  for (let i = 0; i < n; i++) {
+    const sl = _slots[i];
+    const w = sl.s1 - sl.s0;
+    const sc = (sl.s0 + sl.s1) * 0.5;
+    const x = fr.ax + fr.tx * sc, z = fr.az + fr.tz * sc;
+    const entry = sl.rec === ENTRY_SLOT;
+    const rec = entry ? null : sl.rec;
+    const ox = Math.cos(yaw), oz = -Math.sin(yaw);
+    let kind;
+    if (entry) kind = entranceKind(b);
+    else if (rec) kind = rec.kind;
+    else if (retail) kind = synthKind(x, z, 19);
+    else kind = 'blank';
+    // A unit the survey put on the wall rather than in it: a vending machine, an ATM, a
+    // payphone. OSM files all three as premises; on the street they are objects, so they get the
+    // object and the frontage carries on past them as if they were not there.
+    if (kind === 'fixture') {
+      const v = rec ? rec.value : '';
+      if (signsOnly) {
+        // nothing to letter on a vending machine
+      } else if (v === 'vending_machine' || v === 'parcel_locker') {
+        const px = x + ox * 0.46, pz = z + oz * 0.46;
+        const py = reserve(C, 'vendingMachine', px, pz, 0.55, 0.3);
+        if (isNum(py)) appendVendingMachine(C.mb.props, C.rng, px, py + kerbSeat(C, px, pz), pz, yaw);
+      } else if (v === 'telephone') {
+        const px = x + ox * 0.40, pz = z + oz * 0.40;
+        const py = reserve(C, 'payphone', px, pz, 0.45, 0.3);
+        if (isNum(py)) appendPayphone(C.mb.props, px, py + kerbSeat(C, px, pz), pz, yaw);
+      } else {
+        setMat(mb, b.mat);
+        appendWallFixture(mb, null, x, sill, z, yaw, v, b.mat, null);
+      }
+      if (!signsOnly) F.fixtures++;
+      kind = retail ? synthKind(x, z, 23) : 'blank';
+      opts.name = '';
+      opts.house = '';
+      opts.brand = '';
+    } else {
+      opts.name = fasciaName(kind, rec ? rec.name : '', x, z);
+      // The building's own street number goes on its front door; a unit's own number, where the
+      // survey has one, wins on that unit.
+      opts.house = rec ? rec.house : ((entry || (i === 0 && retail)) ? b.hn : '');
+      opts.brand = rec ? rec.brand : '';
+    }
+    opts.kind = kind;
+    opts.endL = true;
+    opts.endR = i === n - 1;
+    if (!signsOnly) setMat(mb, b.mat);
+    appendUnitFront(mb, null, x, sill, z, yaw, w, H, b.mat, opts);
+    if (signsOnly) continue;
+    F.units++;
+    if (rec) F.unitsSurveyed++;
+    // appendUnitFront needs 1.6 m of clear frontage inside the party pilasters before it will
+    // hang a door; anything narrower is a shopfront with no way in, which is what the audit
+    // below counts.
+    const st0 = unitStyle(kind);
+    if (st0.door !== 'none' && w - st0.pil * 2 >= 1.6) doors++;
+    const trades = !NON_TRADE[kind];
+    if (trades) F.unitsRetail++;
+    F.frontageM += w;
+
+    // THE LIGHT A LIT SHOP THROWS ON THE PAVEMENT. The glazing already carries the room behind it
+    // as an emissive pane, but an emissive surface only glows — it puts nothing on the ground in
+    // front of it, and a street of glowing windows over black pavement is exactly what a Toronto
+    // night is not. A unit whose interior material is a genuine emitter (>= EMITTER_MIN, the same
+    // threshold the audit uses) gets one 'shop' light just outside its glass. The renderer decides
+    // WHEN it is on (CONTRACT Amendment 7); this only says a lit room is here.
+    if (st0.glaz > 0.30 && st0.glass && st0.glass[3] >= EMITTER_MIN && w >= 2.6) {
+      const d = st0.proj + 0.85;
+      noteLight(C, 'shop', x + ox * d, sill + Math.min(2.6, H * 0.62), z + oz * d);
+    }
+
+    // What spills onto the sidewalk in front of it, by TRADE rather than by dice: a restaurant
+    // has a patio and a cafe has a board, an office lobby has neither.
+    const st = st0;
+    if (st.patio > 0 && w > 5.0 && hash2(x, z, 61) < st.patio) {
+      const px = x + ox * 2.5, pz = z + oz * 2.5;
+      const py = reserve(C, 'patioSet', px, pz, 1.5, 0.4);
+      if (isNum(py)) appendPatioSet(C.mb.props, C.rng, px, py + kerbSeat(C, px, pz), pz, yaw);
+    }
+    if ((kind === 'food' || kind === 'bar' || kind === 'grocery' || kind === 'goods') &&
+      hash2(x, z, 67) < 0.34) {
+      const px = x + ox * 1.5, pz = z + oz * 1.5;
+      const py = reserve(C, 'sandwichBoard', px, pz, 0.45, 0.3);
+      if (isNum(py)) appendSandwichBoard(C.mb.props, C.rng, px, py + kerbSeat(C, px, pz), pz, yaw);
+    }
+    // One crowd anchor per RETAIL_ANCHOR metres of shopfront, not one per unit: the people pass
+    // draws a figure per anchor, and anchoring per unit would put six of them outside every
+    // eight-metre cafe.
+    if (trades) {
+      anchor += w;
+      while (anchor >= RETAIL_ANCHOR) {
+        anchor -= RETAIL_ANCHOR;
+        C.retail.push({ x, z, yaw, len: Math.min(w, RETAIL_ANCHOR) });
+      }
+    }
+  }
+  if (signsOnly) return 0;
+  if (retail) F.shopfronts++;
+  F.faces++;
+  F.groundFloors++;
+  return doors;
+}
+
+/**
+ * The signage pass: the same block face, the same units, the same fascias — lettering only.
+ *
+ * Everything it reads is a pure function of the building record and the street index, and every
+ * appearance decision inside appendUnitFront is hashed on world position, so this lands on
+ * exactly the boards the detail stage built. It is a separate tile stage because a shop name
+ * stops being readable at 150 m and the geometry is dead weight past there.
+ */
+function buildSignage(C, b) {
+  if (!b.parts || b.h < 3.2 || b.landmark === 'cn') return;
+  if (!findFrontage(C, b)) return;
+  storeyModel(b);
+  if (Math.min(b.frontLen - 0.9, 24) < 1.8) return;
+  const nf = collectFrontages(C, b, _fronts);
+  if (!nf) return;
+  assignUnits(b, _fronts);
+  for (let f = 0; f < nf; f++) {
+    const fr = _fronts[f];
+    fr.retail = frontageRetail(C, b, fr) && (f < 2 || fr.units.length > 0);
+  }
+  for (let f = 0; f < nf; f++) buildFrontage(C, b, _fronts[f], f === 0, true);
+}
+
+/**
+ * The CORNER ENTRANCE. Two street-facing elevations that meet at a real angle get a splayed door
+ * on the corner when the survey puts a unit within CORNER_UNIT_R of the shared vertex, or — where
+ * the survey is silent — when the corner is a retail corner at a junction of two named streets.
+ * @returns {boolean} whether one was built
+ */
+function buildCornerEntrance(C, b, fronts) {
+  const part = b.mainPart;
+  if (!part || fronts.length < 2) return false;
+  const co = part.outer;
+  const n = co.length;
+  for (let p = 0; p < fronts.length; p++) {
+    for (let q = 0; q < fronts.length; q++) {
+      if (p === q) continue;
+      const A = fronts[p], B = fronts[q];
+      // B must follow A round the ring, so they share A's far vertex.
+      if ((A.i + 2) % n !== B.i) continue;
+      if (A.len < CORNER_MIN_LEN || B.len < CORNER_MIN_LEN) continue;
+      const cx = A.bx, cz = A.bz;
+      // Two elevations that are nearly parallel are a jog in the wall, not a corner.
+      const dot = A.nu * B.nu + A.nv * B.nv;
+      if (dot > 0.72 || dot < -0.72) continue;
+      let want = false;
+      for (let k = 0; k < A.units.length; k++) {
+        if (Math.hypot(A.units[k].x - cx, A.units[k].z - cz) < CORNER_UNIT_R) { want = true; break; }
+      }
+      for (let k = 0; !want && k < B.units.length; k++) {
+        if (Math.hypot(B.units[k].x - cx, B.units[k].z - cz) < CORNER_UNIT_R) { want = true; break; }
+      }
+      if (!want && A.retail && B.retail && hash2(cx, cz, 73) < 0.55) want = true;
+      if (!want) continue;
+      const H = clamp(b.groundH, 2.8, Math.min(6.4, Math.max(2.8, b.h - 0.4)));
+      const y = C.groundY(cx, cz) + ROAD_Y + CURB * 0.55;
+      setMat(C.mb.buildings, b.mat);
+      const kind = (A.units.length ? A.units[A.units.length - 1].kind : 0) ||
+        (B.units.length ? B.units[0].kind : 0) || synthKind(cx, cz, 29);
+      const got = appendCornerEntrance(C.mb.buildings, null, cx, y, cz, A.yaw, B.yaw, H, b.mat,
+        { kind, width: clamp(Math.min(A.len, B.len) * 0.34, 1.6, 3.4) });
+      if (got > 0) { C.stats.facades.corners++; return true; }
+    }
+  }
+  return false;
+}
+
+/**
+ * The whole ground-floor and articulation treatment for one building: every street-facing
+ * elevation subdivided into units and built from the survey, a corner entrance where one belongs,
+ * balcony bands on residential towers, cornices and string courses on masonry, a fire escape on
+ * older brick, a loading dock on service stock, and a parapet on anything tall.
  */
 function buildFacade(C, b) {
   if (!b.parts || b.h < 3.2) return;
@@ -5918,6 +7123,7 @@ function buildFacade(C, b) {
   const yaw = b.frontYaw;
   const wall = Math.min(b.frontLen - 0.9, 24);
   if (wall < 1.8) return;
+  storeyModel(b);
 
   // Audit: the frontage normal must genuinely leave the building. A door on an inward normal is
   // emitted inside the extrusion, where back-face culling hides it completely.
@@ -5925,39 +7131,42 @@ function buildFacade(C, b) {
     C.stats.facadesFacingIn++;
   }
 
-  const sill = C.groundY(b.frontX, b.frontZ) + ROAD_Y + CURB * 0.55;
-  // The ground storey can never be taller than the building it is the ground storey of.
-  const floorH = clamp(Math.min(b.h * 0.42, b.h - 0.45), 2.6, b.profile === 3 ? 5.2 : 4.7);
-  const retail = b.profile === 3 && wall >= 6.0;
-
-  setMat(mb, b.mat);
-  appendGroundFloor(mb, rng, b.frontX, sill, b.frontZ, yaw, wall, {
-    profile: b.profile, height: b.h, floorH, mat: b.mat, retail,
-  });
-  F.groundFloors++;
-  if (retail) {
-    F.shopfronts++;
-    C.retail.push({ x: b.frontX, z: b.frontZ, yaw, len: wall });
-  }
-
-  // --- retail spilling onto the sidewalk ----------------------------------------------------
-  if (retail) {
-    const ox = Math.cos(yaw), oz = -Math.sin(yaw);
-    if (rng() < 0.40) {
-      const x = b.frontX + ox * 1.55, z = b.frontZ + oz * 1.55;
-      const y = reserve(C, 'sandwichBoard', x, z, 0.45, 0.3);
-      if (isNum(y)) appendSandwichBoard(C.mb.props, rng, x, y + kerbSeat(C, x, z), z, yaw);
+  // --- the block face: EVERY street-facing elevation, along its whole length ------------------
+  // What the previous single-frontage pass would have treated: ONE edge, capped at 24 m. Kept as
+  // a measurement so the change is a number rather than a claim.
+  F.frontageMBefore += wall;
+  const nf = collectFrontages(C, b, _fronts);
+  if (nf) {
+    const placed = assignUnits(b, _fronts);
+    if (b.units && b.units.length) {
+      F.unitsAvailable += b.units.length;
+      F.unitsMatched += placed;
+      F.unitsMerged += _assignMerged;
+      F.buildingsSurveyed++;
     }
-    if (rng() < 0.20 && wall > 9) {
-      const x = b.frontX + ox * 2.6, z = b.frontZ + oz * 2.6;
-      const y = reserve(C, 'patioSet', x, z, 1.5, 0.4);
-      if (isNum(y)) appendPatioSet(C.mb.props, rng, x, y + kerbSeat(C, x, z), z, yaw);
+    // Retail wraps a corner, it does not wrap a building. The two elevations nearest the street
+    // can be shops; a third or fourth is a lane, a service court or a rear elevation, and it gets
+    // shops only where the survey actually put premises on it.
+    for (let f = 0; f < nf; f++) {
+      const fr = _fronts[f];
+      fr.retail = frontageRetail(C, b, fr) && (f < 2 || fr.units.length > 0);
     }
+    // Corner first, so it owns the corner and the two block faces meet it rather than run
+    // through it. Both elevations then keep their end margin clear of the splay.
+    let doors = buildCornerEntrance(C, b, _fronts) ? 1 : 0;
+    for (let f = 0; f < nf; f++) doors += buildFrontage(C, b, _fronts[f], f === 0, false);
+    if (nf > 1) F.multiFace++;
+    // CONTRACT §6.2: every building gets at least one entrance on a street-facing elevation.
+    F.doors += doors;
+    if (doors === 0) F.noDoor++;
   }
+  const floorH = clamp(b.groundH, 2.7, Math.min(6.4, Math.max(2.7, b.h - 0.4)));
 
   // --- residential balcony bands ------------------------------------------------------------
   if (b.profile === 2 && b.h >= 32 && wall >= 6) {
-    const step = Math.max(3.1, (b.h - 10) / BALCONY_MAX);
+    // Banded on the REAL floor-to-floor where the survey has one, so a condo's balconies line up
+    // with its storeys instead of with an average.
+    const step = clamp(b.storeyH, 2.7, Math.max(3.1, (b.h - 10) / BALCONY_MAX));
     const faces = (b.h >= 95 && pickEdge(b, -b.frontNU, -b.frontNV, 6)) ? 2 : 1;
     const bx = _back.x, bz = _back.z, byaw = _back.yaw, blen = _back.len;
     for (let f = 0; f < faces; f++) {
@@ -5992,9 +7201,12 @@ function buildFacade(C, b) {
   }
   if (b.cls === 'brick' && b.h >= 9.5 && b.h <= 32 && rng() < 0.26 &&
     pickEdge(b, -b.frontNU, -b.frontNV, 3.4)) {
-    const floors = clamp(Math.round((b.h - 4) / 3.4), 1, 6);
-    appendFireEscape(mb, rng, _back.x, C.groundY(_back.x, _back.z) + 3.6, _back.z, _back.yaw,
-      Math.min(_back.len - 0.6, 3.6), floors, b.mat, { storey: 3.4 });
+    // Landings on the building's REAL floor-to-floor, so the escape lines up with the windows
+    // it serves rather than with a 3.4 m guess.
+    const st = clamp(b.storeyH, 2.7, 4.6);
+    const floors = clamp(Math.round((b.h - floorH) / st), 1, 6);
+    appendFireEscape(mb, rng, _back.x, C.groundY(_back.x, _back.z) + floorH - 0.6, _back.z,
+      _back.yaw, Math.min(_back.len - 0.6, 3.6), floors, b.mat, { storey: st });
     F.fireEscapes++;
   }
   if ((b.profile === 0 || b.profile === 4) && b.h >= 5 && b.area > 400 &&
@@ -6186,6 +7398,14 @@ function seatOnBench(C, P, b) {
   if (onCarriageway(C, x, z, 0) || inFootprint(C, x, z, 0)) {
     x = b.x; z = b.z;
     if (onCarriageway(C, x, z, 0) || inFootprint(C, x, z, 0)) return;
+  }
+  // ...and the same for the GROUND under the offset. A bench on a slope, or one whose ends
+  // straddle a kerb, has a seat height that is right at its own centre and wrong two thirds of a
+  // metre along it; the sitter would then read as sunk into the pavement or floating over it.
+  // Fall back to the middle of the bench, which is the height that was validated.
+  if (Math.abs((b.y - kerbSeat(C, x, z)) - C.groundY(x, z)) > 0.06) {
+    x = b.x; z = b.z;
+    if (Math.abs((b.y - kerbSeat(C, x, z)) - C.groundY(x, z)) > 0.06) return;
   }
   appendPedestrian(C.mb.props, P, x, b.y, z, b.yaw + (P() - 0.5) * 0.30, 'sit');
   noteProp(C, 'pedestrian');
@@ -7963,7 +9183,15 @@ function ringPlanArea(r) {
 const ISLE_TILE_UP = 34.0;
 const ISLE_TILE_DOWN = 18.0;
 
-const MESH_CLASSES = ['terrain', 'buildings', 'glass', 'roads', 'sidewalks', 'rails', 'props'];
+// Material classes, in draw order. 'signs' is LAST and is not an opaque class at all: it holds
+// the glyph quads text.js lays out, which render.js draws in its own blended decal pass after
+// everything else has written depth. See CityTiles below for how it reaches that pass.
+const MESH_CLASSES = ['terrain', 'buildings', 'glass', 'roads', 'sidewalks', 'rails', 'props',
+  'signs'];
+// The last OPAQUE class — the one a draw loop walking the classes in order finishes on, and
+// therefore the point at which the signage pass has to run.
+const LAST_OPAQUE_CLASS = 'props';
+const SIGN_CLASS = 'signs';
 
 // Level-of-detail stages, cheapest first. Stage 0 is what a tower contributes to a two-kilometre
 // view: massing with its real facade colour and lighting profile, the ground it stands on, the
@@ -7971,6 +9199,13 @@ const MESH_CLASSES = ['terrain', 'buildings', 'glass', 'roads', 'sidewalks', 'ra
 // pavement: markings, kerbs, shopfronts, balconies, street furniture, people.
 const S_MASS = 0;
 const S_DETAIL = 1;
+// Stage 2 is SIGNAGE: the glyph quads for shop names and house numbers. It is separate because a
+// 250 mm shop name is a smear past 150 m — render.js fades it out at TEXT_FADE_END and the
+// geometry is pure waste beyond that — and because it is the one class that is not drawn with
+// the scene shader. Everything it emits is a pure function of the building and the street
+// network, so the pass can be re-run in its own stage and land on exactly the fascias the
+// detail stage built.
+const S_SIGNS = 2;
 
 // Ranges, metres from the camera to the tile's own cell.
 //   MASS_RANGE   5.0 km. The map is 6.8 km across and the postcard viewpoint is 2 km out over
@@ -7984,6 +9219,10 @@ const MASS_RANGE = 5000;
 const MASS_DROP = 6200;
 const DETAIL_RANGE = 780;
 const DETAIL_DROP = 980;
+// Signage. text.js exports the pair render.js fades over and the pair a tile stage should use;
+// TEXT_RANGE sits past TEXT_FADE_END so a run is invisible before its tile is allowed to drop it.
+const SIGN_RANGE = TEXT_RANGE;
+const SIGN_DROP = TEXT_DROP;
 
 // Resident-vertex ceiling. 11 M vertices is 572 MB of interleaved vertex data at 13 floats —
 // 1.57x the pre-expansion build, which shipped 7.0 M vertices (364 MB) in permanently resident
@@ -8007,6 +9246,69 @@ const TILE_BUDGET_MS = 3.5;
 // How long a tile may go undrawn before its geometry is released even though it is still in
 // range. Long enough that turning round on the spot never rebuilds anything.
 const TILE_EVICT_MS = 20000;
+
+/**
+ * The tile manager, plus the one thing a draw loop walking material classes in order cannot know
+ * about: SIGNAGE.
+ *
+ * Glyph geometry is not an opaque material class. render.js draws it through drawText() — depth
+ * test on, depth WRITE off, alpha blended, its own program and its own atlas sampler — and that
+ * pass has to run after every opaque class has written depth and before the water. A caller that
+ * simply walks the class list and calls drawMesh() on each would push the glyph quads through the
+ * scene shader, which has no sampler for them.
+ *
+ * So the signs ride out behind the LAST OPAQUE CLASS: forEachMesh() notices the tail of the
+ * opaque order going past and flushes the text pass behind it. A caller that asks for the sign
+ * class by name has taken ownership of the pass, and the automatic flush switches itself off for
+ * the rest of the session — so wiring it up explicitly costs nothing and can never double-draw.
+ *
+ * The renderer comes from attachRenderer(), or is found once on the global the boot module
+ * publishes. Nothing here reaches into the renderer beyond calling the one documented entry
+ * point, and a missing renderer, a missing font or a platform with no text support all end the
+ * same way: no glyphs, and a city that is otherwise identical.
+ */
+class CityTiles extends TileManager {
+  constructor(opts) {
+    super(opts);
+    this.signClass = (opts && opts.signClass) || '';
+    this.lastOpaque = (opts && opts.lastOpaque) || '';
+    this.renderer = null;
+    this._signsClaimed = false;
+    this._signLooked = false;
+  }
+
+  /** Hand the signage pass a renderer explicitly. Returns this. */
+  attachRenderer(r) {
+    this.renderer = (r && typeof r.drawText === 'function') ? r : null;
+    return this;
+  }
+
+  _signRenderer() {
+    if (this.renderer) return this.renderer;
+    if (this._signLooked) return null;
+    const g = (typeof globalThis !== 'undefined') ? globalThis.G : null;
+    const r = g ? g.renderer : null;
+    if (r && typeof r.drawText === 'function') {
+      this.renderer = r;
+      this._signLooked = true;
+      return r;
+    }
+    return null;
+  }
+
+  forEachMesh(cls, fn) {
+    if (cls === this.signClass) {
+      this._signsClaimed = true;
+      super.forEachMesh(cls, fn);
+      return;
+    }
+    super.forEachMesh(cls, fn);
+    if (this._signsClaimed || cls !== this.lastOpaque || !this.signClass) return;
+    const r = this._signRenderer();
+    if (!r || !r.font || !r.font.texture) return;
+    super.forEachMesh(this.signClass, (m) => r.drawText(m));
+  }
+}
 
 function makeBuilders() {
   const o = {};
@@ -8032,7 +9334,7 @@ function surroundVerts(mb) {
  * nothing is drawn twice.
  */
 function captureSplit(grid, cap, stageOf, tileChunks) {
-  const VF = 13;
+  const VF = VERT_FLOATS;
   for (let c = 0; c < MESH_CLASSES.length; c++) {
     const name = MESH_CLASSES[c];
     const stage = stageOf[name] === undefined ? S_MASS : stageOf[name];
@@ -8083,7 +9385,7 @@ function captureSplit(grid, cap, stageOf, tileChunks) {
 }
 
 // Append a captured float run into a live builder, verbatim. MeshBuilder.append() with an
-// identity transform copies all 13 channels, so a tiny shim over the raw array is all it takes.
+// identity transform copies every channel, so a tiny shim over the raw array is all it takes.
 const _chunkShim = { _n: 0, _data: null };
 function appendChunk(mb, arr) {
   if (!arr || !arr.length) return;
@@ -8236,13 +9538,18 @@ function decodeCity(buf) {
       const n = len[r];
       const ring = new Array(n);
       if (n <= 0) { out[r] = ring; continue; }
+      // DIVIDE, never multiply by 0.01. An integer count of centimetres divided by 100 is the
+      // correctly-rounded double for that decimal, which is exactly what parsing "-387.21"
+      // gives; multiplying by the inexact literal 0.01 lands one ulp away (-387.21000000000004)
+      // on about 7% of the city's vertices, and the sidecar's whole promise is that which loader
+      // ran cannot be told from the geometry.
       let x = org[oi++], z = org[oi++];
-      ring[0] = [x * 0.01, z * 0.01];
+      ring[0] = [x / 100, z / 100];
       for (let k = 1; k < n; k++) {
         const dx = del[di++], dz = del[di++];
         if (dx === -32768 && dz === -32768) { x = esc[ei++]; z = esc[ei++]; }
         else { x += dx; z += dz; }
-        ring[k] = [x * 0.01, z * 0.01];
+        ring[k] = [x / 100, z / 100];
       }
       out[r] = ring;
     }
@@ -8263,8 +9570,31 @@ function decodeCity(buf) {
   const bh = block('buildings.h'), by = block('buildings.y'), bt = block('buildings.t');
   const bmat = block('buildings.mat'), bcolHas = block('buildings.colHas');
   const bcol = block('buildings.col'), bname = block('buildings.name');
+
+  // THE SURVEYED GROUND FLOOR. House number, storey count, roof shape, and the units on the
+  // frontage. Written by tools/pack_city.py; every value here decodes to exactly the double or
+  // the string the JSON path produces, so which of the two loaded the city cannot be told from
+  // the geometry (see the exact-decode note in pack_city.py).
+  const hnums = dicts.houseNumbers || [];
+  const hstr = (ids, k) => {
+    const v = ids ? ids[k] : -1;
+    return (v >= 0 && v < hnums.length) ? hnums[v] : '';
+  };
+  const unames = dicts.unitNames || [];
+  const ustr = (ids, k) => {
+    const v = ids ? ids[k] : -1;
+    return (v >= 0 && v < unames.length) ? unames[v] : '';
+  };
+  const uvals = dicts.unitValues || [];
+  const bhn = block('buildings.hnum'), blv = block('buildings.levels');
+  const broof = block('buildings.roof'), bUnitsPer = block('buildings.unitsPer');
+  const uCat = block('units.cat'), uVal = block('units.val'), uSeg = block('units.seg');
+  const uT = block('units.t'), uName = block('units.name'), uBrand = block('units.brand');
+  const uHouse = block('units.house'), uHours = block('units.hours');
+
   const buildings = new Array(perB.length);
   let ring = 0;
+  let unit = 0;
   for (let i = 0; i < perB.length; i++) {
     const cnt = perB[i];
     const rr = new Array(cnt);
@@ -8277,6 +9607,35 @@ function decodeCity(buf) {
     }
     const nm = str(bname, i);
     if (nm) rec.n = nm;
+    const hn = hstr(bhn, i);
+    if (hn) rec.hn = hn;
+    if (blv && blv[i]) rec.lv = blv[i];
+    const rs = enumOf(dicts.roofShape, broof, i);
+    if (rs) rec.rs = rs;
+    const nu = bUnitsPer ? bUnitsPer[i] : 0;
+    if (nu > 0) {
+      const us = new Array(nu);
+      for (let k = 0; k < nu; k++, unit++) {
+        const vi = uVal ? uVal[unit] : -1;
+        const u = {
+          c: enumOf(dicts.unitCategory, uCat, unit) || 'shop',
+          v: (vi >= 0 && vi < uvals.length) ? uvals[vi] : '',
+          s: uSeg ? uSeg[unit] : 0,
+          // Thousandths: attach_pois.py writes t to three decimals, so an integer count of them
+          // divided by 1000 is exactly the double parsing "0.253" gives.
+          t: uT ? uT[unit] / 1000 : 0,
+        };
+        const un = ustr(uName, unit);
+        if (un) u.n = un;
+        const ub = ustr(uBrand, unit);
+        if (ub) u.b = ub;
+        const uh = hstr(uHouse, unit);
+        if (uh) u.h = uh;
+        if (uHours && uHours[unit]) u.o = 1;
+        us[k] = u;
+      }
+      rec.u = us;
+    }
     buildings[i] = rec;
   }
 
@@ -8314,7 +9673,27 @@ function decodeCity(buf) {
   const wname = block('waterfront.name');
   for (let i = 0; i < waterfront.length; i++) waterfront[i].n = str(wname, i);
 
-  return { meta: head.meta || {}, terrain, buildings, roads, areas, rails, shore, waterfront };
+  // STANDALONE SURVEYED NODES. Whole centimetres, which is the two decimals attach_pois.py
+  // rounds them to, so x / 100 is exactly the double the JSON literal parses to.
+  const pKind = block('pois.kind'), pX = block('pois.x'), pZ = block('pois.z');
+  const pName = block('pois.name');
+  const pnames = dicts.poiNames || [];
+  const nPoi = pX ? pX.length : 0;
+  const pois = new Array(nPoi);
+  for (let i = 0; i < nPoi; i++) {
+    const rec = {
+      k: enumOf(dicts.poiKind, pKind, i) || '',
+      x: pX[i] / 100,
+      z: pZ ? pZ[i] / 100 : 0,
+    };
+    const v = pName ? pName[i] : -1;
+    if (v >= 0 && v < pnames.length) rec.n = pnames[v];
+    pois[i] = rec;
+  }
+
+  return {
+    meta: head.meta || {}, terrain, buildings, roads, areas, rails, shore, waterfront, pois,
+  };
 }
 
 async function fetchJson(url, onFrac) {
@@ -8428,10 +9807,34 @@ function makeCityStats() {
     materials: {}, profiles: [0, 0, 0, 0, 0, 0], surveyedColour: 0,
     // Accuracy invariants the harness re-checks every run.
     landmarkHeights: {}, gridDeg: 0,
+    // THE SURVEYED FURNITURE (data/toronto.json pois[]). `placed` is how many of the 21,974
+    // surveyed nodes became geometry, `refused` how many were rejected by the same placement
+    // rules the procedural pass obeys (inside a footprint, on a carriageway, under a deck, on
+    // top of something already there), and `fallback` how many items the procedural pass still
+    // had to invent because the survey is silent there.
+    survey: { total: 0, placed: 0, refused: 0, crossings: 0, crossingNodes: 0,
+      crossingsAtJunction: 0, crossingsOffRoad: 0, fallback: 0, suppressed: 0,
+      signalsAdded: 0, byKind: {} },
     // Street-detail audit (CONTRACT §6.3 / §6.4).
     props: {}, facades: {
       groundFloors: 0, shopfronts: 0, balconyBands: 0, cornices: 0, stringCourses: 0,
       fireEscapes: 0, loadingDocks: 0, parapets: 0,
+      // THE BLOCK-FACE AND UNIT MODEL. `faces` is how many street-facing elevations were treated
+      // (it used to be one per building, capped at 24 m); `frontageM` the metres of frontage
+      // those cover; `units` the shopfronts built and `unitsSurveyed` how many of them are a
+      // real surveyed premises rather than plausible filler; `unitsMatched` / `unitsAvailable`
+      // how much of the survey the geometry actually managed to place.
+      faces: 0, multiFace: 0, frontageM: 0, frontageMBefore: 0, units: 0, unitsSurveyed: 0,
+      unitsRetail: 0,
+      unitsAvailable: 0, unitsMatched: 0, unitsMerged: 0, buildingsSurveyed: 0, corners: 0,
+      fixtures: 0, doors: 0, noDoor: 0,
+      // Storey model: how many buildings took their floor-to-floor from the surveyed level
+      // count, and how many had to fall back because the count implied an impossible storey.
+      levelsFromData: 0, levelsDerived: 0, levelsRejected: 0, roofForms: 0,
+      // Signage, from text.js: fascia name runs and the glyphs in them, how many had to shrink
+      // or ellipsise to fit the board, the house numbers, and the street blades.
+      textRuns: 0, textGlyphs: 0, textShrunk: 0, textEllipsised: 0, textNumbers: 0,
+      textBlades: 0,
     },
     ground: {
       junctions: 0, signalised: 0, kerbRamps: 0, markings: 0, crosswalks: 0, stopBars: 0,
@@ -8481,6 +9884,9 @@ function makeCityStats() {
       worldX: [0, 0], worldZ: [0, 0],
     },
     propsInFootprint: 0, propsOnRoad: 0,
+    // Luminaires currently registered with the renderer's clustered local-light rig. Grows as
+    // detail tiles stream in; see noteLight() and flushLights().
+    lights: 0,
     markingsBelowRoad: 0, markLiftMin: Infinity, markLiftMax: -Infinity,
     // Ground-plane geometry audit. Every one of these is a class of artifact that is invisible in
     // a vertex count and glaring at street level, so each gets its own counter.
@@ -8553,6 +9959,16 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   const roadsRaw = Array.isArray(data.roads) ? data.roads : [];
   const areasRaw = Array.isArray(data.areas) ? data.areas : [];
   const railsRaw = Array.isArray(data.rails) ? data.rails : [];
+  // SURVEYED NODES, in local metres. Filtered here once so every pass downstream can assume a
+  // finite position and a kind string.
+  const poisRaw = [];
+  if (Array.isArray(data.pois)) {
+    for (let i = 0; i < data.pois.length; i++) {
+      const q = data.pois[i];
+      if (!q || typeof q.k !== 'string' || !isNum(q.x) || !isNum(q.z)) continue;
+      poisRaw.push(q);
+    }
+  }
 
   const stats = makeCityStats();
   // A tile rebuilt after eviction runs the same emitters a second time. Its counters go here and
@@ -8701,6 +10117,16 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       c: b.c,
       m: b.m,
       name: typeof b.n === 'string' ? b.n : '',
+      // THE SURVEYED GROUND FLOOR. `units` are the premises OSM has on this building's frontage,
+      // in order along it, each carrying the footprint SEGMENT and the parameter along it that
+      // says where it really is; `hn` its street number; `lv` its real storey count; `roof` its
+      // roof shape. Everything the block-face model below builds comes off these four.
+      units: Array.isArray(b.u) ? b.u : null,
+      hn: typeof b.hn === 'string' ? b.hn : '',
+      lv: (typeof b.lv === 'number' && b.lv >= 1 && b.lv <= 200) ? (b.lv | 0) : 0,
+      roof: typeof b.rs === 'string' ? b.rs : '',
+      // Storey model, resolved once by storeyModel(): levels, floor-to-floor, ground storey.
+      levels: 0, storeyH: 0, groundH: 0, levelsFromData: false,
       parts: null,
       mainPart: null,
       area: 0,
@@ -8780,6 +10206,16 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     stats.materials[spec.cls] = (stats.materials[spec.cls] || 0) + 1;
     stats.profiles[spec.profile]++;
     if (spec.tagged) stats.surveyedColour++;
+    // The storey model, resolved ONCE here rather than per tile: it is a property of the
+    // building, every pass that lays anything out vertically reads it, and it is also where the
+    // surveyed level count gets accepted or rejected.
+    storeyModel(b);
+    const FA = stats.facades;
+    if (b.levelsFromData) FA.levelsFromData++;
+    else {
+      FA.levelsDerived++;
+      if (b.lv > 0) FA.levelsRejected++;
+    }
   }, (f) => report(0.46 + f * 0.06, 'reading footprints'));
 
   // The CN Tower must exist even if the massing record was rejected. Either way it is a feature
@@ -9020,6 +10456,8 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         nd = {
           x: p[k][0], z: p[k][1], dirs: [], hw: 0, majors: 0,
           r: 0, cross: false, signal: false, signAng: 0,
+          // The street names that meet here, longest carriageway first: what goes on the blades.
+          names: [], surveyed: false,
         };
         nodes.set(key, nd);
       }
@@ -9030,12 +10468,35 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       if (big) nd.majors += (prev ? 1 : 0) + (next ? 1 : 0);
     }
   }
+  // Where the survey has a traffic signal, index it: which junctions are signalised is a fact
+  // 573 surveyed nodes know and a rule of thumb over branch counts only guesses.
+  const sigIdx = makeGridIndex(40, gx0, gz0,
+    Math.ceil((extent.x + 800) / 40) + 1, Math.ceil((extent.z + 800) / 40) + 1);
+  for (let i = 0; i < poisRaw.length; i++) {
+    const q = poisRaw[i];
+    if (q.k === 'signal') sigIdx.add(q.x, q.z, q.x, q.z, q);
+  }
   const junctions = new Map();
   for (const [key, nd] of nodes) {
     if (nd.dirs.length < 6) continue;
     nd.r = clamp(nd.hw, 3.0, 16.0);
     nd.cross = nd.hw >= 5.0;
     nd.signal = nd.majors >= 2 && nd.hw >= 5.5;
+    {
+      const reach = nd.r + 14;
+      const r2 = reach * reach;
+      let found = false;
+      sigIdx.query(nd.x, nd.z, reach, (q) => {
+        if (found) return;
+        const dx = q.x - nd.x, dz = q.z - nd.z;
+        if (dx * dx + dz * dz < r2) { found = true; return false; }
+      });
+      if (found) {
+        if (!nd.signal) stats.survey.signalsAdded++;
+        nd.signal = true;
+        nd.surveyed = true;
+      }
+    }
     const a0 = Math.atan2(-nd.dirs[1], nd.dirs[0]);
     let d = Math.atan2(-nd.dirs[3], nd.dirs[2]) - a0;
     while (d < 0) d += TAU;
@@ -9053,6 +10514,9 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       // would paint the crossing twice, in the same place, and z-fight it against itself.
       if (!J || J === last) continue;
       rec.junc.push({ s: rec.s[k], r: J.r, J });
+      // A blade carries the name of the street it hangs over, so the junction has to know which
+      // named carriageways reach it. Distinct names only; a way split in two contributes once.
+      if (rec.name && J.names.length < 4 && J.names.indexOf(rec.name) < 0) J.names.push(rec.name);
       last = J;
     }
   }
@@ -9101,9 +10565,26 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   // belong to the tile being built; the indices are global and read-only from here on.
   const tramIdx = makeGridIndex(24, gx0, gz0,
     Math.ceil((extent.x + 800) / 24) + 1, Math.ceil((extent.z + 800) / 24) + 1);
+  // Surveyed nodes, indexed at the coarsest cell any suppression radius needs (postbox, 34 m).
+  const poiIdx = makeGridIndex(36, gx0, gz0,
+    Math.ceil((extent.x + 800) / 36) + 1, Math.ceil((extent.z + 800) / 36) + 1);
+  for (let i = 0; i < poisRaw.length; i++) {
+    const q = poisRaw[i];
+    poiIdx.add(q.x, q.z, q.x, q.z, q);
+  }
+  stats.survey.total = poisRaw.length;
   const C = {
     mb, groundY, terrainY, grade: gradeField, bIndex, roadIdx, tramIdx, deckIdx,
     rng: makeRng(SEED), stats, pedSeed: PED_SEED, tilePeople: 0,
+    // Carriageway records, by the index roadIdx stores in its segments: the block-face model
+    // needs the street a frontage faces, not just how far away it is.
+    recs,
+    // Every surveyed node, indexed for the suppression query: a procedural lamp, tree, bench or
+    // bin is not placed where the survey already has one of its class.
+    poiIdx,
+    // The glyph atlas. Built once per GL context and shared with render.js, which binds the same
+    // texture; null on any platform without a 2-D canvas, and every caller handles that.
+    font: getFont(gl),
     // How far into the synthesised fringe a street still gets a kerb and a pavement: exactly as
     // far as the soft limit lets anyone walk, plus a block. Past that nobody is ever closer than
     // a few hundred metres and the detail returns nothing (CONTRACT §9.3).
@@ -9116,6 +10597,9 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     stations: [], corners: [], benches: [], walks: [], plazas: [], retail: [],
     crowd: new Map(),
     audit: [], auditRoad: [], auditDeck: [], auditPed: [],
+    // THE LOCAL LIGHT REGISTRY. Every lamp this build places also records its LENS here, and
+    // update() hands the accumulated set to render.js's clustered rig. See noteLight().
+    lampList: [], lampKey: new Set(), lampsDirty: false,
   };
 
   for (let i = 0; i < railsRaw.length; i++) {
@@ -9156,6 +10640,7 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         return true;
       },
       note: (kind) => noteProp(C, kind),
+      light: (kind, x, y, z) => noteLight(C, kind, x, y, z),
     });
     await frame();
   }
@@ -9296,10 +10781,12 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       i0: 0, i1: 0, j0: 0, j1: 0,
       b: [], recs: [], foot: [], sub: [], pass: [], corr: [], rails: [],
       areas: [], junc: [], parks: [], plazas: [], cn: false, harbour: null, isle: false,
+      // Surveyed OSM nodes whose position falls in this tile.
+      pois: [],
       // CONTRACT §9.1 / §9.3: designed termini, and the synthesised fringe.
       caps: [], sroads: [], sblocks: [],
     };
-    grid.tiles[k].built = [false, false];
+    grid.tiles[k].built = [false, false, false];   // one flag per stage: massing, detail, signs
   }
 
   // --- terrain cells. Quad (i, j) belongs to the tile holding its centre, so the whole sheet is
@@ -9460,6 +10947,16 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     grid.cover(t, J.x - J.r - 4, J.z - J.r - 4, J.x + J.r + 4, J.z + J.r + 4, gy - 2, gy + 10);
   }
 
+  // --- surveyed nodes. The tallest thing any of them becomes is a 12 m utility pole, and a
+  // subway entrance reaches 3.6 m up and half a metre down; the draw box is sized for both.
+  for (let i = 0; i < poisRaw.length; i++) {
+    const q = poisRaw[i];
+    const t = grid.at(q.x, q.z);
+    t.f.pois.push(q);
+    const gy = groundY(q.x, q.z);
+    grid.cover(t, q.x - 3, q.z - 3, q.x + 3, q.z + 3, gy - 1, gy + 13);
+  }
+
   // --- designed termini (CONTRACT §9.1) and the synthesised fringe (§9.3). Indexed like any
   // other feature, which is the whole point: the surround is not a special case in the renderer,
   // in the culler, in the eviction policy or in the vertex budget.
@@ -9544,7 +11041,7 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     for (const [, rec] of tileChunks) {
       for (let s = 0; s < rec.length; s++) {
         if (!rec[s]) continue;
-        for (const c in rec[s]) chunkVerts += rec[s][c].length / 13;
+        for (const c in rec[s]) chunkVerts += rec[s][c].length / VERT_FLOATS;
       }
     }
     stats.chunkVerts = Math.round(chunkVerts);
@@ -9637,6 +11134,17 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     for (let p = 0; p < b.parts.length; p++) {
       const part = b.parts[p];
       if (!part.capBuried) emitCap(C.mb.buildings, part, y1 - part.capDrop, C.stats);
+    }
+    // A REAL ROOF SHAPE where the survey has one. 286 buildings carry a roof:shape that is not
+    // flat, and until now every one of them rendered as a flat lid — which on the house stock
+    // north of Queen and on the island cottages is the single loudest tell that the city was
+    // generated. The pitched form stands ON the flat cap rather than replacing it, so the
+    // triangulation the massing pass already did stays valid and there is no seam.
+    if (roofShapeOf(b) && roofBox(b.mainPart)) {
+      const rise = roofRise(b, _rbox);
+      appendPitchedRoof(C.mb.buildings, _rbox.cx, y1 - (b.mainPart.capDrop || 0), _rbox.cz,
+        _rbox.yaw, _rbox.w, _rbox.d, rise, roofShapeOf(b), roofMaterial(b.mat, _roofMat));
+      C.stats.facades.roofForms++;
     }
     if (b.h > 118) {
       setMat(C.mb.props, M.beacon);
@@ -9851,6 +11359,17 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     C.mb = builders;
     C.plazas = F.plazas;
 
+    if (stage === S_SIGNS) {
+      /* ---------------------------------------------------------------- signage */
+      // The shortest-range stage: shop names and house numbers, and nothing else. See S_SIGNS.
+      for (let i = 0; i < F.b.length; i++) {
+        buildSignage(C, F.b[i]);
+        if ((i & 31) === 31) yield;
+      }
+      endTile(tile, stage, first);
+      return;
+    }
+
     if (stage === S_MASS) {
       emitTerrainRange(builders.terrain, T, gradeField, F.i0, F.i1, F.j0, F.j1);
       // CONTRACT §9.2: the synthesised ground never simply becomes water.
@@ -9930,6 +11449,10 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         if ((i & 15) === 15) yield;
       }
       yield;
+      // Mid-block crossings from the survey. Before the junction pass, because emitStripe()
+      // borrows C.stations as scratch and the transit stops that list holds are pushed later.
+      placeSurveyedCrossings(C, F.pois);
+      yield;
       // Kerb ramps and the signal heads go in before any furniture, so they win the corners.
       for (let i = 0; i < F.junc.length; i++) {
         emitJunctionKerbs(C, F.junc[i]);
@@ -9957,6 +11480,11 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
         placeTramStops(C, run.p);
         if ((i & 3) === 3) yield;
       }
+      yield;
+      /* --------------------------------------------- surveyed furniture --- */
+      // 21,974 real positions, placed BEFORE the procedural pass so they claim their own sites
+      // and the fixed-pitch pass fills only what the survey leaves.
+      placeSurveyedFurniture(C, F.pois);
       yield;
       /* ------------------------------------------------------------ facades */
       for (let i = 0; i < F.b.length; i++) {
@@ -10073,13 +11601,16 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     endTile(tile, stage, first);
   }
 
-  const tiles = new TileManager({
+  const tiles = new CityTiles({
     gl,
     grid,
     classes: MESH_CLASSES,
+    signClass: SIGN_CLASS,
+    lastOpaque: LAST_OPAQUE_CLASS,
     stages: [
       { name: 'massing', range: MASS_RANGE, drop: MASS_DROP },
       { name: 'detail', range: DETAIL_RANGE, drop: DETAIL_DROP },
+      { name: 'signs', range: SIGN_RANGE, drop: SIGN_DROP },
     ],
     build: buildTile,
     vertexCap: VERTEX_CAP,
@@ -10347,7 +11878,8 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     console.log('[city] data: ' + stats.source + ', ' +
       (stats.bytes ? (stats.bytes / 1048576).toFixed(2) + ' MB decoded' : 'JSON') +
       '; captured global geometry ' + stats.chunkVerts.toLocaleString() + ' verts (harbour + ' +
-      'walkability) held as ' + (stats.chunkVerts * 13 * 4 / 1048576).toFixed(1) + ' MB of ' +
+      'walkability) held as ' +
+      (stats.chunkVerts * VERT_FLOATS * 4 / 1048576).toFixed(1) + ' MB of ' +
       'per-tile chunks');
     console.log('[city] facades: ' + stats.surveyedColour + ' surveyed colours, materials',
       stats.materials, 'lighting profiles [envelope, office, residential, retail, parking, civic]',
@@ -10436,10 +11968,32 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
    */
   function update(camera, nowMs, budgetMs) {
     tiles.frame(camera, nowMs, budgetMs);
+    flushLights();
     const TS = tiles.stats;
     stats.verts = TS.residentVerts + (meshes.water ? meshes.water.vertexCount : 0);
     stats.tris = (stats.verts / 3) | 0;
     return tiles;
+  }
+
+  /**
+   * Hand the accumulated luminaires to the renderer's clustered rig.
+   *
+   * Lamps are placed by the DETAIL stage, which builds lazily per tile, so the set grows as the
+   * player walks. setLights() REPLACES the whole registration and rebuilds its broadphase, which
+   * is O(n) over a few thousand entries — cheap, but not something to do every frame, so this only
+   * runs on the frames where a tile actually added a lamp. Registrations are deduplicated on world
+   * position (noteLight), so a tile that is evicted and rebuilt does not grow the list, and the
+   * total is bounded by the number of luminaires in the city.
+   *
+   * The renderer is resolved exactly the way the signage pass resolves it, so a build with no
+   * renderer attached still produces the identical city — just without local lights.
+   */
+  function flushLights() {
+    if (!C.lampsDirty) return;
+    const r = tiles._signRenderer ? tiles._signRenderer() : null;
+    if (!r || typeof r.setLights !== 'function') return;
+    C.lampsDirty = false;
+    stats.lights = r.setLights(C.lampList);
   }
 
   /**
@@ -10485,6 +12039,10 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     // one, so the position has to come from the data rather than from a constant.
     // [x, z, base Y, mask radius].
     cnTower: [cnX, cnZ, cnBaseY, 34.0],
+    // Every luminaire this build has placed, at its LENS, in the shape render.js setLights() takes.
+    // update() registers it automatically; it is exposed so the harness can audit lamp coverage
+    // without a GL context and so a caller driving its own renderer can register it by hand.
+    lights: C.lampList,
     groundY,
     buildingAt,
     collide,

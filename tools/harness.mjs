@@ -67,7 +67,7 @@ const glStub = new Proxy({
 
 /* ------------------------------------------------------------------ audit -- */
 
-const VF = 13;
+const { VERT_FLOATS: VF } = await import(resolve(ROOT, 'src/gl.js'));
 
 function auditMesh(name, data) {
   const n = (data.length / VF) | 0;

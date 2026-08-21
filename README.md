@@ -29,9 +29,27 @@ north, and that rotation is what makes it *feel* like Toronto: **Bay 162.5°, Yo
 University 160.5°**, with **King 74.1°** and **Queen 74.1°** square to them within 1.6°.
 Length-weighted over every segment of each street in the extract.
 
-**18,312 buildings** with real footprints and heights · **20,403 streets** with real names and
-widths · real terrain, from the lakeshore climbing 40 m to the north · **1,514 surveyed facade
-colours**.
+**18,312 buildings** with real footprints and heights (of 18,604 records; 292 are below the
+minimum footprint area and are dropped) · **20,403 streets** with real names and widths · real
+terrain, from the lakeshore climbing 40 m to the north · **1,514 surveyed facade colours** ·
+**4,305 real storey counts**.
+
+## The shops are the real shops
+
+The thing that makes a street recognisable on foot is not its massing, it is its **ground floor** —
+and OSM keeps almost all of that in *nodes*, which the first extracts did not fetch. They do now:
+**8,451 surveyed premises on 3,261 buildings**, each with the ring segment and the position along it
+where it actually sits, in the order they actually run down the block.
+
+So the block faces are laid out as a row of real premises — Sanagan's Meat Locker on Baldwin, Foot
+Locker on Yonge — with their names lettered on the fascia at legible size, drawn from a signed-
+distance-field glyph atlas rasterised at boot from a system font. **6,805 of those premises carry a
+real name.**
+
+Where the survey is silent the frontage is still filled, because a hole is worse than a guess — but
+it is filled with an all-caps *generic trade word*: `BAKERY`, `HARDWARE`, `DRY CLEANING`. **Nothing
+ever invents a proper noun.** A name you can read is a name you can trust. Honestly: **9.9% of all
+units are surveyed, 30.8% of the ones that trade** — the rest is deliberate, plausible filler.
 
 ## What's in it
 
@@ -41,8 +59,11 @@ in the whole Toronto Islands chain and Billy Bishop airport.
 - **108 km of streetcar track** with 2,414 catenary poles and 117 km of overhead wire, embedded
   flush in the asphalt
 - **176 km of walkways**, 122,868 road markings, 4,163 crosswalks, 641 km of kerb, 4,203 kerb ramps
-- **10,636 pedestrians**, 3,163 parked cars, 2,728 cobra lamps, 1,995 street trees
-- **15,960 modelled ground floors**, 4,308 shopfronts, 22,501 balcony bands
+- **10,654 pedestrians**, 3,206 parked cars, 8,500 street trees, 2,439 cobra lamps
+- **48,299 modelled block faces** carrying **70,755 ground-floor units** over 486 km of frontage —
+  13,227 shopfronts, 34,366 doors, 23,001 balcony bands, 1,062 fire escapes
+- **21,974 surveyed street-furniture nodes** — trees, benches, hydrants, bins, lamps, crossings,
+  transit stops, postboxes, bike parking — placed where OSM says they are, not scattered
 - **The Toronto Islands** — 3.44 km² of land across 16 islands, the lagoons and marinas, 10 km of
   beach, Centreville, and all 8 ferry docks
 - **Billy Bishop** — 2 runways, 35 taxiways, 3 aprons, 13 stands, 243,000 m² of pavement
@@ -74,13 +95,14 @@ is most of the perimeter, it is seamless.
 
 ## How it runs
 
-43 km² is 26 million vertices. Nothing that size fits in one buffer, so the city is cut into
-**156 tiles of 625 m** and built on demand, cheapest first: stage 0 is massing — the silhouette,
-the ground, the carriageways — out to 5 km, and stage 1 is everything you can only resolve from
-the pavement — markings, kerbs, shopfronts, balconies, furniture, people — out to 780 m. Builds
-run as generators against a 3.5 ms-per-frame budget, so a dense downtown tile costs twenty partial
-frames instead of one long stall, and geometry is evicted least-recently-wanted against an 11 M
-vertex ceiling.
+43 km² is 34.5 million vertices. Nothing that size fits in one buffer, so the city is cut into
+**272 tiles of 625 m** and built on demand, cheapest first: stage 0 is massing — the silhouette,
+the ground, the carriageways — out to 5 km; stage 1 is everything you can only resolve from the
+pavement — markings, kerbs, shopfronts, balconies, furniture, people — out to 780 m; and stage 2
+is the lettering on the fascias, out to 165 m, because a 250 mm shop name is a smear past that.
+Builds run as generators against a 3.5 ms-per-frame budget, so a dense downtown tile costs twenty
+partial frames instead of one long stall, and geometry is evicted least-recently-wanted against an
+11 M vertex ceiling.
 
 **Level of detail is for distance only.** The block you are standing on is built exactly as it was
 before tiling existed — same facade colours, same window grids, same street furniture. What LOD
@@ -102,8 +124,16 @@ Buildings light up according to what they actually are. OSM typology drives a pe
 so an office tower shows a strict curtain-wall grid, a condo shows scattered individual units and
 balcony spill, retail lights only its ground floor, and a stadium dome gets no windows at all.
 
-Under the hood: cascaded shadow maps, SSAO, GGX specular, screen-space reflections, bloom, and
-procedural window grids that drop to coarser levels with distance so the skyline never aliases.
+**The lamps are real lights.** 32,537 luminaires — cobra heads, pedestrian poles, heritage acorns
+and the spill out of every lit shopfront — are registered at their lens with a clustered forward
+light rig that ranks and uploads the 512 nearest each frame. Measured on Queen West at night, the
+carriageway reads luma 0.15 under a lamp against 0.08 between them, warm under sodium and neutral
+in the gaps. At noon the rig uploads exactly zero: `city.js` says only that a luminaire *exists*
+somewhere, and the renderer alone decides when it is on.
+
+Under the hood: cascaded shadow maps, SSAO, GGX specular, screen-space reflections, bloom, an
+anisotropic wet-road model with world-space puddles, and procedural window grids that drop to
+coarser levels with distance so the skyline never aliases.
 
 ## Controls
 
@@ -165,14 +195,18 @@ Needs WebGL2 — Chrome, Edge, Firefox or Safari 15+, hardware acceleration on.
 `data/toronto.json` is committed, so you only need this to change the area or refresh the source.
 
 ```bash
-python3 tools/build_city.py    # clip + reproject the massing shapefile, read OSM
+python3 tools/build_city.py    # clip + reproject the massing shapefile, read OSM ways
 python3 tools/match_osm.py     # attach typology, materials and facade colours
+python3 tools/attach_pois.py   # attach OSM NODES: shop units, street furniture, storeys
 python3 tools/pack_city.py     # pack the binary sidecar the loader actually reads
 ```
 
-Or `npm run build:city`, which runs all three in order. `data/toronto.json` is the authoring
-format; `data/toronto.bin` is the packed sidecar — both ship, and the loader falls back to the
-JSON with a console warning if the sidecar is missing or stale.
+`data/toronto.json` is the authoring format; `data/toronto.bin` is the packed sidecar — both
+ship, and the loader falls back to the JSON with a console warning if the sidecar is missing. Note
+that a sidecar packed before `attach_pois.py` existed is **not** detected as stale: it decodes
+cleanly and simply has no shop units and no street furniture in it, so the city comes up with an
+entirely invented ground floor and nothing complains. Re-run `pack_city.py` after any change to the
+JSON, and hard-reload the browser — the sidecar caches aggressively.
 
 The pipeline has no Python dependencies — the ESRI shapefile and dBASE parsers are written from
 scratch. `tools/build_city.py` expects the source data in `data/raw/` (gitignored, ~400 MB); the

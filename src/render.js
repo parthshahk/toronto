@@ -13,11 +13,15 @@
 //   4. wet streets and a glassy lake reflecting the skyline via screen-space reflections,
 //   5. a deep cyan-to-indigo sky grading warm orange at the WNW horizon where the sun just set.
 //
-// VERTEX FORMAT (13 floats, see gl.js): [px,py,pz, nx,ny,nz, r,g,b, emissive, tintable, rough,
-// profile]. `aMat` is a **vec4** at attribute location 3 — (emissive, tintable, rough, profile).
-// The profile is an OSM-derived lighting class carried per building by data/toronto.json:
+// VERTEX FORMAT (14 floats, see gl.js): [px,py,pz, nx,ny,nz, r,g,b, emissive, tintable, rough,
+// profile, uv]. `aMat` is a **vec4** at attribute location 3 — (emissive, tintable, rough,
+// profile). The profile is an OSM-derived lighting class carried per building by
+// data/toronto.json:
 //   0 envelope (NO windows) · 1 office · 2 residential · 3 retail · 4 parking · 5 civic
+//   6 GLYPH — a quad of text in the world (src/text.js), drawn by the text pass below
 // It travels to the fragment stage FLAT, never interpolated: it is an enum, not a quantity.
+// `aUv` at location 4 is one float carrying a packed [0,1]^2 texture coordinate; only the text
+// pass reads it, and gl.js owns both halves of the encoding (packUv / GLSL_UV).
 //
 // Rendering model: forward, single geometry pass with MRT.
 //   COLOR_ATTACHMENT0  RGBA16F (or RGBA8 range-compressed)  linear HDR radiance
@@ -32,8 +36,16 @@
 // the resolve pass multiplies by `1 - share * (1 - ao)`. Direct light and emissive windows are
 // never touched by AO, which is the whole point — a lit window inside an alley must not go grey.
 //
+// LOCAL LIGHTS. Every street lamp in the city is a real punctual light, not merely an emissive
+// lens: a clustered forward rig over a world-space uniform grid, culled and ranked per frame,
+// bounded per FRAGMENT by the cluster's slot count rather than by how many lamps the city has.
+// Register them once with `renderer.setLights(list)` — see that method — and the renderer owns
+// culling, ranking, clustering, the per-frame cap and the time-of-day gate from there. Registering
+// nothing renders exactly as this file did before the rig existed. See the LIGHT_* constants for
+// why the clusters are world-space and 2-D, and GLSL_LIGHTS for the shading.
+//
 // EVERY feature degrades independently and NONE of them may block boot:
-//   renderer.quality = { shadows: 'off'|'low'|'high', ssao, ssr, bloom, clouds, fxaa }
+//   renderer.quality = { shadows: 'off'|'low'|'high', ssao, ssr, bloom, clouds, fxaa, lights }
 // plus the original three-tier bloom fallback (float target -> RGBA8 target -> straight to the
 // screen, graded in-shader). Anything that fails at setup latches itself off with one warning.
 //
@@ -49,6 +61,8 @@
 //   renderer.drawMesh(city.meshes.terrain, IDENTITY)
 //   renderer.drawMesh(city.meshes.buildings, IDENTITY)   ... roads, sidewalks, rails, props, glass
 //   renderer.drawWater(city.meshes.water, camera)
+//   renderer.drawText(city.meshes.signs, IDENTITY)       LAST of the geometry: a blended decal
+//                                       pass that never writes depth and never casts a shadow
 //   renderer.endFrame()              -> SSAO, SSR, resolve, bloom, composite
 //
 // World axes: X = east, Y = up, Z = south. Right-handed. TRUE METRES.
@@ -56,7 +70,8 @@
 import {
   clamp, mat4, vec3, m4identity, m4lookAt, m4mul, m4ortho, m4perspective, m4invert,
 } from './math.js';
-import { Shader } from './gl.js';
+import { Shader, GLSL_UV } from './gl.js';
+import { getFont, forgetFont, releaseFont, TEXT_FADE_START, TEXT_FADE_END } from './text.js';
 
 /* ----------------------------------------------------------------- constants */
 
@@ -190,6 +205,88 @@ const DAY_FOG_DENSITY = 0.24;
 // was; what changed is how the range above a shaded wall is distributed, not how bright it is.
 const DAY_EXPOSURE = 5.12;
 
+// --- local lights: a world-space CLUSTERED forward rig -----------------------------------------
+// Why clustered-in-WORLD-SPACE rather than tiled-in-SCREEN-SPACE, which is the usual answer.
+//
+// A tiled (Forward+) rig bins lights into screen tiles every frame, which means projecting every
+// light's bounding sphere, depth-partitioning the tile, and writing a fresh per-tile list — work
+// that is proportional to the light count AND has to be redone whenever the camera so much as
+// turns. WebGL2 has no compute shaders and no SSBOs, so all of that lands on the CPU and then has
+// to be uploaded as a texture anyway.
+//
+// This city's lights do not move. Ever. They are street lamps bolted to masts, and they are
+// distributed as a two-dimensional field: every one of them sits within a couple of metres of
+// street level, and its useful reach is a squat cylinder about 30 m across. That makes a plain
+// UNIFORM GRID OVER WORLD XZ the natural cluster structure — no depth slices, no frustum maths,
+// no projection, and a fragment finds its cluster with two subtractions and a floor. The camera
+// only decides WHICH WINDOW of that grid is resident.
+//
+// So the per-frame CPU work is: pull the lights inside an 896 m window out of a static broadphase
+// grid, rank them, stamp each one into the handful of 28 m cells its disc covers, and upload two
+// small textures (16 KB of light parameters, 32 KB of cell lists). The per-FRAGMENT work is
+// bounded by LIGHT_SLOTS and by nothing else — not by how many lamps the city has, which is the
+// entire point and what makes this scale from the 1,403 surveyed lamp positions in the current
+// extract to the ~130,000 the full city implies.
+//
+// A fragment outside the window pays ONE compare. A fragment inside an empty cell pays one
+// texelFetch that returns 0 and breaks. That is what pays for the window being big enough to hold
+// the pools receding down a street, which is most of what a night street looks like.
+//
+//   LIGHT_MAX     lights uploaded per frame. Reported as renderer.lightStats.uploaded.
+//   LIGHT_GRID_N  cells per side of the window
+//   LIGHT_CELL    metres per cell; N x CELL is the window edge (32 x 28 = 896 m)
+//   LIGHT_SLOTS   light indices per cell — the HARD per-fragment loop bound
+//   LIGHT_CAND    candidates the gather will look at before it gives up ranking them
+const LIGHT_MAX = 512;
+const LIGHT_GRID_N = 32;
+const LIGHT_CELL = 28;
+const LIGHT_SLOTS = 16;
+const LIGHT_CAND = 4096;
+// Broadphase cell for the STATIC index built once by setLights(). Bigger than the cluster cell
+// because it is only ever queried with a window-sized box.
+const LIGHT_BROAD_CELL = 96;
+// The largest influence radius any registered light may claim. It bounds how far outside the
+// window the gather has to reach so a lamp just past the edge still lights the ground inside it.
+const LIGHT_RADIUS_MAX = 64;
+
+// The luminaire types a caller may name. `power` is scene-linear radiance at one metre — the same
+// units the rest of this renderer works in, fitted (see the Renderer's `lights` block) so a cobra
+// head at 9.5 m lays a pool on 3% asphalt that reads at roughly 60 luma against a 6 luma street
+// between the masts. The 'cone' field is the luminaire distribution: 1 = full cutoff (nothing above
+// the horizontal), 0 = a bare globe. NONE of this encodes a time of day — CONTRACT Amendment 7;
+// `env.nightFactor` and `env.daylight` alone decide when the rig is on.
+const LIGHT_KINDS = [
+  // 0 cobra: high-pressure sodium on an arterial mast. Toronto's legacy default and still most
+  //   of the network — this is the colour that makes a Toronto night photograph orange.
+  { key: 'cobra', color: [1.000, 0.600, 0.220], power: 420, radius: 32, cone: 0.92 },
+  // 1 led: the 4000 K replacement head going in across the city. Cooler, tighter, brighter.
+  { key: 'led', color: [0.870, 0.930, 1.000], power: 460, radius: 32, cone: 0.95 },
+  // 2 acorn: heritage globe (Distillery, St Lawrence, Queens Quay). Non-cutoff, so it glows.
+  { key: 'acorn', color: [1.000, 0.760, 0.430], power: 145, radius: 20, cone: 0.15 },
+  // 3 ped: pedestrian-scale post top on a sidewalk or a plaza.
+  { key: 'ped', color: [1.000, 0.790, 0.480], power: 180, radius: 22, cone: 0.62 },
+  // 4 shop: light thrown out of a lit ground-floor interior onto the pavement in front of it.
+  { key: 'shop', color: [1.000, 0.870, 0.700], power: 100, radius: 14, cone: 0.30 },
+  // 5 signal: a traffic or pedestrian head. Barely lights anything; it is here so a signalised
+  //   intersection reads as one at night.
+  { key: 'signal', color: [1.000, 0.560, 0.240], power: 36, radius: 10, cone: 0.35 },
+  // 6 tunnel: batten luminaire under a soffit, teamway or underpass. Neutral and close in.
+  { key: 'tunnel', color: [1.000, 0.940, 0.800], power: 130, radius: 16, cone: 0.55 },
+];
+const LIGHT_KIND_INDEX = (() => {
+  const m = Object.create(null);
+  for (let i = 0; i < LIGHT_KINDS.length; i++) m[LIGHT_KINDS[i].key] = i;
+  // A few aliases a caller is likely to reach for, so registering lamps never needs this table.
+  m.sodium = 0; m.lamp = 0; m.street = 0; m.arterial = 0;
+  m.white = 1; m.cool = 1;
+  m.globe = 2; m.heritage = 2;
+  m.pedestrian = 3; m.post = 3;
+  m.shopfront = 4; m.interior = 4;
+  m.traffic = 5;
+  m.batten = 6; m.soffit = 6;
+  return m;
+})();
+
 // Module-scope scratch — the hot paths must not allocate.
 const _tint = new Float32Array(3);
 const _sun = new Float32Array(3);
@@ -213,6 +310,17 @@ const _ssrParam = new Float32Array(4);
 const _aoParam = new Float32Array(4);
 const _dayInd = new Float32Array(4);
 const _cnTower = new Float32Array(4);
+// Road surface response: x = wetness, y = dry roughness, z = wet roughness, w = anisotropy.
+const _road = new Float32Array(4);
+// Local-light cluster window: xy = its world XZ origin, z = 1 / cell size, w = master gain.
+const _lightWin = new Float32Array(4);
+// x = rig level (0 at midday, 1 at Night), y = 1 when the tables hold something worth sampling.
+const _lightRig = new Float32Array(2);
+// Text pass: xy = atlas size in texels, z = the SDF's texel range, w = cap height in texels.
+const _glyphAtlas = new Float32Array(4);
+// x = fade start (m), y = 1 / fade span, z = cap px below which a glyph is gone, w = cap px
+// above which it is fully opaque.
+const _textLod = new Float32Array(4);
 const _lightEye = vec3();
 const _lightTarget = vec3();
 const _lightUp = vec3(0, 1, 0);
@@ -1460,6 +1568,157 @@ float vhCnBeacon(float hUp, float at, float rate, float time) {
   return band * (0.10 + 0.90 * pulse);
 }
 `;
+
+// --- LOCAL LIGHTS ------------------------------------------------------------------------------
+// The street lamps, as actual lights. Until this existed the ONLY street lighting in the renderer
+// was uStreetColor — one global uniform wash keyed on height above grade and multiplied by 0.30 on
+// anything horizontal, which on 3%-reflectance asphalt at Night comes to about 0.002 linear. That
+// is black. Every mast in the city carried a genuine emissive lens and lit nothing at all, because
+// an emissive lens is a surface that is BRIGHT, not a surface that ILLUMINATES.
+//
+// So: real punctual lights, clustered in world space. See the LIGHT_* block at the top of this
+// file for why the cluster grid is a 2-D world grid rather than a screen tiling.
+//
+// The rig is gated on nightFactor * (1 - daylight) at the point of use and NOTHING is baked:
+// Afternoon multiplies it by exactly zero, Golden hour by 0.099, Blue hour by 0.86 and Night by
+// 1.0, all of them read straight off the existing preset fields (CONTRACT Amendment 7).
+//
+// There are no shadow maps for these lights. A cascade set per lamp is out of the question at this
+// count, and the alternative — omitting the lights — is what the previous build did. The reach is
+// deliberately short (a windowed inverse square that is fully closed by ~32 m) and the cutoff term
+// puts almost nothing above the head, so the leak is bounded to about a wall thickness: a lamp on
+// the far side of a building lights a couple of metres of the near face and nothing else.
+const GLSL_LIGHTS = `
+const int VH_LGRID = ${LIGHT_GRID_N};
+const int VH_LSLOTS = ${LIGHT_SLOTS};
+
+// Row 0 of uLightData: xyz = world position, w = influence radius.
+// Row 1:               rgb = colour x power, w = cutoff (0 bare globe .. 1 full cutoff head).
+uniform highp sampler2D uLightData;
+// One texel per (cell, slot): the light index PLUS ONE, so 0 can mean "no more lights here".
+uniform highp usampler2D uLightGrid;
+uniform vec4 uLightWindow;   // xy = window origin in world XZ, z = 1 / cell size, w = master gain
+uniform vec2 uLightRig;      // x = rig level, y = 1 when the tables are live
+
+// Anisotropic GGX (Burley). Two roughnesses about an in-plane frame instead of one, which is what
+// turns a lamp's reflection on a road from a round blob into the long smear you actually see.
+float vhD_GGXAniso(float ndh, float tdh, float bdh, float ax, float ay) {
+  float dx = tdh / max(ax, 1e-4);
+  float dy = bdh / max(ay, 1e-4);
+  float k = dx * dx + dy * dy + ndh * ndh;
+  return 1.0 / max(VH_PI * ax * ay * k * k, 1e-7);
+}
+
+// The axis the sheen stretches along: the HORIZONTAL component of the view direction, projected
+// into the surface. Asphalt is anisotropic because it is rolled, and it is rolled along the
+// carriageway — which is the direction a pedestrian on that carriageway is almost always looking.
+// Deriving the axis from the view rather than from a road tangent costs nothing (there are no
+// tangents in this vertex format), is continuous everywhere, and degenerates gracefully: looking
+// straight down at the road there IS no streak direction, and the fallback below is only ever
+// reached within a twentieth of a degree of vertical, where the highlight is a round spot anyway.
+vec3 vhAnisoAxis(vec3 N, vec3 V) {
+  vec3 t = vec3(V.x, 0.0, V.z);
+  t = t - N * dot(N, t);
+  float l = length(t);
+  if (l > 1e-3) return t / l;
+  vec3 f = abs(N.x) < 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 0.0, 1.0);
+  vec3 t2 = f - N * dot(N, f);
+  float l2 = length(t2);
+  return l2 > 1e-4 ? t2 / l2 : vec3(1.0, 0.0, 0.0);
+}
+
+// Sum the lamps whose cluster cell this fragment falls in. 'aniso' is 0 for everything that is not
+// a carriageway, and at 0 the anisotropic lobe below is the isotropic one to the bit.
+void vhLocalLights(vec3 P, vec3 N, vec3 V, float ndv, float rough, float aniso,
+                   out vec3 diffuse, out vec3 specular) {
+  diffuse = vec3(0.0);
+  specular = vec3(0.0);
+  float rig = uLightRig.x;
+  if (rig <= 0.002 || uLightRig.y < 0.5) return;
+
+  // Which cluster cell. Two subtractions, a multiply and a floor — no projection, no frustum.
+  vec2 g = (P.xz - uLightWindow.xy) * uLightWindow.z;
+  if (g.x < 0.0 || g.y < 0.0) return;
+  ivec2 c = ivec2(g);
+  if (c.x >= VH_LGRID || c.y >= VH_LGRID) return;
+
+  vec3 T = vhAnisoAxis(N, V);
+  vec3 Bt = cross(N, T);
+  float a = max(rough * rough, 0.0016);
+  // Stretch the lobe along T and narrow it across, holding ax * ay — and therefore the lobe's
+  // integral — constant, so anisotropy moves the highlight's SHAPE and never its energy.
+  float k = 1.0 + clamp(aniso, 0.0, 1.0) * 2.6;
+  float ax = clamp(a * k, 0.0016, 0.98);
+  float ay = clamp(a / k, 0.0016, 0.98);
+  float aIso = sqrt(max(ax * ay, 1e-8));
+  float gain = max(uLightWindow.w, 0.0) * rig;
+  int base = c.x * VH_LSLOTS;
+
+  for (int s = 0; s < VH_LSLOTS; s++) {
+    uint id = texelFetch(uLightGrid, ivec2(base + s, c.y), 0).r;
+    if (id == 0u) break;                       // the cell's list is packed, so this is the end
+    int li = int(id) - 1;
+    vec4 lp = texelFetch(uLightData, ivec2(li, 0), 0);
+    vec3 dv = lp.xyz - P;
+    float d2 = dot(dv, dv);
+    float r2 = max(lp.w * lp.w, 1e-4);
+    if (d2 >= r2) continue;
+    float d = sqrt(max(d2, 1e-8));
+    vec3 L = dv / d;
+    float ndl = dot(N, L);
+    if (ndl <= 0.0) continue;
+
+    vec4 lc = texelFetch(uLightData, ivec2(li, 1), 0);
+    // Karis' windowed inverse square: physical falloff with a finite radius and no visible edge
+    // where it ends. The +1 m^2 is the source's own size — without it a fragment that lands on
+    // the lens itself returns infinity.
+    float w = clamp(1.0 - d2 / r2, 0.0, 1.0);
+    w *= w;
+    // Luminaire distribution. A full-cutoff cobra head puts nothing above the horizontal and is
+    // at full output a few degrees below it; a heritage globe is very nearly omnidirectional.
+    // L points from the fragment TO the lamp, so dot(vec3(0,-1,0), -L) — how far below the lamp
+    // this fragment sits, measured along the luminaire's own downward axis — is exactly L.y.
+    float cut = mix(1.0, smoothstep(-0.34, 0.10, L.y), clamp(lc.w, 0.0, 1.0));
+    float e = (w / (d2 + 1.0)) * cut * gain;
+    if (e <= 1e-7) continue;
+
+    diffuse += lc.rgb * (e * ndl);
+
+    vec3 H = normalize(L + V);
+    float ndh = clamp(dot(N, H), 0.0, 1.0);
+    float vdh = clamp(dot(V, H), 0.0, 1.0);
+    float D = vhD_GGXAniso(ndh, dot(T, H), dot(Bt, H), ax, ay);
+    vec3 sp = lc.rgb * (e * ndl * D * vhV_Smith(ndv, ndl, aIso)) * vhF_Schlick(vec3(0.04), vdh);
+    // One wet pixel lining a lamp up exactly must not return four figures of radiance and become
+    // a firefly the bloom chain then smears across the frame.
+    specular += min(sp, vec3(6.0));
+  }
+}
+
+// --- the road surface --------------------------------------------------------------------------
+// Value noise on WORLD XZ (CONTRACT §8.4: every procedural hash is keyed on world position, never
+// on an index, so a tile looks the same whether or not its neighbours are resident).
+float vhNoise2(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = p - i;
+  f = f * f * (3.0 - 2.0 * f);
+  float a = vhHash21(i);
+  float b = vhHash21(i + vec2(1.0, 0.0));
+  float c = vhHash21(i + vec2(0.0, 1.0));
+  float d = vhHash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// How wet a patch of carriageway is, 0..1. Two octaves at 18 m and 5.5 m: standing water gathers
+// in the crown's low side and along the gutter line in patches tens of metres long, and a road
+// that is uniformly wet everywhere is exactly the varnished-sheet look this is here to kill.
+// 'k' is env-level wetness; at k = 0 the smoothstep window sits entirely above the noise's range
+// and this returns 0 for every fragment in the city.
+float vhRoadWet(vec2 xz, float k) {
+  float f = vhNoise2(xz * 0.0555) * 0.70 + vhNoise2(xz * 0.1820 + vec2(37.3, 11.7)) * 0.30;
+  return smoothstep(1.0 - k, 1.02 - k * 0.35, clamp(f, 0.0, 1.0));
+}
+`;
 /* ------------------------------------------------------------------ scene pass */
 
 const SCENE_VS = `#version 300 es
@@ -1528,6 +1787,8 @@ uniform float uWindowGain;
 uniform float uDaylight;     // 0 = blue hour / night, 1 = full sun. Every daylight path is gated
                              // on this and is an EXACT no-op at 0.
 uniform vec4 uDayIndirect;   // x = wall bounce, y = street bounce, z = sky view, w = warmth
+uniform vec4 uRoad;          // x = wetness, y = dry roughness, z = wet roughness, w = anisotropy
+uniform float uEmitterGain;  // how much brighter a genuine luminaire is than a lit window pane
 uniform float uExposure;     // daylight exposure, applied with the OETF in the grade
 uniform float uTime;
 uniform float uFlash;
@@ -1540,6 +1801,7 @@ ${GLSL_COMMON}
 ${GLSL_GRADE}
 ${GLSL_SHADOW}
 ${GLSL_FACADE}
+${GLSL_LIGHTS}
 
 // --- daylight model constants -----------------------------------------------------------------
 // VH_DAY_SKY_FILL, VH_DAY_SUN_GAIN and VH_DAY_GROUND_GAIN live in GLSL_COMMON, above: the water
@@ -1558,6 +1820,11 @@ void main() {
   float emis = clamp(vMat.x, 0.0, 4.0);
   float tintable = clamp(vMat.y, 0.0, 1.0);
   float rough = clamp(vMat.z, 0.03, 1.0);
+  // The AUTHORED roughness, kept because it is the only thing in the vertex format that separates
+  // a carriageway from the kerb beside it: city.js gives asphalt 0.18 and highway 0.16 while every
+  // matte ground cover it emits — sidewalk 0.72, kerb 0.70, path 0.78, ballast 0.95 — sits far
+  // above. The 'rough' local itself is rewritten several times below, so it cannot be used.
+  float rough0 = rough;
   // The lighting profile: 0 envelope, 1 office, 2 residential, 3 retail, 4 parking, 5 civic.
   // It arrives flat-interpolated, so this rounds an exact integer and never a blend of two.
   int prof = int(clamp(vProfile, 0.0, 5.0) + 0.5);
@@ -1613,6 +1880,37 @@ void main() {
   // shader, so the harbour keeps its reflection.
   float ground = smoothstep(0.55, 0.85, N.y);
   rough = clamp(mix(rough, max(rough, 0.72), uDaylight * ground), 0.03, 1.0);
+
+  // --- asphalt is not glass ------------------------------------------------
+  // The wet-street look is the signature of this build (CONTRACT §0), and it had been taken to a
+  // place where the carriageway behaved like a polished sheet: authored at roughness 0.18 it kept
+  // 82% of a SHARP sky reflection, picked up vhEnvSpecWeight's polish tail (a term that exists so
+  // mirror-smooth curtain wall silvers at a grazing angle), and handed SSR a confidence of 0.53
+  // over the whole roadway. Every square metre of every street mirrored the towers equally. Real
+  // asphalt does not. It is a rough mineral aggregate; it returns a BROAD, DIM sheen, and it turns
+  // into a mirror only where there is genuinely a film of water on it.
+  //
+  //   dry  0.55  bituminous aggregate. Wide lobe, no polish tail, and — because SSR reads the
+  //              same roughness out of the material G-buffer — SSR switches itself off entirely
+  //              (its gate is 1 - smoothstep(0.07, 0.30, rough), which is 0 by 0.30).
+  //   wet  0.11  standing water. Sharper than the old blanket 0.18, so where the road IS wet it
+  //              mirrors the skyline harder than it ever did — the signature survives, it just
+  //              stops being everywhere at once.
+  //
+  // The wet field is world-space value noise, so puddles sit in the same places every frame and
+  // across tile boundaries, and the transition between the two is smooth in ROUGHNESS, which
+  // means SSR fades in and out with it instead of switching at a hard edge.
+  //
+  // Gated on (1 - uDaylight): at Afternoon this whole block multiplies by exactly zero and the
+  // line above — which already forces a dry 0.72 under a sun — is untouched, to the bit.
+  float roadAmt = ground * (1.0 - smoothstep(0.16, 0.38, rough0)) * (1.0 - uDaylight);
+  float roadAniso = 0.0;
+  if (roadAmt > 0.002) {
+    float wet = vhRoadWet(vWorld.xz, clamp(uRoad.x, 0.0, 1.0));
+    rough = clamp(mix(rough, mix(uRoad.y, uRoad.z, wet), roadAmt), 0.03, 1.0);
+    // Dry aggregate carries the anisotropy; a wet film is a liquid surface and has none.
+    roadAniso = clamp(uRoad.w, 0.0, 1.0) * roadAmt * (1.0 - wet);
+  }
 
   // Ground-cover reflectance under a sun — see VH_DAY_GROUND_GAIN for the numbers and for why
   // the inverse bake cannot do this job. Sky-facing and near the street is what says "ground
@@ -1749,11 +2047,27 @@ void main() {
   float spill = exp2(-1.442695 * clamp(hAbove, 0.0, 80.0) * 0.135) * smoothstep(-3.0, 0.6, hAbove);
   vec3 street = uStreetColor * spill * (0.30 + 0.70 * vertical);
 
+  // --- the lamps themselves -------------------------------------------------
+  // uStreetColor above is a WASH: one uniform, one exponential in height above grade, the same
+  // everywhere in the city. It says "there is street lighting in this world". It cannot say where
+  // any of it is, and on a horizontal surface its 0.30 factor put 3%-reflectance asphalt at 0.002
+  // linear — black — under every mast in Toronto.
+  //
+  // These are the actual luminaires: punctual lights at the surveyed lamp positions, clustered in
+  // world space (see GLSL_LIGHTS and the LIGHT_* block). The wash is deliberately LEFT ALONE, so a
+  // build that registers no lights at all renders exactly as it did; the pools are added on top,
+  // and where they exist they are two orders of magnitude above the wash and simply dominate it.
+  vec3 lampDiff = vec3(0.0);
+  vec3 lampSpec = vec3(0.0);
+  vhLocalLights(vWorld, N, V, ndv, rough, roadAniso, lampDiff, lampSpec);
+
   // The bounce joins the ambient rather than the direct light: it arrives from every direction
   // at once, it is what the SSAO resolve is entitled to occlude (an alcove sees less of the lit
   // city too), and it must not carry a shadow — it IS the light the shadow left behind.
   vec3 ambientTerm = albedo * ((ambient + bounce) * contact + street) * kd + specEnv;
-  vec3 col = ambientTerm + albedo * direct * kd + spec;
+  // Local lights are DIRECT light and stay out of the ambient share for the same reason the key
+  // does: the pool under a lamp is not something an ambient-occlusion term is entitled to remove.
+  vec3 col = ambientTerm + albedo * direct * kd + spec + albedo * lampDiff * kd + lampSpec;
 
   // --- emissive -------------------------------------------------------------
   float night = clamp(uNightFactor, 0.0, 1.0);
@@ -1774,6 +2088,27 @@ void main() {
   // the shoulder together, so most lit pixels came out colourless white.
   if (uOutputMode > 0.5) glow *= mix(1.25, 1.62, night);
   col = mix(col, glow, e);
+
+  // A LAMP IS NOT A LIT WINDOW PANE. mix(col, glow, e) can never take a surface past its own
+  // albedo, so a sodium lens at emissive 1.0 arrived at very nearly the same screen value as an
+  // office pane behind glass — which is why every mast in the city read as decoration rather than
+  // as the source of the light on the pavement under it.
+  //
+  // city.js and props.js both mark a GENUINE luminaire with emissive >= 0.50 (their EMITTER_MIN)
+  // and a facade "there are windows here" hint with emissive <= 0.10, so the two are separable
+  // with no new channel. Genuine emitters get their radiance lifted ADDITIVELY, which puts them
+  // decisively over the bright pass' threshold and gives them the bloom halo that is what
+  // actually makes a lamp read as a lamp from three blocks away.
+  //
+  // The grazing term is the reason it reads FROM THE SIDE. A cobra head's lens is a downward-
+  // facing frosted panel: seen from below it is a flat rectangle, seen from across the street it
+  // is edge-on, and a diffuser shows more of its own scattering depth the more obliquely you look
+  // through it. Bounded at 1.30 and never divided by ndv, so it cannot go singular.
+  //
+  // The 'e' factor already carries mix(0.20, 1.0, night) * (1 - uDaylight), so this is off at
+  // Afternoon by exactly the gate the rest of the emissive rig uses — CONTRACT Amendment 7.
+  float lamp = smoothstep(0.44, 0.56, emis) * e;
+  if (lamp > 0.002) col += glow * (lamp * max(uEmitterGain, 0.0) * (0.70 + 0.60 * (1.0 - ndv)));
 
   // Window light is added, not mixed: the pane still reflects the sky on top of what is behind
   // it, which is exactly how a lit curtain wall behaves at dusk. The gain is deliberately well
@@ -1850,6 +2185,233 @@ void main() {
   }
 }
 `;
+/* ------------------------------------------------------------------- text pass */
+
+// TEXT IN THE WORLD. A separate program rather than a branch in the scene shader, for three
+// reasons that are all about not paying for text on the 10.8 M vertices that are not text:
+//
+//   1. The scene pass is opaque, writes depth and feeds the depth buffer that SSAO and SSR march.
+//      A glyph is a DECAL a centimetre off the fascia behind it: it must be blended (its edge is
+//      analytic coverage, and a hard alpha test aliases a 3 px cap height into confetti), and it
+//      must NOT write depth, or an SSR ray would reflect the letter instead of the shopfront and
+//      SSAO would find an occluder floating in front of a flat wall. Those are opposite states.
+//   2. Blending needs the text drawn after the opaque geometry. Giving it its own entry point
+//      makes that an explicit ordering the caller controls rather than an accident of which
+//      material class the glyphs happened to land in.
+//   3. It keeps the atlas sampler, the fwidth() of the texture coordinate and the level-of-detail
+//      fade out of the shader that every building in the city compiles through.
+//
+// It is NOT a separate lighting model. Everything below — the daylight albedo expansion, the key,
+// the cascades, the directional sky irradiance, the street-lamp spill, the emissive rule and the
+// aerial perspective — is the scene shader's, term for term, so a painted board and the wall it
+// is painted on move together at every time of day. What is missing is deliberate: no window
+// lattice (a glyph is not a curtain wall) and no GGX lobe from the key (vinyl and enamel letters
+// are matte, and the board behind them already carries the sheen).
+//
+// The glyph itself is a signed distance field; see src/text.js for why, and for the atlas.
+const TEXT_VS = `#version 300 es
+precision highp float;
+
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec3 aColor;
+layout(location = 3) in vec4 aMat;
+layout(location = 4) in float aUv;
+
+uniform mat4 uViewProj;
+uniform mat4 uModel;
+
+out vec3 vNormal;
+out vec3 vColor;
+out vec4 vMat;
+out vec3 vWorld;
+out vec2 vUv;
+
+${GLSL_UV}
+
+void main() {
+  vec4 wp = uModel * vec4(aPos, 1.0);
+  vWorld = wp.xyz;
+  vNormal = mat3(uModel) * aNormal;
+  vColor = aColor;
+  vMat = aMat;
+  // Unpacked HERE, per vertex, so the varying interpolates a real vec2 and the 12-bit
+  // quantisation cannot accumulate across the quad.
+  vUv = vhUnpackUv(aUv);
+  gl_Position = uViewProj * wp;
+}
+`;
+
+const TEXT_FS = `#version 300 es
+precision highp float;
+
+in vec3 vNormal;
+in vec3 vColor;
+in vec4 vMat;
+in vec3 vWorld;
+in vec2 vUv;
+
+uniform sampler2D uGlyphs;
+uniform vec4 uGlyphAtlas;    // xy = atlas size in texels, z = SDF texel range, w = cap height (texels)
+uniform vec4 uTextLod;       // x = fade start (m), y = 1/fade span, z = gone below this cap px,
+                             // w = fully opaque above this cap px
+uniform float uTextWeight;   // texels of dilation applied as the glyph minifies
+
+uniform vec3 uCameraPos;
+uniform vec3 uKeyDir;
+uniform vec3 uKeyColor;
+uniform vec3 uSunDir;
+uniform vec3 uSkyZenith;
+uniform vec3 uSkyHorizon;
+uniform vec3 uSkyWest;
+uniform vec3 uAmbientSky;
+uniform vec3 uAmbientGround;
+uniform vec3 uStreetColor;
+uniform vec3 uFogColor;
+uniform vec3 uTint;
+uniform vec4 uFogParams;
+uniform vec4 uFogRange;
+uniform vec4 uDayIndirect;
+uniform float uFogBeta;
+uniform float uSkyBounce;
+uniform float uNightFactor;
+uniform float uDaylight;
+uniform float uExposure;
+uniform float uAlpha;
+uniform float uOutputMode;
+
+layout(location = 0) out vec4 outColor;
+layout(location = 1) out vec4 outMat;
+${GLSL_COMMON}
+${GLSL_GRADE}
+${GLSL_SHADOW}
+
+void main() {
+  // --- coverage from the distance field -------------------------------------
+  // Every derivative is taken up here, in uniform control flow: fwidth() past the discard below
+  // would be undefined for any 2x2 quad straddling a glyph edge, which is most of them.
+  float sd = texture(uGlyphs, vUv).r;
+  vec2 duv = fwidth(vUv) * uGlyphAtlas.xy;
+  float texPerPx = max(max(duv.x, duv.y), 1e-5);
+  // Signed distance to the outline in TEXELS, positive inside. Dividing by the texel footprint
+  // of one screen pixel converts it to pixels of coverage, which is exact antialiasing at any
+  // magnification and the whole reason this is a distance field.
+  float d = (sd - 0.5) * uGlyphAtlas.z;
+  // Strokes thinner than a pixel do not survive a correct coverage calculation: they go grey and
+  // then vanish, which reads as the sign going blank rather than going small. Dilating by a
+  // fraction of a texel exactly as fast as the glyph minifies keeps the WORD legible as a shape
+  // for another 30 m. It is zero at 1:1, so nothing close up is fattened.
+  float bold = uTextWeight * smoothstep(0.8, 3.0, texPerPx);
+  float cov = clamp((d + bold) / texPerPx + 0.5, 0.0, 1.0);
+
+  // --- level of detail ------------------------------------------------------
+  vec3 toEye = uCameraPos - vWorld;
+  float viewDist = length(toEye);
+  // Two gates, and the tighter one wins. DISTANCE is the hard guarantee the tile stage is built
+  // around. SIZE is the honest one: it is keyed on the glyph's cap height in PIXELS, so a 120 mm
+  // street blade disappears at 40 m and a 2 m tower crown survives to 700 m, with no per-run
+  // attribute and nothing for a caller to get wrong.
+  float distFade = 1.0 - clamp((viewDist - uTextLod.x) * uTextLod.y, 0.0, 1.0);
+  float capPx = uGlyphAtlas.w / texPerPx;
+  float sizeFade = smoothstep(uTextLod.z, uTextLod.w, capPx);
+  float alpha = cov * distFade * sizeFade * clamp(uAlpha, 0.0, 1.0);
+
+  // --- key light + cascaded shadows -----------------------------------------
+  // Hoisted ABOVE the discard on purpose. vhShadow is the only sampler left in this shader that
+  // takes an implicit level of detail, and derivatives are undefined once any lane in the 2x2
+  // quad has been killed — which is every quad along a glyph edge, i.e. all of them. Doing the
+  // cascade lookup first means nothing after the discard needs a derivative, so the early-out
+  // costs the sky, the GGX weights, the fog and the grade and is still legal.
+  vec3 N = normalize(vNormal);
+  float ndl = max(dot(N, uKeyDir), 0.0);
+  float shadow = vhShadow(vWorld, N, ndl, viewDist);
+
+  // Below the coverage floor the fragment cannot change the frame: under SRC_ALPHA blending an
+  // alpha of zero is an exact no-op on both draw buffers. That is most of the padded quad around
+  // every glyph, so the early-out is worth having.
+  if (alpha < 0.004) discard;
+
+  // --- material -------------------------------------------------------------
+  float emis = clamp(vMat.x, 0.0, 4.0);
+  float tintable = clamp(vMat.y, 0.0, 1.0);
+  float rough = clamp(vMat.z, 0.03, 1.0);
+
+  vec3 albedo = vColor * mix(vec3(1.0), uTint, tintable);
+  float dayAlb = uDaylight * (1.0 - smoothstep(0.44, 0.56, emis));
+  albedo = vhDayAlbedo(albedo, dayAlb);
+
+  vec3 V = viewDist > 1e-4 ? toEye / viewDist : vec3(0.0, 1.0, 0.0);
+  float ndv = clamp(dot(N, V), 1e-3, 1.0);
+  float hAbove = vWorld.y - vhGroundApprox(vWorld.xz);
+  float vertical = clamp(1.0 - abs(N.y) * 1.35, 0.0, 1.0);
+
+  vec3 keyCol = uKeyColor * mix(1.0, VH_DAY_SUN_GAIN, uDaylight);
+  vec3 direct = keyCol * ndl * shadow;
+
+  // --- urban bounce ---------------------------------------------------------
+  float lit = clamp(ndl * shadow, 0.0, 1.0);
+  float shadeW = (1.0 - lit) * (1.0 - lit);
+  float bounceK = mix(max(uDayIndirect.x, 0.0), max(uDayIndirect.y, 0.0), clamp(N.y, 0.0, 1.0));
+  vec3 bTint = mix(vec3(1.0), VH_DAY_BOUNCE_TINT, clamp(uDayIndirect.w, 0.0, 1.0));
+  bTint /= max(vhLum(bTint), 1e-4);
+  vec3 bounce = keyCol * bTint * (bounceK * shadeW * uDaylight);
+
+  // --- sky ambient ----------------------------------------------------------
+  float skyView = mix(1.0, mix(clamp(uDayIndirect.z, 0.0, 1.0), 1.0, clamp(N.y, 0.0, 1.0)),
+    uDaylight);
+  vec3 ambient = vhSkyIrradiance(N, uSkyZenith, uSkyHorizon, uSkyWest, uSunDir, uAmbientGround)
+    * (max(uSkyBounce, 0.0) * mix(1.0, VH_DAY_SKY_FILL, uDaylight) * skyView);
+
+  vec3 R = reflect(-V, N);
+  vec3 envSharp = vhSkyGradient(R, uSkyZenith, uSkyHorizon, uSkyWest, uSunDir);
+  float horizonOcc = clamp(R.y * 2.6 + 0.42, 0.0, 1.0);
+  envSharp = mix(uAmbientGround * 1.15, envSharp, horizonOcc);
+  vec3 env = mix(uAmbientSky, envSharp, 1.0 - rough);
+  vec3 specW = vhEnvSpecWeight(ndv, rough);
+  vec3 specEnv = env * specW;
+  vec3 kd = vec3(1.0) - specW;
+
+  // --- street lighting ------------------------------------------------------
+  // The term that actually makes a shop name readable at night: a fascia sits 3 m off the ground
+  // and the lamp wash is what is falling on it.
+  float spill = exp2(-1.442695 * clamp(hAbove, 0.0, 80.0) * 0.135) * smoothstep(-3.0, 0.6, hAbove);
+  vec3 street = uStreetColor * spill * (0.30 + 0.70 * vertical);
+
+  vec3 ambientTerm = albedo * ((ambient + bounce) + street) * kd + specEnv;
+  vec3 col = ambientTerm + albedo * direct * kd;
+
+  // --- emissive: an internally lit sign, and only at night --------------------
+  // CONTRACT Amendment 7. A painted board carries emissive 0 and is legible by daylight alone; a
+  // lit box sign carries emissive > 0 and the renderer, not the author, decides that it is off at
+  // midday and full after dark. Identical arithmetic to the scene shader so the sign face and the
+  // letters on it can never disagree about what time it is.
+  float night = clamp(uNightFactor, 0.0, 1.0);
+  float el = vhLum(albedo);
+  vec3 glow = max(mix(vec3(el), albedo, 1.30), vec3(0.0));
+  float e = clamp(emis, 0.0, 1.0) * mix(0.20, 1.0, night) * (1.0 - clamp(uDaylight, 0.0, 1.0));
+  if (uOutputMode > 0.5) glow *= mix(1.25, 1.62, night);
+  col = mix(col, glow, e);
+
+  // --- height fog + aerial perspective ---------------------------------------
+  float fogAmt = vhFogAmount(uCameraPos, vWorld, uFogParams, uFogRange, uFogBeta);
+  vec3 viewDir = viewDist > 1e-4 ? -V : vec3(0.0, 0.0, 1.0);
+  vec3 aerial = vhAerial(uFogColor, viewDir, uSkyZenith, uSkyHorizon, uSkyWest, uSunDir,
+    uKeyColor, uDaylight, vhAerialWeld(viewDist, uFogRange));
+  col = mix(col, aerial, fogAmt);
+  col = max(col, vec3(0.0));
+
+  // The material target is blended by the same coverage, so a glyph edge hands the resolve a
+  // weighted mix of the letter and the board it sits on — which is what is actually there. The
+  // normal is the board's normal to within a rounding error (the quad is coplanar with it), so
+  // blending the octahedral encoding is a no-op in practice rather than the nonsense it would be
+  // between two differently-oriented surfaces.
+  float ambLum = vhLum(ambientTerm) * (1.0 - e) * (1.0 - fogAmt);
+  float share = clamp(ambLum / max(vhLum(col), 1e-4), 0.0, 1.0);
+  outMat = vec4(vhOctEncode(N), rough, share);
+  outColor = vec4(vhOutD(col, uOutputMode, uDaylight, uExposure), alpha);
+}
+`;
+
 /* -------------------------------------------------------------------- sky pass */
 
 // Fullscreen triangle from gl_VertexID — no vertex buffer, no attributes.
@@ -2889,6 +3451,7 @@ export class Renderer {
       bloom: true,
       clouds: true,
       fxaa: true,        // the only AA there is once the frame renders offscreen
+      lights: true,      // the clustered local-light rig (street lamps)
     };
 
     // Tunable live: `G.renderer.bloom.intensity = 1.4`.
@@ -2912,6 +3475,27 @@ export class Renderer {
 
     this.ssao = { radius: 3.4, intensity: 1.0, bias: 0.045, power: 1.35, sharpness: 5.5 };
 
+    // TEXT LEVEL OF DETAIL. Two independent gates; whichever closes first wins.
+    //
+    //   fadeStart/fadeEnd  metres. The hard guarantee, and the numbers the caller's tile stage is
+    //                      built around — src/text.js exports the same pair as TEXT_FADE_START /
+    //                      TEXT_FADE_END, and TEXT_RANGE sits past fadeEnd so a run is already
+    //                      invisible before its tile is allowed to drop the geometry.
+    //   minPx/fadePx       CAP HEIGHT IN PIXELS. This is the gate that does the perceptual work,
+    //                      because "how far away is it" is the wrong question — a 120 mm street
+    //                      blade and a 2 m tower crown are unreadable and perfectly readable at
+    //                      the same 60 m. 4.6 px is about where a word stops being a word;
+    //                      2.4 px is where it is a smear that only crawls, so it goes.
+    //   weight             texels of dilation at full minification (see uTextWeight).
+    // Tunable live: `G.renderer.text.fadeEnd = 260`.
+    this.text = {
+      fadeStart: TEXT_FADE_START,
+      fadeEnd: TEXT_FADE_END,
+      minPx: 2.4,
+      fadePx: 4.6,
+      weight: 0.42,
+    };
+
     // Daylight INDIRECT light: the bounce off the sunlit city, and the sky-view correction that
     // goes with it. This is what makes a street canyon read as three in the afternoon instead of
     // deep dusk — see the uDayIndirect block in GLSL_COMMON for the physics and the measured
@@ -2934,13 +3518,69 @@ export class Renderer {
     this.ssr = { maxDistance: 1400, steps: 42, thickness: 1.3, stride: 0.6, intensity: 1.0 };
     this.post = { streak: 0.5, grain: 0.026, chroma: 0.0032, vignette: 0.30 };
 
+    // THE ROAD SURFACE. Asphalt is a rough mineral aggregate, not a mirror — see the "asphalt is
+    // not glass" block in SCENE_FS for what each of these does and why the old blanket 0.18 read
+    // as a polished sheet. Tunable live: `G.renderer.road.wetness = 0.8` for a downpour, 0 for a
+    // dry August night. Every one of them is multiplied by (1 - daylight) at the point of use, so
+    // Afternoon cannot be moved by any of it.
+    this.road = {
+      // Fraction of the carriageway carrying a film of standing water. 0.42 is "it rained an hour
+      // ago": the gutter lines and the low side of the crown are wet, the crowns are not.
+      wetness: 0.42,
+      dryRough: 0.55,    // bituminous aggregate — broad sheen, no SSR (its gate closes by 0.30)
+      wetRough: 0.11,    // standing water — sharper than the old blanket value, so wet is WETTER
+      // How far the dry sheen is stretched along the direction of travel: the ratio between the
+      // two in-plane roughnesses is (1 + 2.6 * aniso)^2, so 0.30 is a 3.2:1 stretch.
+      //
+      // FITTED against the pool it is allowed to flatten. Walking north on University Avenue at
+      // Night, sampling the road at the player's feet every 4 m along a 30 m lamp run, the ratio
+      // of the luma directly under a mast to the luma at mid-span runs
+      //   aniso 0.00 -> 4.9x     0.20 -> 4.6x     0.30 -> 4.4x     0.45 -> 3.4x     0.62 -> 1.6x
+      // and past about 0.45 the streak stops being a sheen on a road and becomes a second, flat,
+      // bright field — which is the varnished-sheet look this whole block exists to remove. 0.30
+      // is the most stretch the pools survive.
+      aniso: 0.30,
+    };
+
+    // THE LOCAL LIGHT RIG. Feed it with setLights(); see that method for the shape. Everything
+    // here is a dial over what setLights() registered, and none of it decides WHEN the lamps are
+    // on — env.nightFactor and env.daylight do (CONTRACT Amendment 7).
+    //
+    //   max          lights uploaded per frame, capped by LIGHT_MAX. The per-FRAGMENT bound is
+    //                LIGHT_SLOTS (16) and is unaffected by this.
+    //   gain         master multiplier on every registered light's power
+    //   radiusScale  master multiplier on every registered light's influence radius
+    //
+    // The powers in LIGHT_KINDS are a FIT, not a guess. Measured at Night on University Avenue,
+    // sampling the road at the player's own feet (the only sampling geometry in which nothing can
+    // get between the camera and the surface), a 9.5 m sodium cobra lays a pool of 42 luma
+    // directly beneath it against 9 luma at mid-span of a 30 m run and 1.3 luma with the rig
+    // switched off. A 4.4:1 maximum-to-minimum ratio along the run is what IES arterial practice
+    // actually specifies (3:1 to 6:1), and it is the same order as this build's measured 3.4:1
+    // sun/shade ratio at Afternoon — a pool at night is the night's version of a sunlit face.
+    this.lights = { max: LIGHT_MAX, gain: 1.0, radiusScale: 1.0 };
+
+    // What the rig actually did this frame. Read it, do not write it.
+    //   registered  lights setLights() is holding
+    //   candidates  lights the broadphase handed the ranker for this camera
+    //   uploaded    lights that made the per-frame cap
+    //   binned      (cell, slot) entries written into the cluster grid
+    //   dropped     stamps refused because a cell was already full
+    //   maxCell     the fullest cell's occupancy, out of LIGHT_SLOTS
+    //   ms          wall-clock cost of the whole update, milliseconds
+    this.lightStats = {
+      registered: 0, candidates: 0, uploaded: 0, binned: 0, dropped: 0, maxCell: 0, ms: 0,
+    };
+
     // Feature latches. Each one flips to false the first time its setup fails, so a broken
     // driver costs one warning for the session, not one per frame.
     this._postSupported = true;      // any offscreen target at all
     this._bloomSupported = true;
+    this._textSupported = true;
     this._ssaoSupported = true;
     this._ssrSupported = true;
     this._fxaaSupported = true;
+    this._lightsSupported = true;
     this._shadowSupported = true;
     this._depthTexSupported = true;  // depth attachment as a sampleable TEXTURE
     this._mrtSupported = true;       // second colour attachment (normal / roughness / ambient)
@@ -2954,6 +3594,29 @@ export class Renderer {
       aoA: null, aoB: null, ssr: null, streakA: null, streakB: null, ldr: null,
       levels: [], useAo: false, useSsr: false, useBloom: false, useFxaa: false,
     };
+    // The light store. `n` lights in parallel arrays (structure-of-arrays: the gather touches
+    // position and power and nothing else, and this keeps that scan in two cache lines), a static
+    // uniform-grid broadphase built once by setLights(), and the two per-frame staging buffers
+    // that become the GPU tables. Nothing here is reallocated per frame.
+    this._lights = {
+      n: 0,
+      px: null, py: null, pz: null, lr: null, pw: null,
+      cr: null, cg: null, cb: null, cone: null,
+      // Static broadphase over the whole registered set.
+      bx0: 0, bz0: 0, bnx: 0, bnz: 0, bStart: null, bItems: null,
+      // Per-frame staging.
+      data: new Float32Array(LIGHT_MAX * 2 * 4),
+      grid: new Uint16Array(LIGHT_GRID_N * LIGHT_SLOTS * LIGHT_GRID_N),
+      cand: new Int32Array(LIGHT_CAND),
+      score: new Float64Array(LIGHT_CAND),
+      ord: [],
+      cmp: null,
+      // Where this frame's window landed, and how much of it is live.
+      ox: 0, oz: 0, count: 0,
+      dataTex: null, gridTex: null, ready: false,
+    };
+    this._lights.cmp = (a, b) => this._lights.score[b] - this._lights.score[a];
+
     this._shadowState = {
       ready: false, sig: '', size: 0, count: 0, atlasW: 0, atlasH: 0,
       tex: null, fbo: null, tiles: null,
@@ -3059,6 +3722,15 @@ export class Renderer {
       fogHorizon: 3000,     // where fogMax starts giving way so the air may close completely
       fogHorizonEnd: 13000, // and where it has given way entirely — inside the far plane
       nightFactor: 0.86,
+      // How much brighter a GENUINE luminaire (emissive >= 0.50 — city.js and props.js both call
+      // it EMITTER_MIN) is than the lit window pane beside it. Before this existed they were the
+      // same brightness, because both went through mix(col, glow, e) and that expression cannot
+      // take anything past its own albedo. A lamp lens is a light source and a window is a lit
+      // room seen through glass; they are not the same order of magnitude and it shows.
+      //
+      // Applied through the same (1 - daylight) * nightFactor gate as the rest of the emissive
+      // rig, so it is exactly 0 at Afternoon (CONTRACT Amendment 7).
+      emitterGain: 2.2,
       // Base lit fraction. Each lighting profile scales it (offices up, condos and civic well
       // down — see vhFacadeStyle), so this is a master dial rather than a literal percentage.
       // It came DOWN from 0.62: the old build lit so much of every wall, in one narrow amber,
@@ -3097,9 +3769,11 @@ export class Renderer {
     this._sceneFrame = false;
     this._waterFrame = false;
     this._gshadowFrame = false;
+    this._textFrame = false;
 
     this._q = {
       shadows: 'off', ssao: false, ssr: false, bloom: false, clouds: false, fxaa: false,
+      lights: false,
     };
 
     this._createGpuResources();
@@ -3121,6 +3795,10 @@ export class Renderer {
         this._forgetTargets();
         this._forgetShadowTargets();
         this._dummyShadow = null;
+        // The glyph atlas is a texture in the DEAD context. Forget the handle rather than
+        // deleting it — deleting through the fresh context is invalid — so _createGpuResources
+        // below rasterises a new one.
+        forgetFont(gl);
         // Extension objects are per-context too: without asking again, RGBA16F is not colour
         // renderable on the new context and the post chain would silently drop to 8-bit.
         this._floatProbed = false;
@@ -3236,6 +3914,8 @@ export class Renderer {
     // Everything below is optional by construction: if any of it refuses to compile on some
     // driver, that feature turns itself off and the game still boots and renders.
     this.csmShader = null;
+    this.textShader = null;
+    this.font = null;
     this.brightShader = null;
     this.blurShader = null;
     this.compShader = null;
@@ -3251,6 +3931,23 @@ export class Renderer {
       } catch (err) {
         this._shadowSupported = false;
         this._fail('shadows', 'the depth-only shader would not compile', err);
+      }
+    }
+    // Text. Optional like everything else here: a platform with no 2-D canvas, or a driver that
+    // will not take the atlas, loses signage and keeps the city.
+    if (this._textSupported) {
+      try {
+        this.font = getFont(gl);
+        if (!this.font || !this.font.texture) throw new Error('the glyph atlas could not be built');
+        this.textShader = new Shader(gl, TEXT_VS, TEXT_FS);
+      } catch (err) {
+        if (this.textShader) {
+          try { this.textShader.dispose(); } catch (e) { /* best effort */ }
+        }
+        this.textShader = null;
+        this.font = null;
+        this._textSupported = false;
+        this._fail('text', 'the world-text pass could not be built', err);
       }
     }
     if (this._bloomSupported) {
@@ -3305,6 +4002,15 @@ export class Renderer {
     }
 
     this._makeDummyShadow();
+    // The light tables are GPU textures and a context loss takes them with it. The handles are
+    // dropped rather than deleted — deleting through the fresh context is invalid — and remade.
+    if (this._lights) {
+      this._lights.dataTex = null;
+      this._lights.gridTex = null;
+      this._lights.ready = false;
+      this._lights.count = 0;
+      this._makeLightTables();
+    }
 
     this._shader = null;
     this._vao = null;
@@ -3312,6 +4018,10 @@ export class Renderer {
     this._flash = -1;
     this._alpha = -1;
     this._shadowAlpha = -1;
+    // Uniform values are per-PROGRAM GL state, so the text pass keeps its own cache rather than
+    // sharing the scene pass's and believing a value the other program set.
+    this._txTr = -1; this._txTg = -1; this._txTb = -1;
+    this._txAlpha = -1;
   }
 
   // A 2x2 depth texture with comparison filtering, bound to uShadowMap whenever the real atlas
@@ -3338,6 +4048,401 @@ export class Renderer {
     }
   }
 
+  /* -------------------------------------------------------- local lights */
+
+  // The two GPU tables the clustered rig reads. Both are tiny and both are rewritten every frame,
+  // so they are created ONCE at whatever size the LIGHT_* constants ask for and never resized.
+  //
+  //   uLightData  RGBA32F, LIGHT_MAX x 2. Row 0 is (x, y, z, radius); row 1 is (r, g, b, cutoff)
+  //               with rgb already multiplied by the light's power. Float, because a position
+  //               anywhere in a 6.8 km extract quantises to ~4 m in half-float and that would put
+  //               every pool in the wrong place. Sampled with texelFetch and NEAREST only, which
+  //               is core WebGL2 — no EXT_color_buffer_float, no OES_texture_float_linear.
+  //   uLightGrid  R16UI, (LIGHT_GRID_N * LIGHT_SLOTS) x LIGHT_GRID_N. One texel per (cell, slot),
+  //               holding the light index PLUS ONE so that 0 can mean "end of this cell's list".
+  //
+  // 16 KB and 32 KB respectively. If either refuses to allocate the rig latches off for the
+  // session and the city renders exactly as it did before it existed.
+  _makeLightTables() {
+    if (!this._lightsSupported) return false;
+    const gl = this.gl;
+    const S = this._lights;
+    if (S.dataTex && S.gridTex) return true;
+    try {
+      // Drain any error another module left on the context, so the check below can only ever be
+      // reporting on these two allocations.
+      while (gl.getError() !== gl.NO_ERROR) { /* discard */ }
+      const data = gl.createTexture();
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, data);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, LIGHT_MAX, 2, 0, gl.RGBA, gl.FLOAT, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+      const grid = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, grid);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16UI, LIGHT_GRID_N * LIGHT_SLOTS, LIGHT_GRID_N, 0,
+        gl.RED_INTEGER, gl.UNSIGNED_SHORT, null);
+      // Integer textures may only ever be filtered NEAREST; anything else is incomplete.
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+
+      if (gl.getError() !== gl.NO_ERROR) {
+        gl.deleteTexture(data);
+        gl.deleteTexture(grid);
+        throw new Error('the driver would not allocate an RGBA32F or R16UI table');
+      }
+      S.dataTex = data;
+      S.gridTex = grid;
+      return true;
+    } catch (err) {
+      this._lightsSupported = false;
+      S.dataTex = null;
+      S.gridTex = null;
+      this._fail('lights', 'the local-light tables could not be allocated', err);
+      return false;
+    }
+  }
+
+  /**
+   * Register the city's LOCAL LIGHTS — every street lamp, shopfront and signal that should throw
+   * light onto the world rather than merely glow. This REPLACES whatever was registered before.
+   *
+   * The renderer owns culling, ranking, clustering and the per-frame cap, so a caller hands over
+   * the whole city ONCE (after the data loads, not per tile and not per frame) and never thinks
+   * about it again. 1,403 surveyed lamps costs 64 KB of index and about 30 microseconds to build.
+   *
+   * Two accepted shapes:
+   *
+   *   1. An array of objects. `x`, `y`, `z` are world metres and are the only required fields.
+   *        { x, y, z,
+   *          kind:   one of 'cobra' | 'led' | 'acorn' | 'ped' | 'shop' | 'signal' | 'tunnel'
+   *                  (plus the aliases in LIGHT_KIND_INDEX), or the numeric index. Default cobra.
+   *          color:  [r, g, b] overriding the kind's colour
+   *          power:  scene-linear radiance at one metre, overriding the kind's
+   *          radius: influence radius in metres, overriding the kind's
+   *          cone:   0 = a bare globe .. 1 = a full-cutoff head, overriding the kind's }
+   *
+   *   2. A flat numeric array (typed arrays welcome) of STRIDE 4: x, y, z, kindIndex. This is the
+   *      shape to use at full-city scale — 130,000 lamps is a 2 MB Float32Array.
+   *
+   * Positions should be the LENS, not the base of the mast: a cobra head sits ~9.5 m up and 2 m
+   * out over the carriageway, and putting the light at the foot of the post lights the post.
+   *
+   * Returns the number of lights accepted.
+   */
+  setLights(list) {
+    const S = this._lights;
+    S.n = 0;
+    S.count = 0;
+    S.ready = false;
+    this.lightStats.registered = 0;
+    if (!list || typeof list !== 'object') return 0;
+
+    const flat = (typeof list[0] === 'number') || ArrayBuffer.isView(list);
+    const n = flat ? Math.floor(list.length / 4) : (list.length | 0);
+    if (!(n > 0)) return 0;
+
+    const px = new Float32Array(n), py = new Float32Array(n), pz = new Float32Array(n);
+    const lr = new Float32Array(n), pw = new Float32Array(n);
+    const cr = new Float32Array(n), cg = new Float32Array(n), cb = new Float32Array(n);
+    const cone = new Float32Array(n);
+    let m = 0;
+
+    for (let i = 0; i < n; i++) {
+      let x, y, z, ki, col = null, power = NaN, radius = NaN, cn = NaN;
+      if (flat) {
+        const o = i * 4;
+        x = +list[o]; y = +list[o + 1]; z = +list[o + 2];
+        ki = list[o + 3] | 0;
+      } else {
+        const L = list[i];
+        if (!L) continue;
+        x = +L.x; y = +L.y; z = +L.z;
+        const k = (L.kind !== undefined) ? L.kind : L.k;
+        ki = (typeof k === 'number') ? (k | 0)
+          : (typeof k === 'string' && LIGHT_KIND_INDEX[k] !== undefined ? LIGHT_KIND_INDEX[k] : 0);
+        // isArrayLike() up top demands four entries (it guards matrices and vec4 uniforms); a
+        // colour is three, so the test is written out here rather than reused.
+        const rgb = (v) => (v !== null && typeof v === 'object' && v.length >= 3) ? v : null;
+        col = rgb(L.color) || rgb(L.c);
+        power = +(L.power !== undefined ? L.power : L.p);
+        radius = +(L.radius !== undefined ? L.radius : L.r);
+        cn = +L.cone;
+      }
+      // A NaN position would poison the broadphase bounds and take every light with it.
+      if (!Number.isFinite(x + y + z)) continue;
+      if (ki < 0 || ki >= LIGHT_KINDS.length) ki = 0;
+      const K = LIGHT_KINDS[ki];
+      const p = numOr(power, 0, 100000, K.power);
+      const c = col || K.color;
+      px[m] = x; py[m] = y; pz[m] = z;
+      lr[m] = numOr(radius, 0.5, LIGHT_RADIUS_MAX, K.radius);
+      pw[m] = p;
+      cr[m] = numOr(+c[0], 0, 64, 1) * p;
+      cg[m] = numOr(+c[1], 0, 64, 1) * p;
+      cb[m] = numOr(+c[2], 0, 64, 1) * p;
+      cone[m] = numOr(cn, 0, 1, K.cone);
+      m++;
+    }
+
+    S.px = px; S.py = py; S.pz = pz; S.lr = lr; S.pw = pw;
+    S.cr = cr; S.cg = cg; S.cb = cb; S.cone = cone;
+    S.n = m;
+    this.lightStats.registered = m;
+    this._buildLightBroadphase();
+    return m;
+  }
+
+  /** Forget every registered light. The wash (env.streetColor) is untouched. */
+  clearLights() {
+    const S = this._lights;
+    S.n = 0;
+    S.count = 0;
+    S.ready = false;
+    S.bStart = null;
+    S.bItems = null;
+    this.lightStats.registered = 0;
+  }
+
+  // A counting-sort uniform grid over the whole registered set, built once. The per-frame gather
+  // only ever asks it for a window-sized box, so the cell is coarse (LIGHT_BROAD_CELL) and the
+  // whole structure is two typed arrays with no per-cell objects. O(n), and linear in the light
+  // count exactly as CONTRACT §8.4 requires of everything that has to reach the full city.
+  _buildLightBroadphase() {
+    const S = this._lights;
+    const n = S.n;
+    S.bStart = null;
+    S.bItems = null;
+    if (n <= 0) return;
+
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const x = S.px[i], z = S.pz[i];
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (z < z0) z0 = z;
+      if (z > z1) z1 = z;
+    }
+    const cell = LIGHT_BROAD_CELL;
+    const nx = Math.max(1, Math.min(4096, Math.ceil((x1 - x0) / cell) + 1));
+    const nz = Math.max(1, Math.min(4096, Math.ceil((z1 - z0) / cell) + 1));
+    const cells = nx * nz;
+    const counts = new Int32Array(cells + 1);
+    const idx = new Int32Array(n);
+
+    for (let i = 0; i < n; i++) {
+      const ci = clamp(Math.floor((S.px[i] - x0) / cell), 0, nx - 1);
+      const cj = clamp(Math.floor((S.pz[i] - z0) / cell), 0, nz - 1);
+      const c = cj * nx + ci;
+      idx[i] = c;
+      counts[c + 1]++;
+    }
+    for (let c = 0; c < cells; c++) counts[c + 1] += counts[c];
+    const items = new Int32Array(n);
+    const cursor = new Int32Array(cells);
+    for (let i = 0; i < n; i++) {
+      const c = idx[i];
+      items[counts[c] + cursor[c]] = i;
+      cursor[c]++;
+    }
+
+    S.bx0 = x0; S.bz0 = z0; S.bnx = nx; S.bnz = nz;
+    S.bStart = counts;
+    S.bItems = items;
+  }
+
+  // Per frame: pick the window, gather, rank, cluster, upload. Called from beginFrame, before
+  // anything can ask for the scene uniforms.
+  _updateLights() {
+    const S = this._lights;
+    const st = this.lightStats;
+    st.candidates = 0; st.uploaded = 0; st.binned = 0; st.dropped = 0; st.maxCell = 0; st.ms = 0;
+    S.count = 0;
+    S.ready = false;
+    const cam = this.camera;
+    if (!this._q.lights || S.n <= 0 || !cam || !S.bStart) return;
+    // The rig is dark at Afternoon, so there is nothing to cull, rank, cluster or upload. This is
+    // what makes the daylight path an exact no-op on the CPU as well as in the shader.
+    if (this._lightRigLevel() <= 0.002) return;
+    if (!this._makeLightTables()) return;
+
+    const t0 = (typeof performance !== 'undefined' && performance.now)
+      ? performance.now() : Date.now();
+
+    // The window is SNAPPED to the cluster grid. Without the snap every fragment's cell index
+    // would shift by a sub-cell amount each frame and a pool's edge would crawl.
+    const span = LIGHT_GRID_N * LIGHT_CELL;
+    const cx = Number.isFinite(cam.pos[0]) ? cam.pos[0] : 0;
+    const cz = Number.isFinite(cam.pos[2]) ? cam.pos[2] : 0;
+    const cy = Number.isFinite(cam.pos[1]) ? cam.pos[1] : 0;
+    const ox = Math.floor((cx - span * 0.5) / LIGHT_CELL) * LIGHT_CELL;
+    const oz = Math.floor((cz - span * 0.5) / LIGHT_CELL) * LIGHT_CELL;
+    S.ox = ox;
+    S.oz = oz;
+
+    // Gather. The box is grown by LIGHT_RADIUS_MAX so a lamp just outside the window still lights
+    // the strip of ground inside it, which is what stops a seam appearing at the window edge.
+    const pad = LIGHT_RADIUS_MAX;
+    const bcell = LIGHT_BROAD_CELL;
+    const i0 = clamp(Math.floor((ox - pad - S.bx0) / bcell), 0, S.bnx - 1);
+    const i1 = clamp(Math.floor((ox + span + pad - S.bx0) / bcell), 0, S.bnx - 1);
+    const j0 = clamp(Math.floor((oz - pad - S.bz0) / bcell), 0, S.bnz - 1);
+    const j1 = clamp(Math.floor((oz + span + pad - S.bz0) / bcell), 0, S.bnz - 1);
+
+    const cand = S.cand;
+    const score = S.score;
+    let nc = 0;
+    const xLo = ox - pad, xHi = ox + span + pad;
+    const zLo = oz - pad, zHi = oz + span + pad;
+    for (let j = j0; j <= j1 && nc < LIGHT_CAND; j++) {
+      const row = j * S.bnx;
+      for (let i = i0; i <= i1 && nc < LIGHT_CAND; i++) {
+        const c = row + i;
+        const s0 = S.bStart[c], s1 = S.bStart[c + 1];
+        for (let k = s0; k < s1 && nc < LIGHT_CAND; k++) {
+          const li = S.bItems[k];
+          const x = S.px[li], z = S.pz[li];
+          if (x < xLo || x > xHi || z < zLo || z > zHi) continue;
+          const dx = x - cx, dy = S.py[li] - cy, dz = z - cz;
+          // Rank by apparent brightness at the eye, not by distance: an arterial cobra head 200 m
+          // down the street contributes more to the image than a shopfront spill 40 m behind the
+          // camera. The 400 m^2 pedestal stops the nearest lamp from owning the whole ranking.
+          cand[nc] = li;
+          score[nc] = S.pw[li] / (dx * dx + dy * dy + dz * dz + 400);
+          nc++;
+        }
+      }
+    }
+    st.candidates = nc;
+    if (nc === 0) return;
+
+    const cfg = this.lights || {};
+    const cap = Math.min(LIGHT_MAX, Math.max(0, numOr(cfg.max, 0, LIGHT_MAX, LIGHT_MAX) | 0));
+    if (cap === 0) return;
+    const gainR = numOr(cfg.radiusScale, 0.1, 4, 1);
+
+    // Rank. The order is also the cluster slot priority, so when a cell overflows it is the
+    // dimmest lights in it that are dropped and never the nearest.
+    const ord = S.ord;
+    ord.length = nc;
+    for (let i = 0; i < nc; i++) ord[i] = i;
+    ord.sort(S.cmp);
+    const take = Math.min(cap, nc);
+
+    // Stage the parameter table. Row 0 at [0, LIGHT_MAX*4), row 1 immediately after it.
+    const data = S.data;
+    const row1 = LIGHT_MAX * 4;
+    for (let s = 0; s < take; s++) {
+      const li = cand[ord[s]];
+      const o = s * 4;
+      data[o] = S.px[li];
+      data[o + 1] = S.py[li];
+      data[o + 2] = S.pz[li];
+      data[o + 3] = S.lr[li] * gainR;
+      data[row1 + o] = S.cr[li];
+      data[row1 + o + 1] = S.cg[li];
+      data[row1 + o + 2] = S.cb[li];
+      data[row1 + o + 3] = S.cone[li];
+    }
+
+    // Cluster. Every light is stamped into the cells its disc actually covers — at radius 32 m
+    // over 28 m cells that is at most 3 x 3, so the whole pass is a few thousand writes.
+    const grid = S.grid;
+    grid.fill(0);
+    const inv = 1 / LIGHT_CELL;
+    let binned = 0, dropped = 0, maxCell = 0;
+    for (let s = 0; s < take; s++) {
+      const li = cand[ord[s]];
+      const r = S.lr[li] * gainR;
+      const gx0 = Math.floor((S.px[li] - r - ox) * inv);
+      const gx1 = Math.floor((S.px[li] + r - ox) * inv);
+      const gz0 = Math.floor((S.pz[li] - r - oz) * inv);
+      const gz1 = Math.floor((S.pz[li] + r - oz) * inv);
+      const ax0 = gx0 < 0 ? 0 : gx0;
+      const ax1 = gx1 > LIGHT_GRID_N - 1 ? LIGHT_GRID_N - 1 : gx1;
+      const az0 = gz0 < 0 ? 0 : gz0;
+      const az1 = gz1 > LIGHT_GRID_N - 1 ? LIGHT_GRID_N - 1 : gz1;
+      const id = s + 1;
+      for (let gz = az0; gz <= az1; gz++) {
+        const base = gz * LIGHT_GRID_N * LIGHT_SLOTS;
+        for (let gx = ax0; gx <= ax1; gx++) {
+          const cellBase = base + gx * LIGHT_SLOTS;
+          let slot = 0;
+          while (slot < LIGHT_SLOTS && grid[cellBase + slot] !== 0) slot++;
+          if (slot >= LIGHT_SLOTS) { dropped++; continue; }
+          grid[cellBase + slot] = id;
+          binned++;
+          if (slot + 1 > maxCell) maxCell = slot + 1;
+        }
+      }
+    }
+
+    const gl = this.gl;
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, S.dataTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, LIGHT_MAX, 2, gl.RGBA, gl.FLOAT, data);
+    gl.bindTexture(gl.TEXTURE_2D, S.gridTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, LIGHT_GRID_N * LIGHT_SLOTS, LIGHT_GRID_N,
+      gl.RED_INTEGER, gl.UNSIGNED_SHORT, grid);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    S.count = take;
+    S.ready = binned > 0;
+    st.uploaded = take;
+    st.binned = binned;
+    st.dropped = dropped;
+    st.maxCell = maxCell;
+    st.ms = ((typeof performance !== 'undefined' && performance.now)
+      ? performance.now() : Date.now()) - t0;
+  }
+
+  // The rig's LEVEL, 0..1. nightFactor says how far into the night the preset is and daylight
+  // closes the whole thing down under a sun, which together give exactly the Amendment 7 ramp with
+  // no new field and nothing baked: Afternoon 0.000, Golden hour 0.099, Blue hour 0.860,
+  // Night 1.000.
+  _lightRigLevel() {
+    const e = this.env;
+    return numOr(e.nightFactor, 0, 1, 0.86) * (1 - this._daylight());
+  }
+
+  // Cluster uniforms, for any program that shades with local lights. The sampler UNITS are always
+  // written even when the rig is dark: leaving two samplers defaulted to unit 0 would put them on
+  // the same unit as uShadowMap, and two samplers of different types on one unit is undefined
+  // behaviour that some drivers refuse to draw at all.
+  _setLightUniforms(s) {
+    const S = this._lights;
+    const live = S.ready && S.count > 0 && this._q.lights && !!S.dataTex && !!S.gridTex;
+    s.setTexture('uLightData', 5, live ? S.dataTex : null);
+    s.setTexture('uLightGrid', 6, live ? S.gridTex : null);
+    const cfg = this.lights || {};
+    _lightWin[0] = S.ox;
+    _lightWin[1] = S.oz;
+    _lightWin[2] = 1 / LIGHT_CELL;
+    _lightWin[3] = numOr(cfg.gain, 0, 32, 1);
+    s.set('uLightWindow', _lightWin);
+    _lightRig[0] = live ? this._lightRigLevel() : 0;
+    _lightRig[1] = live ? 1 : 0;
+    s.set('uLightRig', _lightRig);
+  }
+
+  // The road surface response, sanitised. `rough` multiplies into the material G-buffer and from
+  // there into SSR's gate, so a NaN here would switch screen-space reflections on or off over the
+  // whole carriageway for a frame.
+  _roadParams() {
+    const r = this.road || {};
+    _road[0] = numOr(r.wetness, 0, 1, 0.42);
+    _road[1] = numOr(r.dryRough, 0.03, 1, 0.55);
+    _road[2] = numOr(r.wetRough, 0.03, 1, 0.11);
+    _road[3] = numOr(r.aniso, 0, 1, 0.62);
+    return _road;
+  }
+
   _resetStateCache() {
     this._blend = false;
     this._blendMode = 0;
@@ -3348,6 +4453,7 @@ export class Renderer {
     this._sceneFrame = false;
     this._waterFrame = false;
     this._gshadowFrame = false;
+    this._textFrame = false;
     this._frameOffscreen = false;
     this._frameActive = false;
     this._outputMode = 0;
@@ -3388,6 +4494,9 @@ export class Renderer {
       this._depthTexSupported && this._mrtSupported && !!this.resolveShader;
     out.fxaa = boolOr(q.fxaa, true) && this._fxaaSupported && this._postSupported &&
       !!this.fxaaShader;
+    // The local lights need no offscreen target and no depth texture — they are part of the
+    // geometry pass — so they survive every post-chain fallback there is.
+    out.lights = boolOr(q.lights, true) && this._lightsSupported;
     return out;
   }
 
@@ -4294,10 +5403,13 @@ export class Renderer {
     s.set('uWindowGain', numOr(e.windowGain, 0, 8, 1.45));
     s.set('uDaylight', this._daylight());
     s.set('uDayIndirect', this._dayIndirectParams());
+    s.set('uRoad', this._roadParams());
+    s.set('uEmitterGain', numOr(e.emitterGain, 0, 16, 2.2));
     s.set('uExposure', this._dayExposure());
     s.set('uTime', numOr(e.time, -1e7, 1e7, 0));
     s.set('uOutputMode', this._outputMode);
     this._setShadowUniforms(s);
+    this._setLightUniforms(s);
   }
 
   // The daylight indirect model, sanitised. Nothing here may be NaN: uDayIndirect multiplies the
@@ -4352,6 +5464,54 @@ export class Renderer {
     this._setShadowUniforms(s);
   }
 
+  // Per-frame state for the text pass. Every term it shares with the scene shader is read from
+  // the same env field, so a preset change moves the fascia and the letters on it together.
+  _textUniforms() {
+    if (this._textFrame) return;
+    this._textFrame = true;
+    const e = this.env;
+    const s = this.textShader;
+    const cam = this.camera;
+    const f = this.font;
+    s.set('uViewProj', (cam && cam.viewProj) || IDENTITY);
+    s.set('uCameraPos', (cam && cam.pos) || WHITE);
+    s.set('uKeyDir', this._normalizedKey());
+    s.set('uKeyColor', e.keyColor);
+    s.set('uSunDir', this._normalizedSun());
+    s.set('uSkyZenith', e.skyZenith);
+    s.set('uSkyHorizon', e.skyHorizon);
+    s.set('uSkyWest', e.skyWest);
+    s.set('uAmbientSky', e.ambientSky);
+    s.set('uAmbientGround', e.ambientGround);
+    s.set('uStreetColor', e.streetColor);
+    s.set('uFogColor', e.fogColor);
+    s.set('uFogParams', this._fogParams());
+    s.set('uFogRange', this._fogRangeParams());
+    s.set('uFogBeta', this._fogBeta());
+    s.set('uSkyBounce', numOr(e.skyBounce, 0, 6, 1.85));
+    s.set('uNightFactor', numOr(e.nightFactor, 0, 1, 0.86));
+    s.set('uDaylight', this._daylight());
+    s.set('uDayIndirect', this._dayIndirectParams());
+    s.set('uExposure', this._dayExposure());
+    s.set('uOutputMode', this._outputMode);
+    _glyphAtlas[0] = f ? f.width : 1;
+    _glyphAtlas[1] = f ? f.height : 1;
+    _glyphAtlas[2] = f ? f.sdfRange : 12;
+    _glyphAtlas[3] = f ? f.capTexels : 24;
+    s.set('uGlyphAtlas', _glyphAtlas);
+    const t = this.text || {};
+    const f0 = numOr(t.fadeStart, 0, 1e6, TEXT_FADE_START);
+    const f1 = Math.max(f0 + 1, numOr(t.fadeEnd, 0, 1e6, TEXT_FADE_END));
+    const p0 = numOr(t.minPx, 0, 400, 2.4);
+    _textLod[0] = f0;
+    _textLod[1] = 1 / (f1 - f0);
+    _textLod[2] = p0;
+    _textLod[3] = Math.max(p0 + 0.25, numOr(t.fadePx, 0, 400, 4.6));
+    s.set('uTextLod', _textLod);
+    s.set('uTextWeight', numOr(t.weight, 0, 3, 0.42));
+    this._setShadowUniforms(s);
+  }
+
   _gshadowUniforms() {
     if (this._gshadowFrame) return;
     this._gshadowFrame = true;
@@ -4383,6 +5543,7 @@ export class Renderer {
     this._sceneFrame = false;
     this._waterFrame = false;
     this._gshadowFrame = false;
+    this._textFrame = false;
     this._frameOffscreen = false;
     this._frameActive = false;
     this._outputMode = 0;
@@ -4399,6 +5560,12 @@ export class Renderer {
     this._autoA = this._autoB;
     this._autoB = prev;
     this._autoB.n = 0;
+
+    // --- local lights: cull, rank and cluster for THIS camera ---------------
+    // Before the shadow pass, because it uploads two textures and the shadow pass is about to
+    // change the bound framebuffer; and unconditionally before any program can ask for the scene
+    // uniforms, which is where the tables are handed to the shader.
+    this._updateLights();
 
     // --- cascaded shadow maps, before anything binds the scene target -------
     if (!this._shadowDone) this.shadowPass(casters || null, this.camera);
@@ -4538,6 +5705,62 @@ export class Renderer {
     this._drawGeom(mesh);
 
     this._setPolyOffset(false);
+  }
+
+  /**
+   * Glyph geometry from src/text.js. Draw it AFTER every opaque class and before drawWater or
+   * endFrame; it is a blended decal pass, so anything it should sit on top of has to be in the
+   * depth buffer already.
+   *
+   * Three deliberate departures from drawMesh, all of them about a glyph being paint on a surface
+   * rather than a surface:
+   *   * DEPTH WRITE IS OFF. Depth is what SSAO and SSR march, and a letter is not an occluder and
+   *     not a reflector — it is a centimetre of ink on the fascia that already wrote depth there.
+   *     With the write on, SSR would trace the reflection of the letter and SSAO would darken
+   *     around a shape floating in front of a flat wall.
+   *   * IT IS BLENDED. The distance field gives analytic coverage; throwing that away for an
+   *     alpha test turns a 3 px cap height into crawling confetti, which is exactly the distance
+   *     at which street signage matters most. Glyph quads only overlap where both are at zero
+   *     coverage, so the missing depth sort costs nothing.
+   *   * IT NEVER BECOMES A SHADOW CASTER. The depth-only cascade program reads position and
+   *     nothing else, so a text mesh in the caster list would cast the SOLID QUAD of every glyph
+   *     across the pavement. _rememberCaster is not called here, and callers must keep the text
+   *     class out of setShadowCasters.
+   */
+  drawText(mesh, model, tint = WHITE, alpha = 1) {
+    if (this.contextLost || !mesh) return;
+    if (!this.textShader || !this.font || !this.font.texture) return;
+    const s = this._useShader(this.textShader);
+    this._textUniforms();
+
+    this._setPolyOffset(false);
+    this._setCull(true);
+    this._setDepthTest(true);
+    this._setBlend(true, BLEND_ALPHA);
+    this._setDepthWrite(false);
+
+    const tr = tint ? tint[0] : 1;
+    const tg = tint ? tint[1] : 1;
+    const tb = tint ? tint[2] : 1;
+    if (tr !== this._txTr || tg !== this._txTg || tb !== this._txTb) {
+      this._txTr = tr; this._txTg = tg; this._txTb = tb;
+      _tint[0] = tr; _tint[1] = tg; _tint[2] = tb;
+      s.set('uTint', _tint);
+    }
+    const a = Number.isFinite(alpha) ? clamp(alpha, 0, 1) : 1;
+    if (a !== this._txAlpha) {
+      this._txAlpha = a;
+      s.set('uAlpha', a);
+    }
+
+    // Texture UNITS are global GL state, not program state, and the post chain uses unit 4 for
+    // the SSR and streak buffers. Binding the atlas once per frame with the other uniforms
+    // therefore only works until something else touches the unit — which cost most of a day, and
+    // presents as text that samples a black atlas and vanishes completely. Bind per draw; it is
+    // a handful of calls a frame.
+    s.setTexture('uGlyphs', 4, this.font.texture);
+    s.set('uModel', model || IDENTITY);
+    this._drawGeom(mesh);
   }
 
   // The lake. Drawn OPAQUE on purpose: an alpha-blended surface would blend the material target
@@ -4874,17 +6097,24 @@ export class Renderer {
     if (!this.contextLost) {
       try {
         if (this._dummyShadow) gl.deleteTexture(this._dummyShadow);
+        if (this._lights.dataTex) gl.deleteTexture(this._lights.dataTex);
+        if (this._lights.gridTex) gl.deleteTexture(this._lights.gridTex);
         if (this.skyVao) gl.deleteVertexArray(this.skyVao);
       } catch (err) {
         // Teardown is best-effort.
       }
     }
+    this._lights.dataTex = null;
+    this._lights.gridTex = null;
+    this._lights.ready = false;
     this._dummyShadow = null;
     this.skyVao = null;
+    if (!this.contextLost) releaseFont(gl);
+    this.font = null;
     const shaders = [
       this.sceneShader, this.skyShader, this.waterShader, this.gshadowShader, this.csmShader,
-      this.brightShader, this.blurShader, this.compShader, this.ssaoShader, this.aoBlurShader,
-      this.ssrShader, this.resolveShader, this.fxaaShader,
+      this.textShader, this.brightShader, this.blurShader, this.compShader, this.ssaoShader,
+      this.aoBlurShader, this.ssrShader, this.resolveShader, this.fxaaShader,
     ];
     for (let i = 0; i < shaders.length; i++) {
       if (shaders[i] && !this.contextLost) {

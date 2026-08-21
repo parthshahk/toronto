@@ -1291,6 +1291,9 @@ export function appendHarbour(H, ctx) {
     mb: ctx.mb,
     claim: typeof ctx.claim === 'function' ? ctx.claim : () => true,
     note: typeof ctx.note === 'function' ? ctx.note : () => {},
+    // A real luminaire on the quay, reported at its LENS so city.js can register it with the
+    // renderer's local-light rig. Optional: a caller that does not supply it still gets geometry.
+    light: typeof ctx.light === 'function' ? ctx.light : () => {},
     data: ctx.data || null,
     H,
     rocks: 0, moored: 0,
@@ -1850,7 +1853,10 @@ export function appendQuayFurniture(H, c) {
       c.note('lifebuoyStation');
     }, 0.7, 2.6);
     place(run, total, QUAY_LAMP_SPACING, 0.13, (st, x, z, yaw) => {
-      appendPedestrianLamp(mb, x, st.g + deck, z, yaw + Math.PI, 5.2);
+      const a = yaw + Math.PI;
+      appendPedestrianLamp(mb, x, st.g + deck, z, a, 5.2);
+      // The head hangs 0.76 m out along the boom at 5.26 m — the offsets props.js builds it at.
+      c.light('ped', x + Math.cos(a) * 0.76, st.g + deck + 5.26, z - Math.sin(a) * 0.76);
       c.note('quayLamp');
     }, 0.9, 3.4);
     place(run, total, BENCH_SPACING, 0.77, (st, x, z, yaw) => {
