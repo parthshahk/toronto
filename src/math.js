@@ -1,6 +1,6 @@
 // src/math.js — scalar helpers, seeded RNG, angle utilities, vec3 ops and a
 // column-major (WebGL convention) mat4 suite. Zero dependencies; every other
-// module in Vice Heights builds on this file.
+// module in this project builds on this file.
 //
 // Conventions:
 //   - Matrices are Float32Array(16), column-major: m[c * 4 + r] is row r, column c.

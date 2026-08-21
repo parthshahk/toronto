@@ -1,4 +1,4 @@
-// src/input.js — keyboard / mouse / pointer-lock / gamepad state for Vice Heights.
+// src/input.js — keyboard / mouse / pointer-lock / gamepad state.
 // Edge-triggered pressed/released sets are valid for exactly one frame; call endFrame()
 // at the very END of the game loop. Zero dependencies by contract.
 

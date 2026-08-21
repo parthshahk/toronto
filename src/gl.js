@@ -1,4 +1,4 @@
-// src/gl.js — WebGL2 plumbing for Vice Heights: context creation, a Shader wrapper with
+// src/gl.js — WebGL2 plumbing: context creation, a Shader wrapper with
 // type-dispatched uniform setting, static/dynamic interleaved triangle meshes, and a fast
 // zero-allocation MeshBuilder. Vertex format (NORMATIVE, 11 floats, non-indexed triangles):
 //   [ px, py, pz,  nx, ny, nz,  r, g, b,  emissive, tintable ]

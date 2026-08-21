@@ -1,11 +1,12 @@
 {
-  "name": "vice-heights",
+  "name": "toronto",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Vice Heights — a GTA-style 3D open-world game running on a hand-written WebGL2 engine with zero dependencies.",
+  "description": "An accurate free-roam recreation of downtown Toronto, built from City of Toronto and OpenStreetMap open data and rendered by a hand-written WebGL2 engine with zero dependencies.",
   "scripts": {
     "start": "python3 -m http.server 8123",
-    "check": "for f in src/*.js; do node --check \"$f\" || exit 1; done && echo 'all modules parse'"
+    "check": "for f in src/*.js; do node --check \"$f\" || exit 1; done && echo 'all modules parse'",
+    "build:city": "python3 tools/build_city.py && python3 tools/match_osm.py"
   }
 }
