@@ -514,6 +514,11 @@ export function placeIslandRoofs(isle, c, x0, z0, x1, z1) {
   for (let i = 0; i < c.buildings.length; i++) {
     const b = c.buildings[i];
     if (!b || !Array.isArray(b.rings) || !b.rings.length) continue;
+    // A record that is wholly inside something taller is never extruded, so a pitched roof on it
+    // would be a gable floating inside a neighbour's walls. The tile hands over every record it
+    // holds now, buried or not — city/coplanar.js settles that verdict when the tile is built
+    // rather than before the tile index exists — so the filter belongs here.
+    if (b.buried) continue;
     const cx = b.cx, cz = b.cz;
     if (!isNum(cx) || cx < x0 || cx >= x1 || cz < z0 || cz >= z1) continue;
     if (!isNum(b.h) || b.h > 12 || b.h < 2) continue;

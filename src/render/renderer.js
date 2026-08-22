@@ -344,7 +344,7 @@ export class Renderer {
         shell.showError(
           'The graphics context was lost.',
           'The GPU dropped this page\'s WebGL context and took the world geometry with it (' +
-          detail + ').\n\nReload the page to get back into downtown Toronto.'
+          detail + ').\n\nReload the page to get back into Toronto.'
         );
       }
     } catch (e) {

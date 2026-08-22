@@ -9,6 +9,13 @@
 // through ctx.claim(), so the harbour competes for kerb space with the same reservation system
 // city.js's procedural furniture pass uses and nothing is placed twice.
 //
+// THEY ARE ALL GENERATORS. 32 km of surveyed shoreline is one continuous run that no tile owns, so
+// this cannot be sharded the way a building or a street can — but it is not needed before a first
+// frame either. city.js drives it from the chore queue and cuts the result up per tile when it
+// finishes (city/lod.js deliverCapture), so the quay costs a few tenths of a millisecond a frame
+// for a second or two instead of a fifth of a second in front of the player. Yielding at the head
+// of each top-level loop is what makes that interruptible; nothing else about the passes changed.
+//
 // Amendment 7 (time-of-day independence): geometry and material only. Water is not emissive, the
 // quay is not emissive, no surface here is pre-darkened or pre-lit. The only emitters are the
 // navigation lights and the lifebuoy-station lamps in props/, which are real light sources.
@@ -40,7 +47,7 @@ import { harbourDeckY, ribbonRing, segRing } from './water.js';
  * world position instead of drawing from a shared stream, so a piece of harbour looks the same
  * whatever else was built first (CONTRACT §8.4).
  */
-export function appendHarbour(H, ctx) {
+export function* appendHarbour(H, ctx) {
   if (!H || !ctx || !ctx.mb) return null;
   const c = {
     mb: ctx.mb,
@@ -53,14 +60,14 @@ export function appendHarbour(H, ctx) {
     H,
     rocks: 0, moored: 0,
   };
-  appendQuayWalls(H, c);
-  appendCrossings(H, c);
-  appendPiers(H, c);
-  appendMounds(H, c);
-  appendMarinas(H, c);
-  appendFerryTerminal(H, c);
-  appendWalkways(H, c);
-  appendQuayFurniture(H, c);
+  yield* appendQuayWalls(H, c);
+  yield* appendCrossings(H, c);
+  yield* appendPiers(H, c);
+  yield* appendMounds(H, c);
+  yield* appendMarinas(H, c);
+  yield* appendFerryTerminal(H, c);
+  yield* appendWalkways(H, c);
+  yield* appendQuayFurniture(H, c);
   return H.stats;
 }
 
@@ -77,12 +84,14 @@ export function appendHarbour(H, ctx) {
  * and below the coping a vertical face to WALL_FOOT, in two materials: the dry wall, and the
  * fouled band under the waterline.
  */
-export function appendQuayWalls(H, c) {
+export function* appendQuayWalls(H, c) {
   const mbG = c.mb.sidewalks, mbW = c.mb.terrain;
   const S = H.stats;
   for (let r = 0; r < H.runs.length; r++) {
     const run = H.runs[r];
+    yield;
     for (let i = 0; i + 1 < run.n; i++) {
+      if ((i & 63) === 63) yield;
       const g0 = run.g[i], g1 = run.g[i + 1];
       const t0 = g0 + APRON_Y, t1 = g1 + APRON_Y;
       const c0 = g0 + COPE_TOP, c1 = g1 + COPE_TOP;
@@ -166,10 +175,11 @@ function atArc(run, d) {
  * on driven piles, which is what the harbourfront actually carries between the wave decks and the
  * slips. Tagged bridges are left to the street pass so one slip never gets two decks.
  */
-export function appendCrossings(H, c) {
+export function* appendCrossings(H, c) {
   const mbD = c.mb.sidewalks, mbS = c.mb.terrain;
   for (let k = 0; k < H.crossings.length; k++) {
     const cr = H.crossings[k];
+    yield;
     if (cr.bridge) continue;
     for (let i = cr.a; i < cr.b; i++) {
       const t0 = (i - cr.a) / Math.max(1, cr.b - cr.a), t1 = (i + 1 - cr.a) / Math.max(1, cr.b - cr.a);
@@ -197,10 +207,11 @@ export function appendCrossings(H, c) {
 
 /* -------------------------------------------------------------------- piers */
 
-export function appendPiers(H, c) {
+export function* appendPiers(H, c) {
   const mbD = c.mb.sidewalks, mbS = c.mb.terrain;
   for (let i = 0; i < H.piers.length; i++) {
     const rec = H.piers[i];
+    yield;
     if (!rec.ring || rec.ring.length < 3) continue;
     const deck = rec.y;
     emitDeckSlab(mbD, mbS, rec.ring, deck, M.pierDeck, M.pierFascia, deck - 1.25);
@@ -303,10 +314,11 @@ function quayAnchor(H, x, z) {
  * running down past the waterline to the toe. Works for a closed breakwater ring and for an open
  * groyne line alike, and needs no offsetting or skeleton, so a pathological outline cannot fold it.
  */
-export function appendMounds(H, c) {
+export function* appendMounds(H, c) {
   const mb = c.mb.terrain;
   for (let m = 0; m < H.mounds.length; m++) {
     const rec = H.mounds[m];
+    yield;
     const closed = rec.closed;
     const ring = closed ? rec.p.slice(0, rec.p.length - 1) : null;
     const bb = rec.bbox;
@@ -319,6 +331,9 @@ export function appendMounds(H, c) {
     const inside = new Uint8Array((ni + 1) * (nj + 1));
     for (let j = 0; j <= nj; j++) {
       const z = z0 + j * MOUND_CELL;
+      // A single mound may raster 60,000 cells against a distance-to-polyline; one breakwater is
+      // easily a frame on its own, so the row is the unit of work here, not the mound.
+      if ((j & 15) === 15) yield;
       for (let i = 0; i <= ni; i++) {
         const x = x0 + i * MOUND_CELL;
         const k = j * (ni + 1) + i;
@@ -336,6 +351,7 @@ export function appendMounds(H, c) {
     }
     setMat(mb, M.rubble);
     for (let j = 0; j < nj; j++) {
+      if ((j & 31) === 31) yield;
       for (let i = 0; i < ni; i++) {
         const k00 = j * (ni + 1) + i, k10 = k00 + 1;
         const k01 = k00 + ni + 1, k11 = k01 + 1;
@@ -350,6 +366,7 @@ export function appendMounds(H, c) {
     setMat(mb, M.rubbleWet);
     const toe = H.waterY + MOUND_TOE;
     for (let j = 0; j < nj; j++) {
+      if ((j & 31) === 31) yield;
       for (let i = 0; i < ni; i++) {
         const kc = [j * (ni + 1) + i, j * (ni + 1) + i + 1,
           (j + 1) * (ni + 1) + i + 1, (j + 1) * (ni + 1) + i];
@@ -388,10 +405,11 @@ export function appendMounds(H, c) {
 
 /* ------------------------------------------------------------------ marinas */
 
-export function appendMarinas(H, c) {
+export function* appendMarinas(H, c) {
   const mb = c.mb.props;
   for (let m = 0; m < H.marinas.length; m++) {
     const rec = H.marinas[m];
+    yield;
     // Gangway from the quay down to the nearest float, and a marker at the basin mouth.
     const hit = nearestShore(H, rec.cen[0], rec.cen[1]);
     if (hit) {
@@ -438,10 +456,11 @@ export function appendMarinas(H, c) {
  * finger piers running out into the harbour, the slips between them open to the water, fender
  * dolphins at every slip mouth and a mooring dolphin off the end.
  */
-export function appendFerryTerminal(H, c) {
+export function* appendFerryTerminal(H, c) {
   const mbD = c.mb.sidewalks, mbS = c.mb.terrain, mbP = c.mb.props;
   for (let t = 0; t < H.terminals.length; t++) {
     const rec = H.terminals[t];
+    yield;
     if (rec.p && rec.ring) {
       emitDeckSlab(mbD, mbS, rec.ring, rec.y, M.terminal, M.pierFascia, rec.y - 1.6);
       emitPileField(mbS, rec.ring, rec.y - 1.4, -3.0, c);
@@ -513,7 +532,7 @@ export function appendFerryTerminal(H, c) {
  * the ground; these run one rung above that, so the correct surface is what you see and the
  * generic ribbon underneath can never fight it.
  */
-export function appendWalkways(H, c) {
+export function* appendWalkways(H, c) {
   const data = c.data;
   if (!data || !Array.isArray(data.roads)) return;
   const mb = c.mb.sidewalks;
@@ -526,6 +545,7 @@ export function appendWalkways(H, c) {
   let boardMetres = 0, trailMetres = 0;
   for (let i = 0; i < data.roads.length; i++) {
     const r = data.roads[i];
+    if ((i & 31) === 31) yield;
     if (!r || typeof r.n !== 'string' || !Array.isArray(r.p) || r.p.length < 2) continue;
     if (r.tun === 1) continue;
     const board = /boardwalk/i.test(r.n);
@@ -586,10 +606,11 @@ function emitWalkRibbon(mb, pts, hw, gy, board) {
 
 /* --------------------------------------------------------------- furniture */
 
-export function appendQuayFurniture(H, c) {
+export function* appendQuayFurniture(H, c) {
   const mb = c.mb.props;
   for (let r = 0; r < H.runs.length; r++) {
     const run = H.runs[r];
+    yield;
     const total = run.s[run.n - 1];
     // Bollards and ladders are bolted THROUGH the coping stone; everything else stands on the
     // apron, a couple of centimetres up so a base plate never fights the paving it sits on.
@@ -599,14 +620,17 @@ export function appendQuayFurniture(H, c) {
       appendMooringBollard(mb, x, st.g + COPE_TOP, z, yaw);
       c.note('mooringBollard');
     }, 0.42, cope);
+    yield;
     place(run, total, LADDER_SPACING, 0.31, (st, x, z, yaw) => {
       appendQuayLadder(mb, x, st.g + COPE_TOP, z, yaw, st.g + COPE_TOP - (H.waterY - 1.1));
       c.note('quayLadder');
     }, 0.5, 0.30);
+    yield;
     place(run, total, LIFEBUOY_SPACING, 0.57, (st, x, z, yaw) => {
       appendLifebuoyStation(mb, x, st.g + deck, z, yaw);
       c.note('lifebuoyStation');
     }, 0.7, 2.6);
+    yield;
     place(run, total, QUAY_LAMP_SPACING, 0.13, (st, x, z, yaw) => {
       const a = yaw + Math.PI;
       appendPedestrianLamp(mb, x, st.g + deck, z, a, 5.2);
@@ -614,6 +638,7 @@ export function appendQuayFurniture(H, c) {
       c.light('ped', x + Math.cos(a) * 0.76, st.g + deck + 5.26, z - Math.sin(a) * 0.76);
       c.note('quayLamp');
     }, 0.9, 3.4);
+    yield;
     place(run, total, BENCH_SPACING, 0.77, (st, x, z, yaw) => {
       appendTimberBench(mb, rngAt(x, z), x, st.g + deck, z, yaw + Math.PI * 0.5);
       c.note('timberBench');

@@ -148,9 +148,10 @@ void main() {
   vec3 V = viewDist > 1e-4 ? toEye / viewDist : vec3(0.0, 1.0, 0.0);
   float ndv = clamp(dot(N, V), 1e-3, 1.0);
 
-  // Metres above the LOCAL street, which downtown is nowhere near metres above the lake: grade
-  // climbs about 30 m from the ferry docks up to Queen St. Shopfront bands, parking decks, the
-  // street-lamp spill and the contact darkening are all placed by this, not by world Y.
+  // Metres above the LOCAL street, which is nowhere near metres above the lake: grade climbs
+  // 120 m from the ferry docks to the Eglinton edge. Shopfront bands, parking decks, the
+  // street-lamp spill and the contact darkening are all placed by this, not by world Y. See
+  // vhGroundApprox in common.glsl.js for how good the approximation is, and where it is not.
   float hAbove = vWorld.y - vhGroundApprox(vWorld.xz);
 
   // --- procedural facade lighting -------------------------------------------

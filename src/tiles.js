@@ -1,4 +1,5 @@
-// src/tiles.js — the spatial tile grid, the lazy per-tile geometry cache and its scheduler.
+// src/tiles.js — the lazy per-tile geometry cache and its scheduler. (The grid itself is
+// ./tilegrid.js; this file is what owns GL buffers, budgets and eviction.)
 //
 // WHY THIS EXISTS. The city used to be one merged mesh per material class: 18 draw calls, and
 // every footprint triangulated before the first frame. That works at 7 km2. At the current 43 km2
@@ -29,18 +30,15 @@
 // Zero dependencies.
 
 import { MeshBuilder } from './core/gl.js';
+import {
+  TILE_SIZE, makeTileGrid, splitRuns, extractPlanes, boxOutside, boxDist,
+} from './tilegrid.js';
+
+// The grid moved to ./tilegrid.js when this file passed the ~800-line ceiling. It is still
+// exported from here: world/roads.js, city.js and city/report.js import it by this path.
+export { TILE_SIZE, makeTileGrid, splitRuns };
 
 /* ================================================================ constants == */
-
-// Tile edge, metres. Measured choice, not a guess:
-//   * 25 m is the terrain sample pitch, so the edge must be a whole number of terrain cells or
-//     the ground mesh cannot be split without either cracks or double-emitted cells. 625 = 25 x 25.
-//   * bigger tiles mean fewer draw calls but a coarser detail radius: at 1000 m a pedestrian
-//     standing anywhere loads 4 km2 of street furniture.
-//   * smaller tiles mean tighter culling but more draw calls: at 384 m a 3.5 km view is ~190
-//     tiles and, at three populated classes each, ~570 draw calls before any detail.
-//   625 m puts a 3.5 km view at ~30 tiles and a street-level detail set at 4-9 tiles.
-export const TILE_SIZE = 625;
 
 const STATE_EMPTY = 0;
 const STATE_BUILDING = 1;
@@ -50,165 +48,11 @@ const STATE_READY = 2;
 // downtown tile does not leave 7 oversized scratch buffers pinned for the rest of the session.
 const POOL_MAX_FLOATS = 1 << 21;      // 2 M floats = 8 MB per class
 
-const EPS = 1e-9;
-
-/* ==================================================================== grid == */
-
-/**
- * A fixed grid over the world. `margin` is how far outside the data extent tiles still exist,
- * so features that spill past the bounding box (the synthesised surround, a road that leaves
- * the extract) still land somewhere real.
- */
-export function makeTileGrid(extent, size = TILE_SIZE, margin = 400) {
-  const ex = (extent && Number.isFinite(extent.x)) ? extent.x : 3141.7;
-  const ez = (extent && Number.isFinite(extent.z)) ? extent.z : 2226.4;
-  const s = Math.max(50, size);
-  const x0 = -ex / 2 - margin;
-  const z0 = -ez / 2 - margin;
-  const nx = Math.max(1, Math.ceil((ex + margin * 2) / s));
-  const nz = Math.max(1, Math.ceil((ez + margin * 2) / s));
-  const tiles = new Array(nx * nz);
-
-  for (let j = 0; j < nz; j++) {
-    for (let i = 0; i < nx; i++) {
-      const id = j * nx + i;
-      tiles[id] = {
-        id, i, j,
-        // Core cell: what the level-of-detail distance is measured against. Deliberately NOT the
-        // draw box — a 1.9 km arterial anchored here must not drag the whole tile's street
-        // furniture into range from the far end of the road.
-        cx0: x0 + i * s, cz0: z0 + j * s,
-        cx1: x0 + (i + 1) * s, cz1: z0 + (j + 1) * s,
-        mx: x0 + (i + 0.5) * s, mz: z0 + (j + 0.5) * s,
-        // Draw box: grown to contain every feature indexed here. Frustum culling uses this.
-        bx0: Infinity, bz0: Infinity, by0: Infinity,
-        bx1: -Infinity, bz1: -Infinity, by1: -Infinity,
-        empty: true,
-        st: null,          // per-stage cache, allocated by the manager
-        dist: 0, visible: false, lastSeen: 0,
-      };
-    }
-  }
-
-  return {
-    size: s, x0, z0, nx, nz, count: nx * nz, tiles,
-    ci(x) {
-      const i = Math.floor((x - x0) / s);
-      return i < 0 ? 0 : (i >= nx ? nx - 1 : i);
-    },
-    cj(z) {
-      const j = Math.floor((z - z0) / s);
-      return j < 0 ? 0 : (j >= nz ? nz - 1 : j);
-    },
-    // The tile that OWNS this point.
-    at(x, z) {
-      const fx = Number.isFinite(x) ? x : 0;
-      const fz = Number.isFinite(z) ? z : 0;
-      return tiles[this.cj(fz) * nx + this.ci(fx)];
-    },
-    idAt(x, z) {
-      const fx = Number.isFinite(x) ? x : 0;
-      const fz = Number.isFinite(z) ? z : 0;
-      return this.cj(fz) * nx + this.ci(fx);
-    },
-    // Grow a tile's draw box. Called once per indexed feature.
-    cover(tile, x0b, z0b, x1b, z1b, y0b, y1b) {
-      if (!tile) return;
-      if (x0b < tile.bx0) tile.bx0 = x0b;
-      if (z0b < tile.bz0) tile.bz0 = z0b;
-      if (x1b > tile.bx1) tile.bx1 = x1b;
-      if (z1b > tile.bz1) tile.bz1 = z1b;
-      if (Number.isFinite(y0b) && y0b < tile.by0) tile.by0 = y0b;
-      if (Number.isFinite(y1b) && y1b > tile.by1) tile.by1 = y1b;
-      tile.empty = false;
-    },
-    // Every tile that has nothing indexed in it still needs a legal box, or the culler compares
-    // against infinities and a NaN quietly makes it visible forever.
-    seal(defaultY0, defaultY1) {
-      for (let k = 0; k < tiles.length; k++) {
-        const t = tiles[k];
-        if (t.bx0 > t.bx1) { t.bx0 = t.cx0; t.bx1 = t.cx1; t.bz0 = t.cz0; t.bz1 = t.cz1; }
-        if (!(t.by0 <= t.by1)) { t.by0 = defaultY0; t.by1 = defaultY1; }
-        // Never let a box be thinner than the cell it sits in: a tile holding one flagpole is
-        // still a square of ground.
-        if (t.bx0 > t.cx0) t.bx0 = t.cx0;
-        if (t.bz0 > t.cz0) t.bz0 = t.cz0;
-        if (t.bx1 < t.cx1) t.bx1 = t.cx1;
-        if (t.bz1 < t.cz1) t.bz1 = t.cz1;
-      }
-    },
-  };
-}
-
-/**
- * Cut a polyline into runs of consecutive segments that belong to the same tile, so a 1.9 km
- * arterial is not one indivisible lump of geometry anchored at its midpoint.
- *
- * A segment belongs to the tile holding its midpoint; a run is a maximal stretch of segments
- * with the same owner. The cut lands on a shared vertex, so the two runs meet exactly.
- * `visit(tileId, k0, k1)` gets the vertex range [k0, k1] (inclusive) of each run.
- */
-export function splitRuns(grid, pts, visit) {
-  const n = pts ? pts.length : 0;
-  if (n < 2) return 0;
-  let runs = 0;
-  let k0 = 0;
-  let owner = grid.idAt((pts[0][0] + pts[1][0]) * 0.5, (pts[0][1] + pts[1][1]) * 0.5);
-  for (let k = 1; k < n - 1; k++) {
-    const id = grid.idAt((pts[k][0] + pts[k + 1][0]) * 0.5, (pts[k][1] + pts[k + 1][1]) * 0.5);
-    if (id === owner) continue;
-    visit(owner, k0, k);
-    runs++;
-    k0 = k;
-    owner = id;
-  }
-  visit(owner, k0, n - 1);
-  return runs + 1;
-}
-
-/* ============================================================== frustum ==== */
-
-// Six clip planes from a column-major view-projection matrix (Gribb & Hartmann), normalised so
-// the plane test is a real signed distance and the box test can use the box's half-extent.
-function extractPlanes(m, out) {
-  const p = [
-    [m[3] + m[0], m[7] + m[4], m[11] + m[8], m[15] + m[12]],   // left
-    [m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]],   // right
-    [m[3] + m[1], m[7] + m[5], m[11] + m[9], m[15] + m[13]],   // bottom
-    [m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]],   // top
-    [m[3] + m[2], m[7] + m[6], m[11] + m[10], m[15] + m[14]],  // near
-    [m[3] - m[2], m[7] - m[6], m[11] - m[10], m[15] - m[14]],  // far
-  ];
-  for (let i = 0; i < 6; i++) {
-    const a = p[i][0], b = p[i][1], c = p[i][2];
-    const l = Math.sqrt(a * a + b * b + c * c);
-    const inv = l > EPS ? 1 / l : 0;
-    out[i * 4] = a * inv;
-    out[i * 4 + 1] = b * inv;
-    out[i * 4 + 2] = c * inv;
-    out[i * 4 + 3] = p[i][3] * inv;
-  }
-  return out;
-}
-
-function boxOutside(pl, x0, y0, z0, x1, y1, z1) {
-  for (let i = 0; i < 24; i += 4) {
-    const a = pl[i], b = pl[i + 1], c = pl[i + 2], d = pl[i + 3];
-    // Farthest corner along the plane normal. If even that is behind, the box is outside.
-    const px = a >= 0 ? x1 : x0;
-    const py = b >= 0 ? y1 : y0;
-    const pz = c >= 0 ? z1 : z0;
-    if (a * px + b * py + c * pz + d < 0) return true;
-  }
-  return false;
-}
-
-function boxDist(px, py, pz, x0, y0, z0, x1, y1, z1) {
-  const dx = px < x0 ? x0 - px : (px > x1 ? px - x1 : 0);
-  const dy = py < y0 ? y0 - py : (py > y1 ? py - y1 : 0);
-  const dz = pz < z0 ? z0 - pz : (pz > z1 ? pz - z1 : 0);
-  return Math.sqrt(dx * dx + dy * dy + dz * dz);
-}
+// How many queued builds may be passed over for want of data before the scheduler gives up on
+// this frame. Passing one over costs a request and a few pointer chases, so a handful is free;
+// walking the whole queue every frame while the network catches up is not, and there is nothing
+// to gain from it — the requests for the nearest tiles are already in flight by then.
+const DATA_SKIP_MAX = 32;
 
 /* ============================================================== manager ==== */
 
@@ -226,6 +70,9 @@ function boxDist(px, py, pz, x0, y0, z0, x1, y1, z1) {
  *   vertexCap   resident-vertex ceiling; eviction runs until the total is back under it
  *   budgetMs    milliseconds per frame the scheduler may spend generating geometry
  *   evictMs     how long a tile may go undrawn before its geometry is released anyway
+ *   dataBudgetMs  of `budgetMs`, the most that may go on getting tile DATA resident
+ *   dataAhead   metres past stage 0's build range that data is fetched for anyway, so that
+ *               walking towards a block does not stall on the network
  */
 export class TileManager {
   constructor(opts) {
@@ -243,6 +90,8 @@ export class TileManager {
     this.budgetMs = Number.isFinite(o.budgetMs) ? o.budgetMs : 4.0;
     this.evictMs = Number.isFinite(o.evictMs) ? o.evictMs : 12000;
     this.maxQueue = Number.isFinite(o.maxQueue) ? o.maxQueue : 512;
+    this.dataBudgetMs = Number.isFinite(o.dataBudgetMs) ? o.dataBudgetMs : 2.0;
+    this.dataAhead = Number.isFinite(o.dataAhead) ? o.dataAhead : 700;
 
     // Adaptive level-of-detail scale — the safety valve that keeps the WANT SET inside the cap.
     //
@@ -295,6 +144,13 @@ export class TileManager {
     this._casters = [];
     this._now = 0;
 
+    // THE DATA SOURCE. Null means the whole city's records were already in memory when the
+    // manager was built — the monolithic sidecar — and every tile can be built the moment it is
+    // wanted. A CityStream here means the records themselves arrive per tile, and a build waits
+    // until its own payload and the handful its features reach into have landed. See
+    // src/data/stream.js; setDataSource() is the only way in.
+    this._data = null;
+
     // STATIC GEOMETRY. One mesh per material class that is always resident, always drawn, never
     // culled and never evicted — the world's outermost ground apron and nothing else. The apron
     // is a handful of very large quads that reach thirteen kilometres past the last tile, so it
@@ -312,10 +168,59 @@ export class TileManager {
       built: 0, evicted: 0, evictedVerts: 0, queued: 0, buildMs: 0, lastBuildMs: 0,
       peakResidentVerts: 0, uploads: 0, freed: 0, lodScale: 1, lodShrinks: 0, lodRelaxes: 0,
       evictedWanted: 0, staticVerts: 0, staticMeshes: 0,
+      dataWaits: 0, dataMs: 0,
     };
   }
 
   get visibleTiles() { return this._visible; }
+
+  /**
+   * Attach the per-tile data source, or pass null to clear it.
+   *
+   * It is set after construction rather than in the options because the loader has to know the
+   * extent before it can build the grid, and has to have the grid before it can trust a
+   * manifest's tile ids — so the stream is validated and handed over once both exist.
+   *
+   * The object needs four methods, all of which CityStream has:
+   *   ready(tileId)                 is every payload this tile's build reads decoded?
+   *   want(tileId, nowMs, dist)     stamp it and queue whatever is missing
+   *   pump(budgetMs)                spend up to that long fetching and decoding; returns the ms
+   *   sweep(nowMs, evictMs)         release payloads nobody has wanted for that long
+   *
+   * A fifth, `bounds(tileId)`, is optional and worth having: see _primeBoxes().
+   */
+  setDataSource(src) {
+    const ok = !!(src && typeof src.ready === 'function' && typeof src.want === 'function' &&
+      typeof src.pump === 'function' && typeof src.sweep === 'function');
+    this._data = ok ? src : null;
+    if (ok && typeof src.bounds === 'function') this._primeBoxes(src);
+    return this;
+  }
+
+  /**
+   * Give every tile its draw box from the MANIFEST, before a single feature has arrived.
+   *
+   * A tile's box is normally grown one indexed feature at a time, which is fine when the whole
+   * city is in memory before the grid is walked. Streamed, it is a deadlock: a tile with no
+   * features indexed is `empty`, an empty tile is never queued for a build, a tile that is never
+   * queued never asks for its data, and so its features never arrive to make it non-empty.
+   *
+   * The manifest already carries the box containing everything each tile owns — the packer has
+   * to compute it anyway to work out which payloads a build depends on — so priming from it
+   * breaks the cycle and, as a bonus, gives the frustum culler and the level-of-detail distance
+   * honest boxes from the first frame instead of cell-sized guesses.
+   *
+   * Boxes only GROW here, exactly as cover() grows them, so a grid that was also indexed the
+   * old way ends up with the union rather than whichever ran last.
+   */
+  _primeBoxes(src) {
+    const tiles = this.grid.tiles;
+    for (let k = 0; k < tiles.length; k++) {
+      const b = src.bounds(k);
+      if (!b) continue;
+      this.grid.cover(tiles[k], b[0], b[1], b[2], b[3], b[4], b[5]);
+    }
+  }
 
   /**
    * Register (or replace) the always-resident mesh of one material class. Pass null to clear.
@@ -347,7 +252,22 @@ export class TileManager {
   pump(ms) {
     const clock = (typeof performance !== 'undefined' && performance.now)
       ? () => performance.now() : () => Date.now();
-    return this._pump(Math.max(0, ms), clock);
+    if (!this._now) this._now = clock();
+    const budget = Math.max(0, ms);
+    const spent = this._pumpData(budget);
+    return spent + this._pump(Math.max(0, budget - spent), clock);
+  }
+
+  /**
+   * Spend part of the frame's budget getting RECORDS resident, before any of it goes on turning
+   * records into triangles. Returns the milliseconds used, which come out of the build budget:
+   * the point of the split is to bound the total, not to add a second budget beside the first.
+   */
+  _pumpData(budget) {
+    if (!this._data || !(budget > 0)) return 0;
+    const spent = this._data.pump(Math.min(this.dataBudgetMs, budget)) || 0;
+    this.stats.dataMs += spent;
+    return spent;
   }
 
   /* ------------------------------------------------------------- builders */
@@ -397,6 +317,40 @@ export class TileManager {
   releaseTile(tile) {
     let freed = 0;
     for (let s = 0; s < tile.st.length; s++) freed += this._release(tile, s);
+    return freed;
+  }
+
+  /**
+   * Throw one tile's geometry away because its FEATURES changed, not because it went out of
+   * range — the analysis that produced it finished after it was built.
+   *
+   * This is what lets an analysis pass run behind the first frame instead of in front of it. A
+   * pass that is off the critical path can still produce geometry (the walkability audit builds
+   * connectors and flights of steps; the quay wall is one continuous run of surveyed shoreline),
+   * and a tile that was already standing when its share arrived has to be generated again. The
+   * scheduler re-queues it on the next frame like any other empty stage, so the rebuild costs one
+   * ordinary budgeted build and never a stall.
+   *
+   * A stage that is mid-build is abandoned rather than finished: the job's generator holds a
+   * MeshBuilder set that is about to be reset anyway, and letting it complete would upload
+   * geometry that is already known to be wrong.
+   *
+   * @param {object} tile the grid tile
+   * @param {number} [stage] one stage, or every stage when omitted
+   * @returns {number} vertices freed
+   */
+  invalidate(tile, stage) {
+    if (!tile || !tile.st) return 0;
+    const one = Number.isFinite(stage);
+    const s0 = one ? stage : 0;
+    const s1 = one ? stage : tile.st.length - 1;
+    if (s0 < 0 || s1 >= tile.st.length) return 0;
+    let freed = 0;
+    for (let s = s0; s <= s1; s++) {
+      const job = this._job;
+      if (job && job.tile === tile && job.stage === s) this._job = null;
+      freed += this._release(tile, s);
+    }
     return freed;
   }
 
@@ -529,6 +483,7 @@ export class TileManager {
     const t0 = clock();
     let spent = 0;
     let guard = 0;
+    let skipped = 0;
     while (spent < budget && guard++ < 4096) {
       if (!this._job) {
         if (!this._queue.length || !this.build) break;
@@ -538,6 +493,15 @@ export class TileManager {
         // The queue is built from last frame's distances; a tile that has since fallen out of
         // range must not be built just because it was queued.
         if (!this._wantStage(next.tile, next.stage)) continue;
+        // A streamed city has to have the RECORDS before it can have the geometry. Ask for them
+        // and move on: the tile is queued again next frame, and by then the group file carrying
+        // it is usually already in hand.
+        if (this._data && !this._data.ready(next.tile.id)) {
+          this._data.want(next.tile.id, this._now, next.tile.dist);
+          this.stats.dataWaits++;
+          if (++skipped >= DATA_SKIP_MAX) break;
+          continue;
+        }
         this._job = this._startJob(next.tile, next.stage);
         if (!this._job) continue;
       }
@@ -648,11 +612,28 @@ export class TileManager {
     let meshes = 0;
 
     const maxRange = this.stages.length ? this.drop(0) : 0;
+    // THE READ-AHEAD. Records are asked for out to here, past the range anything is actually
+    // built at, so a tile's payload has already arrived and been decoded by the time the tile
+    // itself comes into range. Without it the first thing that happens when a tile enters range
+    // is a network round trip, which is a visible hole in the direction of travel; with it, one
+    // tile of warning at RUN 22 m/s is 28 seconds.
+    //
+    // Measured against stage 0's BUILD range, not its drop range. The drop is 24% further out —
+    // where geometry is released rather than made — and records are only ever read to make
+    // geometry, so anchoring on it would fetch 54% more area than anything can be built from.
+    // A tile drifting through the band between the two keeps the geometry it already has, and
+    // the eviction grace period keeps its records for twenty seconds after it stops being asked
+    // for, so nothing is re-fetched for hovering on the boundary either.
+    const dataRange = this._data ? this.range(0) + this.dataAhead : -1;
     for (let k = 0; k < tiles.length; k++) {
       const t = tiles[k];
       // Level of detail is measured against the CORE cell (plus the tile's real height range),
       // not the draw box, so one long feature cannot pull a whole tile into detail range.
       t.dist = boxDist(px, py, pz, t.cx0, t.by0, t.cz0, t.cx1, t.by1, t.cz1);
+      // Stamped every frame whether or not it is resident, for the same reason rec.lastWant is:
+      // this is "when was this last wanted", which is what the eviction grace period below and
+      // the stream's own sweep are both measured against.
+      if (t.dist <= dataRange && !t.empty) this._data.want(t.id, this._now, t.dist);
       let ready = false;
       for (let s = 0; s < t.st.length; s++) {
         if (t.st[s].state === STATE_READY) { resident += t.st[s].verts; ready = true; }
@@ -693,7 +674,10 @@ export class TileManager {
     if (this._queue.length > this.maxQueue) this._queue.length = this.maxQueue;
 
     const budget = Number.isFinite(budgetMs) ? budgetMs : this.budgetMs;
-    if (budget > 0) this._pump(budget, clock);
+    // Data first: there is nothing to triangulate until the records land, and a build that finds
+    // its payload missing costs a wasted queue slot.
+    const dataMs = this._pumpData(budget);
+    if (budget - dataMs > 0) this._pump(budget - dataMs, clock);
 
     // Shrink the want set BEFORE evicting, so whatever eviction takes is genuinely out of range
     // and will not simply be rebuilt on the next frame.
@@ -702,6 +686,11 @@ export class TileManager {
     let over = this.stats.residentVerts - this._cap();
     if (over > 0) this._evict(over);
     else this._evict(0);           // still retire anything past evictMs, so memory comes back
+    // ONE eviction policy, not two. The records a tile was built from retire on the same clock
+    // and the same grace period as the meshes built from them, so walking away from a block
+    // gives back both, and walking back into it pays for both at once rather than finding the
+    // geometry gone and the data still pinned, or the reverse.
+    if (this._data) this._data.sweep(this._now, this.evictMs);
 
     let residentTiles = 0;
     for (let k = 0; k < tiles.length; k++) {

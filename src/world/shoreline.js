@@ -77,28 +77,67 @@ export function makeWaterField(outerChains, innerChains, basinRings) {
   for (let i = 0; i < innerChains.length; i++) add(innerChains[i], true);
   if (basinRings) for (let i = 0; i < basinRings.length; i++) add(basinRings[i], true);
 
-  let x0 = Infinity, x1 = -Infinity;
+  let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
   for (let i = 0; i < segs.length; i += 4) {
     x0 = Math.min(x0, segs[i], segs[i + 2]);
     x1 = Math.max(x1, segs[i], segs[i + 2]);
+    z0 = Math.min(z0, segs[i + 1], segs[i + 3]);
+    z1 = Math.max(z1, segs[i + 1], segs[i + 3]);
   }
   if (!isFinite(x0)) { x0 = 0; x1 = 1; }
+  if (!isFinite(z0)) { z0 = 0; z1 = 1; }
   const colW = 48;
   const nCol = Math.max(1, Math.ceil((x1 - x0) / colW) + 1);
   const cols = new Array(nCol);
   for (let i = 0; i < nCol; i++) cols[i] = [];
+  // THE NORTHERN HORIZON of each column: the smallest z any segment filed there reaches. The ray
+  // waterAt() casts runs NORTH, so a query north of every segment in its column cannot cross one
+  // and is land without any arithmetic at all. It is a per-COLUMN horizon rather than one number
+  // for the whole field because the surveyed chain is deliberately not clipped to the extract and
+  // loops far north of it out west, which would make a single global horizon useless. Measured on
+  // the downtown extract, where nearly everything is waterfront, it already short-circuits 42% of
+  // the lake-bed carve; over Old Toronto, where the map reaches 8 km inland, it is nearly all of
+  // it, and the carve becomes a function of the shoreline rather than of the map's area.
+  const colMinZ = new Float64Array(nCol).fill(Infinity);
   for (let i = 0; i < segs.length; i += 4) {
     const lo = Math.min(segs[i], segs[i + 2]), hi = Math.max(segs[i], segs[i + 2]);
+    const zlo = Math.min(segs[i + 1], segs[i + 3]);
     const c0 = clamp(Math.floor((lo - x0) / colW), 0, nCol - 1);
     const c1 = clamp(Math.floor((hi - x0) / colW), 0, nCol - 1);
-    for (let c = c0; c <= c1; c++) cols[c].push(i);
+    for (let c = c0; c <= c1; c++) {
+      cols[c].push(i);
+      if (zlo < colMinZ[c]) colMinZ[c] = zlo;
+    }
   }
-  return { segs, cols, x0, colW, nCol, minX: x0, maxX: x1 };
+  return { segs, cols, colMinZ, x0, colW, nCol, minX: x0, maxX: x1, minZ: z0, maxZ: z1 };
+}
+
+/**
+ * The northernmost shore segment anywhere in the x-span [x0, x1], or +Infinity where the span
+ * holds none.
+ *
+ * The companion to waterAt()'s per-column short circuit, for callers that want to reject a whole
+ * FEATURE rather than a point: nothing whose bounding box lies north of this can have a wet
+ * vertex, so it never has to be resampled to find out. Exact — it is the same horizon, taken over
+ * every column the box touches.
+ */
+export function waterHorizon(F, x0, x1) {
+  if (!F || !F.colMinZ) return -Infinity;
+  if (!isNum(x0) || !isNum(x1) || x1 <= F.minX || x0 >= F.maxX) return Infinity;
+  const c0 = clamp(Math.floor((x0 - F.x0) / F.colW), 0, F.nCol - 1);
+  const c1 = clamp(Math.floor((x1 - F.x0) / F.colW), 0, F.nCol - 1);
+  let z = Infinity;
+  for (let c = c0; c <= c1; c++) if (F.colMinZ[c] < z) z = F.colMinZ[c];
+  return z;
 }
 
 export function waterAt(F, x, z) {
   if (!isNum(x) || !isNum(z) || x <= F.minX || x >= F.maxX) return false;
-  const col = F.cols[clamp(Math.floor((x - F.x0) / F.colW), 0, F.nCol - 1)];
+  const c = clamp(Math.floor((x - F.x0) / F.colW), 0, F.nCol - 1);
+  // Exactly equivalent to walking the column and finding no crossing: every segment filed here
+  // lies south of the query, and a northward ray meets none of them.
+  if (F.colMinZ && z <= F.colMinZ[c]) return false;
+  const col = F.cols[c];
   const s = F.segs;
   let n = 0;
   for (let k = 0; k < col.length; k++) {
@@ -261,6 +300,33 @@ export function makeShoreIndex(runs, rect) {
     }
   }
   return { x0, z0, nx, nz, cells, count };
+}
+
+/**
+ * The world rectangle covered by the NON-EMPTY cells of a uniform index, or null when it holds
+ * nothing at all.
+ *
+ * Every one of the three indices the ground query reads answers -Infinity the moment the cell it
+ * lands in is empty, so a point outside this rectangle is a point all three would refuse. That
+ * makes a single four-compare reject exactly equivalent to running all three, which is what
+ * harbourDeckY() uses it for: the harbour is a thin band along the south of the map and almost
+ * every ground query in the city is nowhere near it.
+ */
+export function occupiedBounds(G, cell) {
+  if (!G || !G.cells) return null;
+  let i0 = G.nx, i1 = -1, j0 = G.nz, j1 = -1;
+  for (let j = 0; j < G.nz; j++) {
+    for (let i = 0; i < G.nx; i++) {
+      const c = G.cells[j * G.nx + i];
+      if (!c || (c.length !== undefined && c.length === 0)) continue;
+      if (i < i0) i0 = i;
+      if (i > i1) i1 = i;
+      if (j < j0) j0 = j;
+      if (j > j1) j1 = j;
+    }
+  }
+  if (i1 < i0 || j1 < j0) return null;
+  return [G.x0 + i0 * cell, G.z0 + j0 * cell, G.x0 + (i1 + 1) * cell, G.z0 + (j1 + 1) * cell];
 }
 
 const _hit = { d: Infinity, run: null, i: 0, t: 0, qx: 0, qz: 0, side: 0 };

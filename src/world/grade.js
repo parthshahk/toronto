@@ -292,21 +292,38 @@ function makeGradeField(extent) {
  * Cost is linear in feature count: segments are filed in a uniform grid and each is tested only
  * against the ones sharing a cell.
  */
-function findCrossings(lines, extent, visit) {
+function findCrossings(lines, extent, pairOk, visit) {
   const cell = 24;
   const pad = 400;
   const x0 = -extent.x / 2 - pad, z0 = -extent.z / 2 - pad;
   const nx = Math.ceil((extent.x + 2 * pad) / cell) + 2;
   const nz = Math.ceil((extent.z + 2 * pad) / cell) + 2;
   const idx = makeGridIndex(cell, x0, z0, nx, nz);
+  // THE SEGMENT TABLE, flat. What the index holds is an ORDINAL into these arrays rather than a
+  // six-element array literal per segment: over the downtown extract that is 88,000 short-lived
+  // arrays, and over Old Toronto half a million, whose only effect is to hand the collector the
+  // whole street network twice. The index's own iteration order is untouched — cells in order,
+  // members in insertion order — so this is the same enumeration, allocating nothing.
+  let cap = 0;
+  for (let l = 0; l < lines.length; l++) {
+    const p = lines[l].p;
+    if (Array.isArray(p) && p.length > 1) cap += p.length - 1;
+  }
+  const sx = new Float64Array(cap * 4);
+  const sl = new Int32Array(cap * 2);
+  let ns = 0;
   for (let l = 0; l < lines.length; l++) {
     const p = lines[l].p;
     if (!Array.isArray(p)) continue;
     for (let k = 1; k < p.length; k++) {
       const a = p[k - 1], b = p[k];
       if (!isNum(a[0]) || !isNum(a[1]) || !isNum(b[0]) || !isNum(b[1])) continue;
+      const o = ns * 4;
+      sx[o] = a[0]; sx[o + 1] = a[1]; sx[o + 2] = b[0]; sx[o + 3] = b[1];
+      sl[ns * 2] = l; sl[ns * 2 + 1] = k;
       idx.add(Math.min(a[0], b[0]), Math.min(a[1], b[1]),
-        Math.max(a[0], b[0]), Math.max(a[1], b[1]), [a[0], a[1], b[0], b[1], l, k]);
+        Math.max(a[0], b[0]), Math.max(a[1], b[1]), ns);
+      ns++;
     }
   }
   for (let l = 0; l < lines.length; l++) {
@@ -319,8 +336,17 @@ function findCrossings(lines, extent, visit) {
       const rad = Math.hypot(bx - ax, bz - az) * 0.5;
       idx.query(mx, mz, rad, (s) => {
         // Each unordered pair once, and never a way against itself.
-        if (s[4] <= l) return;
-        const cx = s[0], cz = s[1], dx = s[2], dz = s[3];
+        const ol = sl[s * 2];
+        if (ol <= l) return;
+        // THE PAIR FILTER, applied before the intersection arithmetic rather than after it. The
+        // solver only cares about pairs whose LAYERS differ, and in a street network essentially
+        // every pair is two ways on the ground: 20,403 road ways produce millions of segment
+        // pairs sharing a grid cell and 7,505 real crossings. Testing the pair first skips the
+        // determinant, the two parameters and the sine filter for all of them, and it cannot
+        // change the answer — visit() rejected exactly these pairs on its first line.
+        if (pairOk && !pairOk(l, ol)) return;
+        const o = s * 4;
+        const cx = sx[o], cz = sx[o + 1], dx = sx[o + 2], dz = sx[o + 3];
         const r1x = bx - ax, r1z = bz - az;
         const r2x = dx - cx, r2z = dz - cz;
         const den = r1x * r2z - r1z * r2x;
@@ -334,7 +360,7 @@ function findCrossings(lines, extent, visit) {
         const l1 = Math.hypot(r1x, r1z), l2 = Math.hypot(r2x, r2z);
         if (!(l1 > EPS) || !(l2 > EPS)) return;
         if (Math.abs(den) / (l1 * l2) < CROSS_MIN_SIN) return;
-        visit(l, k, s[4], s[5], ax + r1x * t, az + r1z * t);
+        visit(l, k, ol, sl[s * 2 + 1], ax + r1x * t, az + r1z * t);
       });
     }
   }
@@ -358,7 +384,7 @@ function findCrossings(lines, extent, visit) {
  * @returns {object} kinds, per-way depth and rise profiles, the corridor field and the shared
  *                   street graph the walkability audit runs on.
  */
-function solveGrade(roadsRaw, railsRaw, buildingsRaw, extent, terrainY, stats) {
+function solveGrade(roadsRaw, railsRaw, extent, terrainY, stats) {
   const n = roadsRaw.length;
   const kind = new Int8Array(n);
   const lay = new Int8Array(n);
@@ -446,7 +472,7 @@ function solveGrade(roadsRaw, railsRaw, buildingsRaw, extent, terrainY, stats) {
   // Kept, because the requirement a crossing puts on the way BELOW depends on how far the way
   // ABOVE ends up rising, and that is not known until every crossing has been seen once.
   const cross = [];
-  findCrossings(lines, extent, (l1, k1, l2, k2, cx, cz) => {
+  findCrossings(lines, extent, (l1, l2) => levelOf(l1) !== levelOf(l2), (l1, k1, l2, k2, cx, cz) => {
     const v1 = levelOf(l1), v2 = levelOf(l2);
     if (v1 === v2) return;
     stats.grade.crossings++;

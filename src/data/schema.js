@@ -81,6 +81,47 @@ export const SIDECAR_MAGIC = [84, 79, 82, 50];
 /** Bytes before the JSON header: 4 of magic plus a uint32 header length. */
 export const SIDECAR_HEADER_OFFSET = 8;
 
+// ============================================================================================
+// data/city/  (tools/pack_city.py) — THE STREAMED CITY
+// ============================================================================================
+// The same information again, cut up so the browser fetches only what it is standing near. At
+// the Old Toronto extent the monolithic sidecar is ~34 MB and every byte of it has to arrive and
+// be parsed before the first frame; this is a few tens of KB before the first frame and a group
+// file at a time after it.
+//
+//   manifest.json   the grid, the extent, the meta block, the per-tile block table, the enum
+//                   vocabularies, and per tile: which group file it is in, its byte range there,
+//                   and the box that contains everything it owns.
+//   global.bin      the terrain height field, the lake shore, the waterfront structures, and the
+//                   features larger than one tile. Fetched once, at boot.
+//   gNNNN.bin       a group of GROUP_EDGE x GROUP_EDGE tiles' payloads, concatenated.
+//
+// OWNERSHIP. A feature belongs to exactly ONE tile — the one holding its anchor, computed the
+// same way city/tileindex.js computes it — and that tile's box grows to contain the whole
+// feature. Nothing is clipped and nothing is duplicated: reassembling every tile plus the global
+// block reproduces data/toronto.json array for array. A feature LARGER than a tile has no tile
+// that can honestly own it, so it goes in the global block with the shore and the terrain.
+//
+// The payload layout is in data/tileformat.js, which is the only file that reads these bytes.
+
+/** Magic bytes at the head of a per-tile payload: 'T', 'O', 'R', 'T'. */
+export const TILE_MAGIC = [84, 79, 82, 84];
+
+/** Magic bytes at the head of data/city/global.bin: 'T', 'O', 'R', 'G'. */
+export const GLOBAL_MAGIC = [84, 79, 82, 71];
+
+/** Bytes in a tile payload before its uint32 block-length table. */
+export const TILE_HEADER_OFFSET = 16;
+
+/** The `format` string a manifest must carry to be usable. */
+export const CITY_FORMAT = 'TORT1';
+
+/** Directory holding the streamed city, beside data/toronto.json. */
+export const CITY_DIR = 'city';
+
+/** Bytes per element of each block type the packer emits. */
+export const ELEM_SIZE = { i8: 1, u8: 1, i16: 2, u16: 2, i32: 4, f32: 4 };
+
 /** Fixed-point scales used by the sidecar. Divide by these; never multiply by their reciprocal. */
 export const SCALE_CM = 100;        // building h/y, road w, ring coordinates, poi x/z
 export const SCALE_MM = 1000;       // terrain heights, and unit parameter t (thousandths)

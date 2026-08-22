@@ -73,9 +73,14 @@ import { emitSurroundStreet, emitSurroundBlock, emitFringeBank } from '../world/
  */
 function makeTileBuilder(W) {
   const {
-    C, G, HARBOUR, T, cnBaseY, cnX, cnZ, data, extent, gradeField, groundY,
-    harbourClaims, recs, scrap, stats, terrainY,
+    C, COP, G, HARBOUR, T, cnBaseY, cnX, cnZ, data, extent, gradeField, groundY,
+    harbourClaims, prep, recs, scrap, stats, terrainY,
   } = W;
+
+  // WHO OWNS A SHARED SURFACE, answered on demand. Every stage that reads a record's walls or its
+  // cap verdict asks for the record first; the resolver pulls in whatever neighbours the answer
+  // depends on and remembers it, so the second stage and every rebuild after eviction are free.
+  const resolve = COP && typeof COP.resolve === 'function' ? COP.resolve : () => {};
 
   /* ------------------------------------------------------- the tile builder */
 
@@ -83,6 +88,20 @@ function makeTileBuilder(W) {
     (SEED ^ Math.imul(t.i + 1, 0x9e3779b1) ^ Math.imul(t.j + 1, 0x85ebca6b) ^
       Math.imul(stage + 1, 0x27d4eb2d)) >>> 0
   );
+
+  // Captures that arrived AFTER the tile index was built — the walkability solve's connectors and
+  // flights of steps, delivered by city/lod.js deliverCapture() once that pass finishes behind the
+  // first frame. A tile that was already standing when its share landed was invalidated and is
+  // being generated again here, so this reads exactly like the up-front capture does.
+  function appendLate(builders, F, stage) {
+    const L = F.late;
+    if (!L) return;
+    for (let i = 0; i < L.length; i++) {
+      const chunk = L[i][stage];
+      if (!chunk) continue;
+      for (const c in chunk) appendChunk(builders[c], chunk[c]);
+    }
+  }
 
   const crowdHist = new Int32Array(80);
   const recYAt = (rec) => {
@@ -378,6 +397,11 @@ function makeTileBuilder(W) {
   }
 
   function* buildTile(tile, stage, builders) {
+    // PREPARE WHAT THIS TILE IS MADE OF. Rings into oriented parts, materials, the storey model
+    // and the broadphase entry, for the records this tile owns and no others — the pass that used
+    // to run over the whole city before the first frame. Idempotent, so the second stage and
+    // every rebuild after eviction are free. See city/prep.js.
+    prep.ensureTile(tile.id);
     const F = tile.f;
     const first = beginTile(tile, stage);
     C.mb = builders;
@@ -387,7 +411,9 @@ function makeTileBuilder(W) {
       /* ---------------------------------------------------------------- signage */
       // The shortest-range stage: shop names and house numbers, and nothing else. See S_SIGNS.
       for (let i = 0; i < F.b.length; i++) {
-        buildSignage(C, F.b[i]);
+        const b = F.b[i];
+        resolve(b);
+        if (!b.buried) buildSignage(C, b);
         if ((i & 31) === 31) yield;
       }
       endTile(tile, stage, first);
@@ -416,6 +442,7 @@ function makeTileBuilder(W) {
       for (let i = 0; i < F.pass.length; i++) emitPassage(C, F.pass[i].r, F.pass[i].hw);
       yield;
       for (let i = 0; i < F.b.length; i++) {
+        resolve(F.b[i]);
         emitBuildingMass(F.b[i]);
         if ((i & 63) === 63) yield;
       }
@@ -434,6 +461,7 @@ function makeTileBuilder(W) {
         const chunk = F.harbour[S_MASS];
         for (const c in chunk) appendChunk(builders[c], chunk[c]);
       }
+      appendLate(builders, F, S_MASS);
       // ISLANDS: the shore mantle, the boardwalks and the airfield surface.
       if (F.isle) {
         yield;
@@ -513,7 +541,8 @@ function makeTileBuilder(W) {
       /* ------------------------------------------------------------ facades */
       for (let i = 0; i < F.b.length; i++) {
         const b = F.b[i];
-        if (b.landmark !== 'cn') buildFacade(C, b);
+        resolve(b);
+        if (b.landmark !== 'cn' && !b.buried) buildFacade(C, b);
         if ((i & 31) === 31) yield;
       }
       yield;
@@ -577,6 +606,7 @@ function makeTileBuilder(W) {
       /* --------------------------------------------------------- roofscape */
       for (let i = 0; i < F.b.length; i++) {
         const b = F.b[i];
+        if (b.buried) continue;
         if (b.landmark !== 'cn' && b.frontLen > 0) placeRoofscape(C, b);
         if (b.towerSign >= 0 && b.frontLen >= 7) {
           appendTowerSign(builders.props, C.rng, b.frontX, b.y + b.h - 7.5, b.frontZ, b.frontYaw,
@@ -608,6 +638,7 @@ function makeTileBuilder(W) {
         const chunk = F.harbour[S_DETAIL];
         for (const c in chunk) appendChunk(builders[c], chunk[c]);
       }
+      appendLate(builders, F, S_DETAIL);
       // ISLANDS: the tree cover, the gardens, the beach, the airfield lights and aircraft, the
       // ferries, Centreville, the lighthouse and the cottage roofs.
       if (F.isle) {

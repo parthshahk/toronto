@@ -25,10 +25,23 @@ SHP = os.path.join(RAW, 'massing2025', '3DMassingShapefile_2025_WGS84')
 # Expanded 2026-08-20: roughly 2x on the north/east/west sides, and stretched south to take in
 # the whole Toronto Islands chain (Hanlan's/Centre/Ward's, south shore at 43.6116) and Billy
 # Bishop airport, with a margin of open lake beyond. 6.8 x 6.4 km, about 43 km2.
-BBOX = dict(west=-79.4290, east=-79.3450, south=43.6060, north=43.6640)
+# Expanded 2026-08-21 to the full pre-1998 City of Toronto ('Old Toronto'), whose OSM historic
+# boundary spans -79.4928..-79.2785 / 43.6092..43.7360. The south edge is held at 43.6060 so the
+# Islands keep their margin of open lake. 17.3 x 14.6 km, about 252 km2, ~181k buildings.
+BBOX = dict(west=-79.4930, east=-79.2780, south=43.6060, north=43.7370)
 
-# SURF_ELEV uses 0.0 for "missing" and 130.1 as a fill value; real downtown ground is 74.6-105 m MSL.
-ELEV_MIN, ELEV_MAX = 74.0, 115.0
+# SURF_ELEV uses 0.0 for "missing" and 130.1 as a fill value, and both have to go before the
+# heightfield is built from what is left.
+#
+# THE CEILING IS A PROPERTY OF THE EXTENT, not of the dataset. At the downtown extent real ground
+# ran 74.6-105 m MSL and the ceiling stood at 115. Old Toronto climbs off the lake plain and keeps
+# climbing: 82 m mean at the south shore, 124 m at Bloor, 166 m along the Eglinton edge, with the
+# Casa Loma escarpment and the Iroquois shoreline in between. A 115 m ceiling threw away 125,745 of
+# 178,499 samples -- 70% of them, and every one north of Davenport -- and cells with no sample left
+# fall back to `default=lake`, so the whole northern half of the city came out as a plateau at lake
+# level with the escarpment missing entirely. 200 m keeps 99.99% of the real ground and still
+# rejects the 18 records whose SURF_ELEV is plainly a roof (up to 314.5 m).
+ELEV_MIN, ELEV_MAX = 74.0, 200.0
 TERRAIN_CELL = 25.0            # metres per heightfield cell
 
 # OSM highway -> (carriageway width m, class). Widths are per-direction-inclusive roadway width.

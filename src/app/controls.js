@@ -109,25 +109,42 @@ const NEAR_PROBE = [0.9, 1.8, 3.6, 7.2];   // footprint probe radii, ascending, 
 // how the coordinates were checked against the real street grid. Positions are re-grounded and
 // pushed out of any footprint on arrival, so they cannot strand the camera inside a wall.
 //
-// RE-PROJECTED for the expanded extent. These were authored against the old bounding box, whose
-// origin was (-79.38850, 43.64400); the extract now originates at (-79.38700, 43.63500), which
-// moves every local coordinate by (-120.9, -1002.0) m. The framings are unchanged — each one was
-// carried back through the old projector to lon/lat and forward through the new one, and every
-// walking viewpoint was re-checked against streetNameAt(): Front Street West, Bay Street, King
-// Street West, Bremner Boulevard, Waterfront Recreational Trail. Left alone they land a kilometre
-// out in the harbour.
+// RE-PROJECTED for the extent, every time the extent moves. A viewpoint is stored in LOCAL
+// METRES, and local metres are measured from the bounding box CENTRE, so widening the box
+// relocates every one of them without a digit changing here. It has now happened twice:
+//
+//     authored at   (-79.38850, 43.64400)   downtown
+//     43 km²        (-79.38700, 43.63500)   moved them (-120.9, -1002.0) m
+//     Old Toronto   (-79.38550, 43.67150)   moves them ~4.06 km further north in local z
+//
+// Left alone after the Old Toronto expansion, "the skyline from the lake" stood at Yonge and
+// Wellesley and every walking viewpoint was four kilometres up Bay Street. The framings below are
+// unchanged: each was carried back through the OLD projector to lon/lat and forward through the
+// new one — which is a rescale as well as a shift, because the projector's cos(lat0) moves with
+// the centre — and every walking viewpoint was re-checked against streetNameAt(): Front Street
+// West, Bay Street, King Street West, Bremner Boulevard, Waterfront Recreational Trail. The
+// lon/lat each one lands on is written beside it, so the next move is arithmetic rather than
+// archaeology.
 export const VIEWPOINTS = [
   // THE START: out over the Inner Harbour in fly mode, looking north at the skyline. This is the
   // postcard angle -- the CN Tower against the Financial District with the water in front -- and it
   // shows what the project is in one frame. 'R' returns here.
-  { name: 'The skyline from the lake', x: 179.2, y: 300, z: 518.3, bearing: 350, pitch: -7, mode: 'fly' },
-  { name: 'Over the harbour', x: 209.2, y: 340, z: 178.2, bearing: 349, pitch: -9, mode: 'fly' },
-  { name: 'Front St W at The Well', x: -749.3, z: -789.8, bearing: 70, pitch: 6, mode: 'walk' },
-  { name: 'Front St W at Simcoe', x: 179.2, z: -1092.0, bearing: 79, pitch: 5, mode: 'walk' },
-  { name: 'Bay St at Wellington', x: 588.2, z: -1373.0, bearing: 343, pitch: 24, mode: 'walk' },
-  { name: 'King St W at Bay', x: 532.0, z: -1517.0, bearing: 253, pitch: 12, mode: 'walk' },
-  { name: 'Bremner Blvd, CN Tower', x: 48.2, z: -760.2, bearing: 340, pitch: 34, mode: 'walk' },
-  { name: 'Harbourfront, York Quay', x: 334.2, z: -489.9, bearing: 333, pitch: 15, mode: 'walk' },
+  // 43.63034 N, 79.38478 W
+  { name: 'The skyline from the lake', x: 58.3, y: 300, z: 4579.9, bearing: 350, pitch: -7, mode: 'fly' },
+  // 43.63340 N, 79.38440 W
+  { name: 'Over the harbour', x: 88.3, y: 340, z: 4240.0, bearing: 349, pitch: -9, mode: 'fly' },
+  // 43.64209 N, 79.39630 W
+  { name: 'Front St W at The Well', x: -869.6, z: 3272.6, bearing: 70, pitch: 6, mode: 'walk' },
+  // 43.64481 N, 79.38478 W
+  { name: 'Front St W at Simcoe', x: 58.3, z: 2970.6, bearing: 79, pitch: 5, mode: 'walk' },
+  // 43.64733 N, 79.37970 W
+  { name: 'Bay St at Wellington', x: 467.1, z: 2689.8, bearing: 343, pitch: 24, mode: 'walk' },
+  // 43.64863 N, 79.38040 W
+  { name: 'King St W at Bay', x: 410.9, z: 2545.8, bearing: 253, pitch: 12, mode: 'walk' },
+  // 43.64183 N, 79.38640 W
+  { name: 'Bremner Blvd, CN Tower', x: -72.6, z: 3302.2, bearing: 340, pitch: 34, mode: 'walk' },
+  // 43.63940 N, 79.38285 W
+  { name: 'Harbourfront, York Quay', x: 213.2, z: 3572.3, bearing: 333, pitch: 15, mode: 'walk' },
 ];
 
 /* ================================================================== player == */

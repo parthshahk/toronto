@@ -84,10 +84,10 @@ import {
   SHORE_SLOPE, WALL_PROUD, WALL_PROUD_MAX, bboxOf, centroidOf, isClosed, planArea, polyLength,
   resample, sampleTerrain,
 } from './waterkit.js';
-import { ISLE_REACH } from './islandkit.js';
+import { ISLE_GRID, ISLE_REACH } from './islandkit.js';
 import {
   buildRuns, chainWays, deckPolyAt, findBasins, makeDeckIndex, makeShoreIndex, makeWaterField,
-  nearestShore, waterAt,
+  nearestShore, occupiedBounds, waterAt, waterHorizon,
 } from './shoreline.js';
 import { carveIslands, islandGroundY } from './islandterrain.js';
 import { nearIsleStation } from './islanddetail.js';
@@ -130,6 +130,9 @@ export function buildHarbour(data, opts) {
     roads: Array.isArray(data && data.roads) ? data.roads : [],
     crossings: [],
     decks: null,
+    // The ground query's reject box, filled in at step 4b once all three indices exist. Null
+    // until then, which is what makes the passes that run before it take the full path.
+    deckBox: null,
     piers: [], fingers: [], mounds: [], marinas: [], walls: [], terminals: [],
     stats: {
       shoreMetres: 0, runs: runs.length, quayStations: 0, apronMinW: Infinity, apronMaxW: 0,
@@ -356,6 +359,30 @@ export function carveHarbourTerrain(T, H) {
   // --- 4. deck polygons (piers, terminal aprons, and walkways over the water) -------------------
   H.decks = makeDeckIndex(collectDeckPolys(H).concat(collectCrossings(H, T)), H.rect);
 
+  // --- 4b. the reject box the ground query opens with ------------------------------------------
+  // harbourDeckY() reads three uniform indices and each of them answers -Infinity the moment its
+  // cell is empty, so the union of their OCCUPIED cells is exactly the region where any of them
+  // can answer anything else. All three grids are sized to the whole extent, so without this a
+  // ground query at Bloor and Bathurst still probes three cells and three bounds tests before
+  // finding out that the harbour is four kilometres away — and the load makes millions of them.
+  {
+    const boxes = [
+      occupiedBounds(H.decks, H.decks.cell),
+      occupiedBounds(H.index, GRID_CELL),
+      H.isle ? occupiedBounds(H.isle.index, ISLE_GRID) : null,
+    ];
+    for (let i = 0; i < boxes.length; i++) {
+      const b = boxes[i];
+      if (!b) continue;
+      if (!H.deckBox) { H.deckBox = [b[0], b[1], b[2], b[3]]; continue; }
+      const d = H.deckBox;
+      if (b[0] < d[0]) d[0] = b[0];
+      if (b[1] < d[1]) d[1] = b[1];
+      if (b[2] > d[2]) d[2] = b[2];
+      if (b[3] > d[3]) d[3] = b[3];
+    }
+  }
+
   // --- 5. groundY now answers with the quay ---------------------------------------------------
   const base = T.groundY;
   T.groundY = (x, z) => {
@@ -428,6 +455,11 @@ function collectCrossings(H, T) {
     if (way.tun === 1) continue;
     const bb = bboxOf(way.p);
     if (bb[2] < H.rect[0] || bb[0] > H.rect[2] || bb[3] < H.rect[1] || bb[1] > H.rect[3]) continue;
+    // ...AND AGAINST THE WATER, not merely against the extract. Nothing north of the shoreline's
+    // own horizon over the columns this way spans can have a wet vertex, and the resample below —
+    // at four metres, over every walkable way in the city — is by far the most expensive thing in
+    // this pass. Over Old Toronto all but the waterfront skips it.
+    if (bb[3] <= waterHorizon(H.field, bb[0], bb[2])) continue;
     const pts = resample(way.p, STEP);
     const wet = new Uint8Array(pts.length);
     let any = 0;
@@ -532,6 +564,13 @@ export function ribbonRing(p, hw) {
  */
 export function harbourDeckY(H, x, z) {
   if (!H) return -Infinity;
+  // Outside the union of the three indices' occupied cells not one of them can answer, so four
+  // compares stand in for the whole query. `deckBox` is null until step 4b has built all three,
+  // and the passes that run before it — the quay level, the bank level — take the full path they
+  // always did. A non-finite coordinate fails every compare, falls through, and takes the same
+  // exit it always did.
+  const D = H.deckBox;
+  if (D && (x < D[0] || x > D[2] || z < D[1] || z > D[3])) return -Infinity;
   let y = deckPolyAt(H.decks, x, z);
   if (!isNum(x) || !isNum(z)) return y;
   // THE ISLANDS: the beach, the riprap and the island seawalls are the walking surface too, so

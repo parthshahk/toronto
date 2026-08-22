@@ -6,11 +6,10 @@ node_modules/
 data/raw/
 
 # The BUILT city IS committed: the app needs it to run, and rebuilding requires a 210 MB
-# shapefile download. data/toronto.json is the authoring format; data/toronto.bin is the packed
-# sidecar the loader actually reads (tools/pack_city.py). Both ship.
+# shapefile download. data/toronto.json is the authoring format; data/city/ is the per-tile
+# format the loader streams and data/toronto.bin is the fallback (tools/pack_city.py).
+# All three ship -- GitHub Pages serves data/city/ as ordinary static files.
 
 # Working spec / notes, not documentation.
 CONTRACT.md
 
-# Working notes, not documentation.
-STREET_LEVEL_PLAN.md

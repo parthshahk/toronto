@@ -1,22 +1,29 @@
 // src/data/load.js — get the city off the network and into the object graph the builders want.
 //
-// Two paths to the same result:
-//   the packed sidecar data/toronto.bin (tools/pack_city.py), decoded here, and
-//   data/toronto.json, parsed by the platform.
-// The JSON stays AUTHORITATIVE — build_city.py, match_osm.py and attach_pois.py write it, and it
-// is what a human reads — so this must work when the sidecar has never been generated. Anything
-// at all wrong with the .bin (missing, truncated, stale magic) falls back with a warning rather
-// than taking the page down.
+// THREE paths to the same records, in the order they are tried:
 //
-// The two decodes agree to the last bit. Every scaled integer is DIVIDED by its scale, never
-// multiplied by a reciprocal, so the double a sidecar field decodes to is the same double the
-// JSON literal parses to. See data/schema.js for why that matters and for what every field means.
+//   data/city/         THE STREAMED CITY: a manifest and a global block at boot, then one group
+//                      file at a time as tiles are built. Opt in with { stream: true }; the
+//                      caller gets a CityStream back and drives it (see data/stream.js).
+//   data/toronto.bin   the monolithic sidecar (tools/pack_city.py), decoded here.
+//   data/toronto.json  parsed by the platform.
+//
+// The JSON stays AUTHORITATIVE — build_city.py, match_osm.py and attach_pois.py write it, and it
+// is what a human reads — so this must work when neither binary has ever been generated. Anything
+// at all wrong with either (missing, truncated, stale magic, a manifest describing a different
+// grid) falls back with a warning rather than taking the page down.
+//
+// All three decodes agree to the last bit. Every scaled integer is DIVIDED by its scale, never
+// multiplied by a reciprocal, so the double a packed field decodes to is the same double the JSON
+// literal parses to. See data/schema.js for why that matters and for what every field means.
 //
 // Zero dependencies. Nothing here draws, allocates a mesh or knows what a building looks like.
 
 import {
-  SIDECAR_MAGIC, SIDECAR_HEADER_OFFSET, SCALE_CM, SCALE_MM, SCALE_COLOR,
+  SIDECAR_MAGIC, SIDECAR_HEADER_OFFSET, SCALE_CM, SCALE_MM, SCALE_COLOR, CITY_DIR,
 } from './schema.js';
+import { readRings } from './tileformat.js';
+import { CityStream } from './stream.js';
 
 /**
  * Decode data/toronto.bin (tools/pack_city.py) into exactly the object graph the JSON produced.
@@ -64,35 +71,10 @@ export function decodeCity(buf) {
     return (v < 255 && table2 && v < table2.length) ? table2[v] : undefined;
   };
 
-  // Ring reader: absolute int32 origin in centimetres, then int16 deltas with an escape.
-  function rings(prefix) {
-    const len = block(prefix + '.ringLen') || EMPTY_I32;
-    const org = block(prefix + '.origin') || EMPTY_I32;
-    const del = block(prefix + '.delta') || new Int16Array(0);
-    const esc = block(prefix + '.esc') || EMPTY_I32;
-    const out = new Array(len.length);
-    let oi = 0, di = 0, ei = 0;
-    for (let r = 0; r < len.length; r++) {
-      const n = len[r];
-      const ring = new Array(n);
-      if (n <= 0) { out[r] = ring; continue; }
-      // DIVIDE, never multiply by 0.01. An integer count of centimetres divided by 100 is the
-      // correctly-rounded double for that decimal, which is exactly what parsing "-387.21"
-      // gives; multiplying by the inexact literal 0.01 lands one ulp away (-387.21000000000004)
-      // on about 7% of the city's vertices, and the sidecar's whole promise is that which loader
-      // ran cannot be told from the geometry.
-      let x = org[oi++], z = org[oi++];
-      ring[0] = [x / SCALE_CM, z / SCALE_CM];
-      for (let k = 1; k < n; k++) {
-        const dx = del[di++], dz = del[di++];
-        if (dx === -32768 && dz === -32768) { x = esc[ei++]; z = esc[ei++]; }
-        else { x += dx; z += dz; }
-        ring[k] = [x / SCALE_CM, z / SCALE_CM];
-      }
-      out[r] = ring;
-    }
-    return out;
-  }
+  // Ring reader: absolute int32 origin in centimetres, then int16 deltas with an escape. Shared
+  // with the streamed format, which encodes rings identically — see data/tileformat.js for the
+  // note on why the decoder DIVIDES by 100 rather than multiplying by 0.01.
+  const rings = (prefix) => readRings(block, prefix);
 
   const th = block('terrain.h');
   const terrain = {
@@ -296,15 +278,62 @@ async function fetchBinary(url, onFrac) {
 }
 
 /**
- * The packed sidecar if it is there, the JSON if it is not.
+ * Open the streamed city: the manifest and the global block, and nothing else.
+ *
+ * What comes back is the part of the city that is NOT local to a tile — the terrain height
+ * field, the lake shore, the waterfront structures, and the hundred-odd features larger than one
+ * tile — together with the live `stream` that everything else arrives through. At the Old
+ * Toronto extent that is tens of KB instead of ~19 MB before the first frame.
+ *
+ * THE CALLER MUST CHECK THE GRID. The manifest's tile ids only mean anything against the grid
+ * they were packed for, so once the extent is known and makeTileGrid() has run, call
+ * `stream.matchesGrid(grid)` and fall back to fetchCity() if it says no.
+ *
+ * Throws if the manifest is missing or unusable; that is the signal to fall back.
+ */
+export async function openCity(url, onFrac, opts) {
+  const stream = await CityStream.open(url, onFrac, Object.assign({ dir: CITY_DIR }, opts || {}));
+  const g = stream.global;
+  return {
+    stream,
+    source: 'tiles',
+    bytes: stream.bootBytes,
+    data: {
+      // A marker, not decoration: a consumer written against the monolithic graph would find
+      // `buildings` missing and quietly build an empty city, so anything that can be handed this
+      // object has to be able to tell that the rest of it arrives later.
+      streamed: true,
+      meta: stream.manifest.meta || {},
+      terrain: g.terrain,
+      shore: g.shore,
+      waterfront: g.waterfront,
+      spanning: g.spanning,
+    },
+  };
+}
+
+/**
+ * The packed sidecar if it is there, the JSON if it is not — and the streamed city first, when
+ * the caller asks for it with `{ stream: true }` and is prepared to drive one.
  *
  * The JSON stays authoritative — tools/build_city.py and tools/match_osm.py write it, and it is
- * what a human reads — so the loader must work without the sidecar ever having been generated.
- * Anything at all wrong with the .bin (missing, truncated, stale magic) falls back with a warning
- * rather than taking the page down.
+ * what a human reads — so the loader must work without either binary ever having been generated.
+ * Anything at all wrong with them (missing, truncated, stale magic, an unreadable manifest) falls
+ * back with a warning rather than taking the page down.
  */
-export async function fetchCity(url, onFrac) {
+export async function fetchCity(url, onFrac, opts) {
   if (typeof fetch !== 'function') throw new Error('city: fetch() unavailable');
+  const o = opts || {};
+  if (o.stream) {
+    try {
+      return await openCity(url, onFrac, o);
+    } catch (e) {
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[city] streamed city unavailable (' +
+          ((e && e.message) ? e.message : e) + '); falling back to the whole-file sidecar');
+      }
+    }
+  }
   const packed = String(url).replace(/\.json$/i, '.bin');
   if (packed !== url) {
     try {

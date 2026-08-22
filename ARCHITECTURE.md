@@ -5,13 +5,55 @@ Reference for working on the code. The [README](README.md) covers what the proje
 ## Coordinate system
 
 **X = east, Y = up, Z = south.** Right-handed, true metres. Origin at the centre of the data
-extent — currently (-79.387, 43.635), and **read from `meta.origin`, never assumed**: the extent
-has already moved once and everything that hard-coded the old centre broke silently. Yaw 0 faces **+Z**, increasing toward **+X**, so
+extent — currently **(-79.38550, 43.67150)**, and **read from `meta.origin`, never assumed**: the
+extent has now moved twice, and both times everything that hard-coded the old centre broke
+silently. The Old Toronto expansion moved it 4.06 km north of the 43 km² centre and 121 m east of
+the original downtown one; `app/controls.js`'s viewpoint table is the one place that legitimately
+holds local metres, and it carries the lon/lat of every entry beside it so the next move is
+arithmetic. Yaw 0 faces **+Z**, increasing toward **+X**, so
 `forward = (sin yaw, 0, cos yaw)` and `right = cross(forward, up)` — at yaw 0 that is **-X**.
 
 Source data is EPSG:3857 (Web Mercator), which inflates horizontal distance by `1/cos(latitude)` —
 **38% at Toronto's latitude**. The build divides it out. Skip that step and every building is a
 third too wide for its height.
+
+## Scale
+
+Every number below is measured at the extent named, on an M1 Pro, in a real tab.
+
+| | downtown (43 km²) | Old Toronto (252 km²) |
+|---|---:|---:|
+| extent | 6.77 × 6.46 km | **17.31 × 14.58 km** |
+| massing records / built | 18,604 / 18,312 | **181,426 / 180,601** |
+| road ways | 20,403 | **94,643** |
+| rail ways | — | 2,287 |
+| tiles of 625 m | 272 | **1,085** (579 populated) |
+| world vertices | 34,482,234 | **203,393,211** |
+| vertices per km² | 802 k | **806 k** |
+| block faces / ground-floor units | 48,299 / 70,755 | **484,300 / 653,976** |
+| surveyed units | 7,029 | 20,530 |
+| surveyed nodes offered / placed | 21,974 / 13,416 | **76,187 / 43,406** |
+| props / people | 113,169 / 10,654 | **471,100 / 65,709** |
+| walkable network | 1,218 km, 94.57% largest | **7,573 km, 98.83% largest** |
+| groundY range above lake | 0 → 39.6 m | **−14.0 → 120.5 m** |
+| `data/toronto.json` | 13.5 MB | **79.9 MB** |
+| `data/toronto.bin` | 4.10 MB | **26.05 MB** (12.6 MB gz) |
+| `data/city/` total | 4.26 MB in 30 files | **27.01 MB in 167 files** |
+| bytes before the first frame | 4.3 MB | **27.9 MB** (sidecar path; see below) |
+| time to the first interactive frame | 2.27 s | **27 s** |
+| fps, default viewpoint | 95–106 | **83** median (12.0 ms), p95 72.6 ms |
+| fps, street level | 95–106 | **112–147** median, p95 64–66 ms |
+| draw calls | — | 253 street level, 417 at the lake viewpoint |
+| resident vertices | — | 10.9–11.2 M against an 11.0 M cap |
+| peak JS heap | 379–406 MB | **1.7–2.0 GB** against a 4 GB limit |
+
+Detail density per km² is the number that matters for "same quality at ten times the buildings":
+block faces 1,123 → 1,918, ground-floor units 1,646 → 2,590, people 248 → 260, vertices 802 k →
+806 k. Three went **up**, one held. Two went down and both are properties of the *survey*, not of
+the code: props 2,632 → 1,866 (downtown genuinely has more street furniture per km² than
+Riverdale), and surveyed units 163 → 81 (OSM's premises coverage is dense downtown and thin in the
+neighbourhoods — 61.1% of offered nodes were placed downtown against 57.0% here, so the placement
+rate barely moved; there are simply fewer offered per km²).
 
 ## Data pipeline
 
@@ -19,15 +61,32 @@ third too wide for its height.
 
     data/raw/  ──build_city.py──▶  data/toronto.json  ──match_osm.py──▶  (enriched in place)
                                             │
-                                   pack_city.py──▶  data/toronto.bin   (what the browser loads)
+                                   pack_city.py──┬─▶  data/city/       (what the browser streams)
+                                                 └─▶  data/toronto.bin (the fallback)
 
 Source files go in `data/raw/` (gitignored, ~400 MB):
 
 - `massing2025/` — [3D Massing 2025](https://open.toronto.ca/dataset/3d-massing/), shapefile, WGS84
-- `osm_infra.json`, `osm_buildings.json`, `osm_water.json` — Overpass API extracts
+- `osm_infra.json`, `osm_buildings.json`, `osm_nodes.json`, `osm_water.json` — Overpass extracts,
+  fetched by `tools/fetch_osm.py`
+
+**The extract is `-79.4930..-79.2780, 43.6060..43.7370`** — 17.31 x 14.58 km, 252.5 km², the
+pre-1998 City of Toronto with the south edge held at 43.6060 so the Islands keep their margin of
+open lake. One Overpass query over that area either times out or returns a few hundred megabytes,
+so `fetch_osm.py` walks a 4x3 grid of sub-boxes, caches each, and merges de-duplicated by
+`(type, id)`. It treats an empty result set as a FAILURE worth retrying: Overpass signals overload
+as a valid 200 carrying no elements, and nine of twelve sub-boxes once came back that way and the
+merged extract silently lost 96% of its aeroway and 73% of its railway.
 
 `build_city.py` clips the 210 MB city-wide shapefile to the bounding box, reprojects, interpolates
-terrain, and reads the OSM street/rail/water layers. `match_osm.py` matches OSM building polygons
+terrain, and reads the OSM street/rail/water layers. **`ELEV_MAX` is a property of the extent, not
+of the dataset**: `SURF_ELEV` samples outside `ELEV_MIN..ELEV_MAX` are discarded as junk, and a
+cell with no sample left falls back to the lake datum. Downtown ground runs 74.6-105 m MSL and the
+ceiling stood at 115, which was right for 43 km² and threw away 70% of the samples at 252 km² —
+every one north of Davenport — flattening the northern half of the city to lake level and deleting
+the Davenport escarpment. It is 200 m now: 99.99% of real ground, and still rejecting the 18
+records whose `SURF_ELEV` is plainly a roof (up to 314.5 m). The heightfield is 693 x 584 at 25 m,
+0-120.6 m above a 74.49 m lake datum. `match_osm.py` matches OSM building polygons
 onto massing footprints to attach typology, material and surveyed colour. `attach_pois.py` reads
 the OSM **node** extract and attaches the shop units, house numbers, storey counts and roof shapes
 to buildings, and the standalone street furniture to `pois[]`. `pack_city.py` packs the result into
@@ -43,11 +102,84 @@ the binary sidecar the loader actually reads.
 `attach_pois.py` needs `data/raw/osm_nodes.json`. Without it the ground floor and the street
 furniture are entirely synthesised and **nothing warns** — see the sidecar note below.
 
+### `data/city/` — the streamed city
+
+Geometry has streamed a tile at a time since the 43 km² expansion, but the **records** it was
+built from do not: one file, fetched and parsed in full before the first frame — **26.05 MB and
+about 550 MB of live objects at the Old Toronto extent**. So `pack_city.py` also partitions the
+city into **the renderer's own tile grid** and writes one payload per tile:
+
+    manifest.json   the grid, the extent, the block table, the enum vocabularies, and per tile:
+                    which group file it is in, its byte range there, and the box containing
+                    everything it owns
+    global.bin      terrain height field, lake shore, waterfront structures, and the ~98 features
+                    LARGER than a tile. Fetched once, at boot.
+    gNNNN.bin       a 2×2 block of tiles' payloads, concatenated
+
+**The grid is not invented twice.** `pack_city.py` reads `TILE_SIZE` out of `src/tilegrid.js`, the
+fringe rule out of `src/world/surround.js` and the margin pad off the one `makeTileGrid(extent,
+TILE_SIZE, SUR_FRINGE + 420)` call in `src/city.js`, and repeats `makeTileGrid()`'s arithmetic on
+the same doubles. It refuses to run rather than guess if any of the three has moved — which is
+exactly what happened when the 108-module split carried that call out of `world/roads.js`. `CityStream.matchesGrid()` refuses a manifest whose grid does not
+match the one the app built, so a drift is a loud fallback rather than a city in the wrong place.
+
+**Ownership is exclusive.** A feature belongs to the one tile holding its anchor — the mean of a
+building's first ring, a way's middle vertex, a node's own position, exactly what
+`city/tileindex.js` computes — and that tile's recorded box grows to contain the whole feature.
+Nothing is clipped and nothing is duplicated. A feature *larger* than a tile has no tile that can
+honestly own it, so it goes in `global.bin`. Every record carries its index in the original JSON
+array: `pack_city.py --verify` reassembles the whole city from the parts and proves it is
+`data/toronto.json` array for array, with **max numeric error 0** over every field.
+
+`src/data/tileformat.js` decodes the bytes; `src/data/stream.js` decides which to ask for and when.
+Its policy is deliberately the geometry policy, not a second one: a millisecond budget pumped once
+per frame, requests ordered nearest-first, a 700 m read-ahead past stage 0's *build* range, and
+release by least-recently-wanted on the same clock and grace period `TileManager._evict()` uses.
+`src/tiles.js` primes every tile's draw box from the manifest the moment the stream is attached —
+without it a tile with no features indexed is `empty`, is never queued, never asks for its data,
+and so never stops being empty.
+
+Measured at both extents. The Old Toronto column is what `pack_city.py` actually wrote, not a
+projection:
+
+| | downtown 43 km² | Old Toronto 252 km² |
+|---|---|---|
+| tiles | 272 (all populated) | 1,085 (579 populated) |
+| manifest + global, at boot | **210 KB**, 2 requests | **1.05 MB** (630 KB gz), 2 requests |
+| one-file sidecar, for comparison | 4.10 MB | 26.05 MB (12.6 MB gz) |
+| total payload | 4.26 MB in 30 files | 27.01 MB in 167 files |
+| tile payload | — | min 0.3 KB, median 42.2 KB, max 130.8 KB |
+| payloads read to build one tile | — | avg 8.05, p95 9, max 9 |
+
+### The streamed city is written but NOT WIRED UP
+
+**As of this writing the app does not use `data/city/` at all.** `openCity()` exists,
+`CityStream` is complete, `TileManager.setDataSource()` is complete, and `pack_city.py --verify`
+proves the tiles reassemble into `data/toronto.json` array for array with max numeric error 0 —
+but nothing in the tree calls `fetchCity(url, cb, { stream: true })` and nothing calls
+`setDataSource()`. `src/city.js`'s `loadCity()` calls `fetchCity(url, report)` with no options, so
+the sidecar path is taken every time, and `featureList(data, 'buildings')` would return `[]` for a
+streamed object anyway — `city.js` has no consumer for one. Two things have to happen together:
+`loadCity` must ask for the stream, and every `featureList` / `readPois` call site must learn to
+pull per tile instead of walking a whole array up front. The console line on a healthy boot today
+reads `[city] data: bin, 26.05 MB decoded`; when this is done it will name the tile source.
+
+Decoded records cost about **11× their packed size** — a ring vertex is a two-element JS array —
+which is why payloads are evicted at all and why `byteCap` is 20 MB packed rather than a round
+number. Splitting massing from detail into separate files was measured and rejected: detail
+(units, POIs, name dictionaries) is only 24% of a payload, which does not pay for doubling the
+file count.
+
 ### `data/toronto.bin`
 
+Still written, and still the **fallback**: anything at all wrong with `data/city/` — missing,
+truncated, a stale format tag, a manifest describing a different grid — falls back to the sidecar
+with a console warning, and a missing sidecar falls back to the JSON. All three decode to the same
+doubles.
+
 The JSON is the **authoring** format — readable, diffable, what the Python writes. It is a poor
-transport format: 13.5 MB of text, and `JSON.parse` has to allocate ~493,000 two-element arrays
-before the first frame can start. The sidecar carries exactly the same information as typed
+transport format: **79.9 MB** of text at the Old Toronto extent, and `JSON.parse` has to allocate
+several million two-element arrays before the first frame can start. The sidecar carries exactly the same information as typed
 arrays:
 
     magic 'TOR2' · uint32 headerLen · header JSON · 4-byte-aligned typed-array blocks
@@ -59,11 +191,12 @@ integer units chosen so that dividing reproduces **exactly** the double the JSON
 to. Float32 would not: 22.7 m becomes 22.700000762939453, which is enough to move a building
 across one of `pickClass`'s height thresholds.
 
-Measured: 13.5 MB → 4.1 MB raw, and 61 ms of `JSON.parse` → 6 ms of typed-array walk. `city.js`
-falls back to the JSON with a console warning if the sidecar is missing or stale, so the app runs
-from a fresh `build_city.py` without it. The console line on a healthy boot reads
-`[city] data: bin, 4.10 MB decoded` — if it says `falling back to JSON`, re-run
-`python3 tools/pack_city.py`.
+Measured: **79.9 MB → 26.05 MB raw (12.6 MB gzipped)**, and a tokeniser replaced by a tight loop
+over an `Int16Array`. `city.js` falls back to the JSON with a console warning if the sidecar is
+missing or stale, so the app runs from a fresh `build_city.py` without it. The console line on a
+healthy boot reads `[city] data: bin, 26.05 MB decoded` — if it says `falling back to JSON`, re-run
+`python3 tools/pack_city.py`. **26 MB before the first frame is the reason `data/city/` exists and
+the reason wiring it up is the top open item.**
 
 The sidecar carries the surveyed **unit** and **POI** blocks as well as the geometry: a
 `buildings.unitsPer` run-length array plus parallel `units.*` blocks (category enum, value
@@ -151,7 +284,7 @@ px py pz   nx ny nz   r g b   emissive  tintable  rough  profile  uv
 
 ## Modules
 
-108 ES modules, no build step, no dependencies. Every import is relative and carries its `.js`
+112 ES modules, no build step, no dependencies. Every import is relative and carries its `.js`
 extension, so the browser resolves the graph exactly as Node does.
 
 **The rule that keeps it workable: dependencies point one way.**
@@ -166,6 +299,14 @@ data schema, a road record or a building. Builders in `world/`, `city/` and `pro
 functions over a MeshBuilder, a feature and a context; they hold no module-level mutable state, so
 tiles build independently and in any order, which is what makes the geometry deterministic. **The
 graph has no cycles.**
+
+Determinism is *enforced*, not assumed: `props/kit.js`'s `rnd()` throws a `TypeError` when a caller
+passes no rng rather than falling back to `Math.random()`, which is the one way a build could come
+out different twice running — nothing crashes, nothing is logged, a handful of props simply move,
+and the fingerprint fails intermittently instead of repeatably. A builder with no rng to thread
+uses `hash2(x, z)`, seeded on world position; `city/facadekit.js`'s `rngOf()` does the same for a
+facade. The only `Math.random()` in the tree is in `core/math.js`, for runtime gameplay, and no
+city builder may reach it.
 
 Two kinds of edge cross a layer boundary. One is inherent; the other is a seam in the
 wrong place, recorded here rather than papered over:
@@ -212,8 +353,10 @@ Two definitions are deliberately singular and must stay that way:
 
 | | |
 |---|---|
-| `data/schema.js` | **THE shape of `toronto.json` / `toronto.bin`**, in one place |
-| `data/load.js` | fetch and decode the packed binary, with the JSON fallback |
+| `data/schema.js` | **THE shape of `toronto.json` / `toronto.bin` / `data/city/`**, in one place |
+| `data/load.js` | open the streamed city, or decode the packed binary, or fall back to the JSON |
+| `data/tileformat.js` | the bytes of one tile payload and of `global.bin`, decoded to records |
+| `data/stream.js` | what is resident, what is on the wire, what is thrown away |
 | `data/index.js` | the uniform-grid broadphase, and per-tile assignment of long ways |
 
 ### `geom/` — plan-space geometry
@@ -261,7 +404,9 @@ Two definitions are deliberately singular and must stay that way:
 | | |
 |---|---|
 | `city/materials.js` | the material palette, the surveyed-colour remap, and how a building picks one |
-| `city/buildings.js` | footprint preparation, extrusion, and the coplanar wall/cap resolution |
+| `city/prep.js` | placing every record up front, and preparing one on demand: parts, material, storey model, broadphase |
+| `city/buildings.js` | the wall faces and the wall emitter |
+| `city/coplanar.js` | who owns a shared surface — walls, portals and roof caps — a record at a time |
 | `city/landmarks.js` | the named towers, and the CN Tower, which is modelled by hand |
 | `city/units.js` | the block-face model: every street-facing edge, subdivided into premises |
 | `city/unitkinds.js` | the surveyed unit taxonomy: OSM premises tag to kind to style |
@@ -633,14 +778,48 @@ Amendment 7 holds: the rig uploads **0** lights at Afternoon, 512 from Golden ho
 
 ## Tiling and level of detail
 
-At 43 km² the city is 26.6 M vertices. As eight merged buffers that is 1.35 GB of vertex data, four
-seconds of blocking generation, a 2.0 GB heap and 33 fps, because the shadow pass redraws all of it
-three times a frame. So geometry is partitioned and streamed.
+At 252 km² the city is **203 M vertices** (805,523 per km², essentially the 43 km² density held at
+six times the area). As eight merged buffers that would be roughly 10 GB of vertex data. So
+geometry is partitioned and streamed: **1,085 tiles of 625 m**, an 11 M resident-vertex ceiling,
+and eviction by least-recently-drawn.
 
-**The load is two phases.** Everything topological runs once, up front, and emits no vertices at
-all: terrain, harbour, the grade solve, footprint preparation, coplanar wall and cap resolution,
-the road records, the junction graph, the walkability audit, the street-name index. Everything
-geometric is deferred. Measured on an M1 Pro, that phase is 1.96 s.
+**The load is three phases, split by WHEN rather than by what.** Measured on an M1 Pro against
+both extents:
+
+| phase | what | 43 km² | 252 km² |
+|---|---|---|---|
+| before the first frame | the ground and the topology every later stage reads: terrain and lake, the surveyed harbour, the dangling-end resolution, the grade solve, the *placement* of every building, the road records, the junction graph, the tile index | **0.79 s** | **24.3 s** |
+| | of which: termini 8.4 s · grade 5.3 s · roads 2.6 s · junctions 1.8 s · tile index 1.7 s · footprint placement 1.7 s · harbour 1.3 s · terrain 0.8 s | | |
+| when a tile is built | all geometry, and the analysis that is a property of one record and its neighbours: preparing that tile's footprints, the coplanar wall resolution, the corridor portals, the roof-cap verdicts | budgeted, 3.5 ms/frame | same |
+| after the first frame | the chore queue: the sweep that prepares the footprints no tile asked for, the walkability audit (§8.2), the quay wall and everything on the water (§8.3), and the sweep that finishes the coplanar analysis | 1.5 s at ~2 ms/frame | 3.3 s at ~2 ms/frame |
+
+**The first row is the open problem.** Footprint preparation and the coplanar solve *were* made
+lazy for this expansion, and they cost 1.7 s and 5 ms respectively — the split works. Everything
+else in that row is still a whole-city pass in front of the first frame, and it scales with record
+count: 24.3 s of analysis plus the 26 MB sidecar fetch and parse puts the first interactive frame
+at **27 s**, against 2.27 s downtown. The five items above are what is left to make lazy or
+incremental, in cost order.
+
+The middle phase is the one that changed most recently. Coplanar resolution used to be three
+whole-city passes in front of the player — 418 ms here, four seconds projected over the pre-1998
+city — and every one of its questions is answered by geometry that *touches* the record asking it:
+a wall can only fight a wall within 6 cm of it, a cap can only fight a cap whose footprint overlaps
+it. So `city/coplanar.js` answers one record when a tile wants it and pulls in whatever neighbours
+the answer depends on. Two rules used to lean on global iteration order and were rewritten so they
+no longer can: wall-edge keys are **composed** (`record key × stride + ordinal`) rather than
+counted, and the cap step-down is stated as "a cap's level is a function of the levels of the
+higher-ranked caps that overlap it" rather than as a rank-ordered sweep. Both induce exactly the
+order the whole-city pass had, and the geometry fingerprint is bit-identical across the change.
+
+The third phase exists because two passes are genuinely global and neither is needed before a first
+frame. The walkability audit measures the whole network — a connected component is not a local
+property — and the only thing it *changes* is a handful of local repairs (58 paved connectors, 237
+flights of steps over this extract). The quay walks 32 km of surveyed shoreline as continuous runs
+that no tile owns. Both run as interruptible generators, write into a capture of their own rather
+than into the tile under construction, and hand their geometry over through
+`city/lod.js deliverCapture()` when they finish: the capture is cut up by tile exactly as the
+up-front one was, and any tile that was already standing is invalidated so the scheduler generates
+it again on the next frame. Worst measured slice in the queue: 16 ms, once.
 
 **Tiles are 625 m square** — 25 terrain cells exactly, so the ground mesh splits on cell boundaries
 and adjacent tiles share their edge vertices to the bit. Bigger tiles mean fewer draw calls and a
@@ -722,7 +901,7 @@ it, off a spatial model built once.
 
 ## The south half: the islands and Billy Bishop
 
-The extract's southern half is 3.44 km² of island in sixteen rings, 35.5 km of surveyed shore, an
+The extract's south edge is 3.44 km² of island in twenty-two rings, 36.5 km of surveyed shore, an
 airport, and the two shipping channels either side of the harbour. It is a different place from
 the mainland waterfront and `world/islands.js` builds it differently.
 
@@ -797,25 +976,49 @@ buffer stop on a siding. It runs **before** `solveGrade()`, on the raw polylines
 solve, the junction table, the walkability audit, the ribbons and the street-name index all read
 one corrected topology.
 
-Measured: 3,086 way-ends, of which 1,446 were dangling inside the map. 1 welded, 791 extended,
-603 nodes spliced, 75 crossings closed, 628 given a designed terminus (407 turning heads, 212
-barrier lines, 9 buffer stops), 20 PATH concourse ends left to the concourse walls. **0 left.**
+Measured at the Old Toronto extent: 17,186 way-ends, of which 10,313 were dangling inside the map
+(6,260 end at a building, 613 at the world edge). 12 welded, 5,263 extended to a way, 3,629 nodes
+spliced, 4,954 given a designed terminus (3,795 turning heads, 1,143 barrier lines, 16 buffer
+stops), 38 PATH concourse ends left to the concourse walls. **0 left.** It is the most expensive
+single item in the up-front analysis at 8.4 s.
 
 **Walkability** (§8.2) is audited on the corrected topology and reported as permanent counters:
-1,217.6 km of walkable metres in 203 components, the largest holding **94.55%**. That is under the
-97% bar, and the reason is the lake, not the network. 68 of the 93 islands over 50 m — 59,760 m of
-the 63,945 m adrift — are **marine**: separated from the mainland by water with no bridge, found by
-flooding the land cells rather than by any hard-coded list. The largest is 44,392 m of path on the
-Toronto Islands, which you genuinely do reach by ferry; Bayview Avenue's severed lengths beyond the
-Don are the next. Discount those deliberate, explained exceptions and the largest component holds
-**99.43%** (`walk.fractionDry`), which clears the bar. Both numbers are kept, because the raw one
-is what the contract asks for and the dry one is what it means.
+**7,572.7 km** of walkable metres in 464 components, the largest holding **98.83%** — which clears
+the 97% bar outright, where the 43 km² extract held 94.57% and needed the explanation below. The
+share rose because the map now contains far more contiguous mainland relative to the water: the
+marine exceptions are the same places and the same lengths, but they are a much smaller fraction of
+a seven-thousand-kilometre network. 86 components holding 63,207 m are **marine**: separated from
+the mainland by water with no bridge, found by flooding the land cells rather than by any
+hard-coded list. The largest is 44,366 m of path on the Toronto Islands, which you genuinely do
+reach by ferry; Bayview Avenue's severed lengths beyond the Don are the next. Discount those
+deliberate, explained exceptions and the largest component holds **99.66%**
+(`walk.fractionDry`). Both numbers are kept, because the raw one
+is what the contract asks for and the dry one is what it means. `fractionDry` is also what the
+harness asserts against the 97% bar: a flat threshold over everything fails for being *right* about
+the geography, which is how it came to read 94.55% and mean nothing.
 
-Also counted: 226 flights of steps built into drops between 0.45 m and 3 m, 59 gaps stitched over
-294 m, and **2 cliffs left** out of 637,108 samples — both the same 18.63 m drop, at (2557, −2674)
-and (2557, −2672), where the Bayview Cycle Path runs along the lip of the Don channel and two
-samples fall to the river bed. Anything over a storey is a wall, not a step, so it is counted and
-located rather than papered over with a staircase up a retaining wall.
+Also counted: 74,573 flights of steps built into drops between 0.45 m and 3 m, 126 gaps stitched
+over 653 m, 25,299 m severed as walls, and **0 cliffs left** out of 3,967,609 samples (the 43 km²
+extract left 2), the worst surviving
+discontinuity being 2.03 m. Anything over a storey is a wall, not a step, so it is counted and
+located rather than papered over with a staircase up a retaining wall — but nothing over a storey
+survives, and that is now an argument rather than an observation.
+
+**The two passes sample the same stations.** The sever test (which takes a route out of the graph
+when the surface under it drops more than `WALK_WALL` = 1.20 m) and the cliff test (which counts
+what is left) ask the same question of the same edge, so they must never be able to disagree about
+it — and they used to. The sever pass walked the *raw* polyline every 1.5 m while the cliff pass
+walks the *welded* segment every `WALK_STEP` = 2 m, so a ground feature narrower than either
+spacing could fall between one pass's stations and land on the other's. It did: a 1 m sliver of a
+river-crossing ground pad, standing 18.6 m proud of the bed of the Lower Don, was straddled by the
+sever pass and hit by the cliff pass, and came out as two 18.63 m "cliffs" at (2557, −2674) and
+(2557, −2672) on a route the sever pass had every reason to have removed. The sever pass now walks
+the welded segment with exactly `SEVER_REFINE` = 2 times the cliff pass's station count, which
+makes every cliff station a sever station as well: two adjacent cliff stations differing by *d*
+have two sever intervals between them summing to at least *d*, so one of them is at least *d*/2.
+Any drop the cliff pass could call a wall is at least `WALK_CLIFF_WALL` = 3 m, so the sever pass
+sees at least 1.50 m across one of its own intervals, clear of the 1.20 m it severs on. The route
+comes out first by arithmetic, and the margin only widens if either constant rises.
 
 **Three bands.** Past the survey the world continues in three concentric bands, all sized from the
 extent:
@@ -859,25 +1062,35 @@ touched, so turning round is instant. `city.limitFrac(x, z)` rises 0 → 1 acros
 HUD cue. `city.collide()` also clamps to the limit as an idempotent backstop, so no teleport, no
 ejection from a footprint and no recovery from NaN can put anyone outside the world.
 
-**Proof that the world never visibly ends** (§9.4). The drawn world is a rectangle, so along any
-bearing from any viewpoint there is exactly one distance at which it stops — computable in closed
-form. `auditHorizon()` casts 6,240 rays from the whole perimeter of the soft limit, at five
-altitudes up to the 2,400 m ceiling and 24 bearings, and evaluates the renderer's own fog model
-(faithfully duplicated for audit, deliberately, so it fails loudly if either drifts) at all four
-time presets. Nearest world edge 13,907 m; **worst airlight 99.15%** (Night, 2,400 m, 14.1 km
-sightline); **0 rays below the 97% threshold**. Confirmed against the framebuffer: at 2,400 m
-looking outward the strongest horizontal edge anywhere in the frame is 0.008–0.020 (and lies in the
-HUD overlay), against 0.098–0.132 for the same measure looking inward over the real city.
+**Whether the world visibly ends** (§9.4). The drawn world is a rectangle, so along any bearing
+from any viewpoint there is exactly one distance at which it stops — computable in closed form.
+`auditHorizon()` casts 6,240 rays from the whole perimeter of the soft limit, at five altitudes up
+to the 2,400 m ceiling and 24 bearings, and evaluates the renderer's own fog model (faithfully
+duplicated for audit, deliberately, so it fails loudly if either drifts) at all four time presets.
+
+**It passed at 43 km² and it does not pass at 252 km².** Downtown: nearest world edge 13,907 m,
+worst airlight 99.15%, 0 rays below the 97% threshold. Old Toronto: **nearest world edge 4,089 m,
+worst airlight 7.8% (Night, 1,200 m, 4,242 m sightline), 2,852 of 6,240 rays below the threshold.**
+
+The cause is not the expansion, it is a constant the expansion exposed. `HAZE_REACH` — the flat
+apron past the fringe — was cut from 13,000 m to **2,600 m** when the synthesised surround was
+removed, on the reasoning that the fog closes a ground plane well before 13 km so the rest of the
+apron was just a grey plate. That reasoning holds for a sightline *along the ground* from low
+altitude. It does not hold from 1,200 m up near a corner of a 17.3 km map, where the geometry of
+the rectangle puts the far edge only 4 km away and the fog has not closed. Raising `HAZE_REACH`
+brings the plate back; scaling it with the extent, or closing the fog harder with altitude, are the
+two candidate fixes. **Neither is done, and the audit is left failing rather than quietly
+re-thresholded.**
 
 **What the surround does not do.** `padTerrain()` continues the ground by *edge replication*, so
-beyond the survey every height is the boundary height held constant outward: the whole north-west
-quadrant is a plateau at exactly 39.59 m, the south is lake bed at −14.00 m, and no synthesised
-terrain relief exists anywhere. That is deliberate — it is what makes `groundY` continuous with no
+beyond the survey every height is the boundary height held constant outward: the north edge is a
+plateau at whatever the last surveyed row was (up to 120.54 m now that the elevation ceiling is
+right), the south is lake bed at −14.00 m, and no synthesised terrain relief exists anywhere. That is deliberate — it is what makes `groundY` continuous with no
 seam and no hole, verified over 491,401 samples across the full 35 × 35 km drawn world with **zero
 non-finite results** — but it has a visible consequence. Fly to the land edge of the soft limit in
-daylight and look outward and you get roughly 1.2 km of synthesised streets and massing, and then a
-dead-flat plain running to the horizon, bright with airlight and empty apart from the occasional
-spoke road. Nothing *ends*: there is no boundary line, no polygon edge, no discontinuity, and the
+daylight and look outward and you get a dead-flat plain running to the horizon, bright with
+airlight and empty — the synthesised streets and massing that used to fill that band are switched
+off (`SUR_ENABLED = false`). Nothing *ends*: there is no boundary line, no polygon edge, no discontinuity, and the
 plain is fully hazed long before the world stops. But it reads as open country rather than as more
 city, and a player who flies to the corner will know they have left the map. Over water — the whole
 southern half of the perimeter — the same construction is exactly right, and the lake horizon is
@@ -894,20 +1107,102 @@ whether or not its neighbours are loaded.
 Tiling makes that rule load-bearing rather than aspirational. Each tile seeds its own RNG from its
 grid coordinates, its own occupancy grid, its own pedestrian budget — nothing accumulates across
 tiles, so a tile built alone is byte-identical to the same tile built last. **Verified:** building
-the whole map in grid order and in reverse grid order produces identical geometry in every material
-class, props included.
+the whole map in grid order, in reverse grid order and in a shuffled order produces identical
+geometry in every material class, props included — bit-exact, with nothing prepared in advance, so
+the lazy footprint preparation is covered by it too. The only differences across the three runs are
+in the float64 running totals the audit keeps (metres of kerb, of tram wire, of duplicated wall),
+which are summed in tile order and agree to 7 × 10⁻¹⁴ relative.
 
-What still has to change for 428,000 buildings: the up-front analysis phase is O(features) with a
-small constant but it is still O(all features), so at 23× it becomes ~45 s. Grade solving, coplanar
-resolution and footprint preparation are all spatially local and can move into the tile prepare
-step behind a margin wider than the biggest footprint; the walkability audit and the harbour need
-to become tile-aware at source.
+**Footprint preparation is per tile.** It used to be the single biggest item in front of the first
+frame and the only one whose cost was a property of *building count*: every record in the city
+turned into oriented parts, given a material and a lighting profile, run through the storey model
+and filed in the broadphase, all before anything was drawn. `city/prep.js` splits it in two by
+*when*:
+
+* **placement**, over every record, once, up front. Its first ring's centroid — which decides the
+  tile that will build it, the landmark match and the island height cap — its height, and the box
+  of its raw rings, which sizes that tile's draw box and files it in a reach index. Three typed
+  arrays and an integer bucket per record. No record object is allocated, no ring is oriented, no
+  material is chosen.
+* **preparation**, one record at a time, the first time anything asks about it: when its tile is
+  built, when a neighbour's coplanar verdict reaches across a party wall, when the player walks
+  into it, or — for everything the flight path never went near — from the chore queue behind the
+  first frame, so the audit counters stay a description of the survey.
+
+The broadphase prepares whatever a query reaches before answering it, and the reach index is over
+the **raw ring boxes**, so "prepare everything that can overlap this disc" is a handful of records
+rather than a whole tile. Two consequences had to be handled explicitly. First, preparing records
+in camera order instead of file order changes the order they land in the broadphase, and two
+queries over it answer with the *first* hit; so every bucket is kept sorted by record key, which is
+the order a single up-front pass produced and a property of the file rather than of the flight
+path. Second, the crown-sign ranking — the tallest few towers with real street frontage — is a
+global decision, and it is now taken over the placement arrays and walked in that order, so a
+record is prepared only when the walk actually reaches it: a couple of dozen records instead of all
+of them.
+
+**What the up-front phase still costs, and why.** The whole-city analysis was 2.48 s here and
+projected to ~20 s over Old Toronto; moving the coplanar resolution into the tile build, and the
+walkability audit and the quay into the chore queue, took it to 1.04 s; making footprint
+preparation per-tile and cutting the constant factors below took it to **0.79 s**. Every figure in
+the table below is the best of six runs on the same machine; the run-to-run spread is about 8%, so
+read them as a shape rather than as a stopwatch. What is left, and how each term grows:
+
+| pass | here | grows with | why it is still up front |
+|---|---|---|---|
+| surveyed harbour | 234 ms | shoreline length, and ~90 ms of it is the Islands and the airfield, which are a fixed size | `groundY` is composed out of it, and the grade solve, the terrain carve and every ground query read `groundY` |
+| dangling ends (`world/termini.js`) | 190 ms | way count | it MUTATES the raw polylines, and the grade solve, the junction table, the ribbons and the street-name index are all built from them; correcting the topology later would leave two of them disagreeing, and repairing a way end after a neighbouring tile had already built it would make geometry a function of the flight path |
+| grade solve | 133 ms | crossings | **the seam argument.** A road ducking under the rail corridor has to line up when its two ends are in different tiles, and the only thing that guarantees that is one solve over one graph — the portal-distance propagation that sets a corridor's depth runs over the whole street graph, so it cannot be sharded. It is O(crossings), not O(buildings) |
+| road records, junctions | 87 ms | way count | a record's tile is decided by the midpoint of its *resampled* polyline, so deferring the resample would move records between tiles and change what each tile hashes |
+| tile index | 45 ms | feature count | a tile cannot be built before it knows what is in it |
+| building placement | 35 ms | **building count** | something has to read every record once to know which tile owns it. This is the irreducible residue of a monolithic data file, and it disappears when the streamed per-tile format lands: the packer already assigns every feature to a tile, so placement becomes a property of the bytes that arrive |
+
+Several terms were made cheaper rather than lazier, and each is exactly equivalent rather than
+approximate:
+
+* `world/weld.js`'s position-welded node set — built twice by the terminus pass and a third time by
+  the grade solve, about 4.5 M bucket lookups over this extract — is an open-addressed table keyed
+  on the `(i, j)` pair rather than a `Map` on a composed integer. The probe order is preserved
+  exactly, because two nodes can each be within tolerance of a query without being within tolerance
+  of each other and the answer therefore depends on the order the nine buckets are visited.
+* The water field carries a **per-column northern horizon**. `waterAt()` casts its ray north, so a
+  query north of every shore segment in its column is land without any arithmetic; that already
+  short-circuits 42% of the lake-bed carve on a waterfront extract, and over a map that reaches
+  8 km inland it is nearly all of it. The same horizon rejects a whole way in `collectCrossings()`
+  before it is resampled at four metres.
+* `findCrossings()` tests the two ways' **layers before** the intersection arithmetic instead of
+  after it. The solver only wants pairs whose layers differ, and in a street network essentially
+  every pair is two ways on the ground.
+* Both segment indices — `findCrossings()`'s and the terminus pass's — hold an **ordinal into a
+  flat table** rather than an array literal per segment. That is 88 k short-lived arrays here and
+  half a million over Old Toronto, whose only effect was to hand the collector the street network
+  twice.
+* The street-name index is built on the **first question**, not before the first frame: its only
+  reader is the HUD line, and nothing asks it until a player is standing somewhere.
+
+Projected over the pre-1998 city (17.3 × 14.6 km, ~181,000 buildings, ~950 tiles) by scaling each
+term by its own driver, the up-front phase lands near **3.6 s** against ~5 s before, and the shape
+of it has changed: building count now contributes about 0.35 s instead of ~0.95 s, and everything
+else is the road network. Termini and the grade solve are more than half of what remains, and both
+are global by argument rather than by accident — so the honest statement is that time to a first
+frame is now flat in *building* count and still linear in *way* count.
+
+The work did not vanish; it moved into the tile builds, where it is bounded by the camera's range
+instead of by the map. Building everything visible from the opening viewpoint went from 1.03 s to
+1.18 s, and that 150 ms is the footprint preparation for the 213 tiles it touches. That number does
+not grow with the city — a bigger map does not put more tiles in front of you — which is the whole
+point of the move.
 
 ## Testing note
 
 In a headless or background browser tab, **both `requestAnimationFrame` and `setTimeout` are
 throttled** (a `setTimeout(8)` measured at ~973 ms). Override `requestAnimationFrame` to capture the
-callback and drive it in a loop awaiting a *microtask*, not a timer.
+callback and drive it in a loop awaiting a *microtask*, not a timer. Install that override **before
+the page's modules run** — reload with it in place rather than patching a running page. Chrome does
+not fire `rAF` at all while `document.hidden`, so a loop that has already registered its next frame
+through the real `rAF` is stopped dead and no shim installed afterwards can restart it; there is no
+handle on the callback to call by hand. The city half of the frame can always be driven directly —
+`city.update(camera, t, budgetMs)` is exactly what the loop calls — which is enough to exercise tile
+builds, the chore queue and every counter, but it draws nothing.
 
 The load yields 18 times now, not 363: `chunked()` yields on a **clock** (12 ms of work between
 yields) rather than on a fixed chunk size. A yield costs most of a frame in a visible tab, and the
@@ -941,29 +1236,41 @@ overlays, so both paths are tested at once.
 
 ## The safety nets
 
-Four checks run without a browser. Between them they cover the geometry, the module graph and the
-shaders; none of them covers the frame, which is why the last step is always to boot the thing.
+Five checks run without a browser. Between them they cover the geometry, the invariants, the module
+graph and the shaders; none of them covers the frame, which is why the last step is always to boot
+the thing.
 
 | | | |
 |---|---|---|
 | `npm run check` | `node --check` on every module | catches a syntax error |
 | `npm run fingerprint:check` | `tools/fingerprint.mjs` | catches **changed geometry** |
+| `node tools/harness.mjs` | `tools/harness.mjs` | catches a **broken invariant** — see below |
 | `npm run scope` | `tools/scopecheck.mjs` | catches a **free variable** left behind by a move |
 | `npm run shaders:check` | `tools/shadercheck.mjs` | catches a changed program or an unwritten uniform |
 
 **The fingerprint** builds the real city against a stub GL context, drives `tiles.js` through every
 stage of every tile, and reduces every emitted vertex to an order-independent hash — each vertex is
 hashed alone and the hashes are summed, so re-ordering tiles, re-ordering emitters inside a tile or
-splitting one module into six cannot move the number. 34,477,884 vertices, plus 468 stats fields,
-plus every landmark height. It is the proof that a refactor was a move and not a rewrite.
+splitting one module into six cannot move the number. **203,393,211 vertices**, plus 462 stats
+fields, plus every landmark height. It is the proof that a refactor was a move and not a rewrite.
+
+**The baseline is pinned to a data file hash** (`data/toronto.bin`, its byte length and its
+SHA-256), so rebuilding the extract invalidates it on purpose rather than by accident. Regenerate
+it with `node tools/fingerprint.mjs` **only** after the change to the data is the agreed change —
+never to make a failure go away. The right order when the extent moves is: run `--check --strict`
+against the *old* data first to prove the code did not alter geometry, then rebuild, then
+regenerate. That was done for this expansion: `--check --strict` passed bit-exact on the 4,294,940-
+byte downtown sidecar (h1=77f49458, 34,482,234 vertices) before the new baseline was written.
 
 It has two blind spots, both structural:
 
 - **the signs class.** Lettering needs the Canvas 2D font atlas, which does not exist headlessly,
   so `facades.textGlyphs` is 0 and the `signs` bucket is empty. The summary prints a COVERAGE line
   whenever that happens, so it is never silent — but any change to `render/text.js`, `render/font.js`
-  or the facade signage pass has to be checked in the browser. In a real tab that pass emits about
-  14,700 glyphs.
+  or the facade signage pass has to be checked in the browser. In a real tab that pass is alive:
+  a settled street-level camera at King and Bay reports 1,749 text runs and 18,639 glyphs from the
+  tiles resident around it, and `facades.textBlades` — the geometry the glyphs sit on, which *is*
+  fingerprinted — went 1,805 → 12,526 across the expansion.
 - **the completion path.** The tool calls `loadCity()` and then walks the tiles itself; it never
   calls `warm()`, so the console summary at the end of a boot never runs under it.
 
@@ -975,6 +1282,22 @@ legal JavaScript until the line runs — the fingerprint passes, and the browser
 identifier that is read but never imported, declared, taken as a parameter or global. It is a
 scanner and not a parser: bindings are collected generously and reads narrowly, so a finding is
 worth reading the line for and a clean run is evidence rather than proof.
+
+**The harness** (`node tools/harness.mjs`) is the fifth, and it answers a different question. The
+fingerprint asks *did anything move*; the harness asks *is what we built correct* — no NaN, no
+non-unit normals, no prop inside a footprint, no marking under the asphalt, no route running off
+the side of a wall, the surveyed landmark heights, the street-grid rotation. It exits non-zero on
+any of those.
+
+Its expectations are **derived, not typed in**, because it went stale twice — once when the map
+grew to 43 km² and again at Old Toronto — by asserting absolute counts (*4,654 buildings*, *7,926
+road ways*, *75 building passages*, *2,500–4,000 people*) that are properties of the **extent**,
+not of the code. Every such expectation now comes out of the extract or out of the `city` object
+itself: conservation (`built + skipped == the records in the file`), densities (passages per
+thousand ways, people per kilometre of walkable route, vertices per km²) and positions read from
+`city.cnTower` rather than from a remembered coordinate. What stays a literal is only what is
+genuinely absolute — a surveyed height, a rotation in degrees, and the zero-tolerance rules. If you
+find yourself editing a number in `harness.mjs` to make it pass, that number was the wrong shape.
 
 ## Files that are still too big
 

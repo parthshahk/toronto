@@ -1,60 +1,44 @@
-// src/city/buildings.js — extruding a footprint, and deciding which faces are worth drawing.
+// src/city/buildings.js — extruding a footprint, and the wall faces that come out of it.
 //
-// CONTRACT.md §3.1 and Amendment 11.1. Moved out of city.js unchanged. This is the half of the
-// building pass that is pure ANALYSIS plus the wall emitter it feeds:
+// CONTRACT.md §3.1 and Amendment 11.1. This is the half of the building pass that turns a record
+// into something a tile can emit:
 //
-//   resolveCoplanarWalls()   the massing extract stacks slabs, so two records routinely extrude
-//                            the same wall in the same plane. A depth buffer cannot order those,
-//                            and the result is a facade that shimmers as the camera moves. This
-//                            pass decides, once and globally, who owns each shared run.
-//   punchCorridorPortals()   opens every wall a depressed corridor or a building passage runs
-//                            through, before a single quad is emitted.
-//   resolveCoplanarCaps()    the same argument for roof caps, which share a plane far more often
-//                            than walls do.
-//   emitWallFace()           the wall quads themselves, honouring the cuts and holes above.
+//   addWallRing()       one ring's worth of wall faces, keyed and indexed.
+//   wallsCoincide()     do two wall faces occupy the same plane, facing the same way?
+//   emitWallFace()      the wall quads themselves, honouring the cuts and the portals.
 //
-// It is a GLOBAL pass and stays one: which faces a record may draw depends on its neighbours, and
-// no record knows its neighbours until every ring is built. It produces no vertices of its own —
-// it decides what each tile is allowed to emit later.
+// Turning a raw massing record INTO one of these — rings into oriented parts, material and
+// lighting profile, the storey model, the landmark claim, the broadphase — lives in city/prep.js,
+// which does it one record at a time, when something asks, rather than for the whole city before
+// the first frame.
+//
+// WHO OWNS A SHARED SURFACE is decided by city/coplanar.js, a record at a time, when a tile first
+// asks for that record. It used to be three whole-city passes here — walls, portals and caps —
+// and at 43 km2 they cost 418 ms in front of the first frame; over the pre-1998 city they project
+// to four seconds of a player staring at a loading bar. The rules did not change, only when they
+// run: every one of them is answered by geometry that TOUCHES the record asking, so the answer for
+// one record is a function of its neighbours and of nothing else. See city/coplanar.js for the two
+// places that used to lean on global iteration order and how each was made independent of it.
 //
 // Plan space is (u, v) = (x, -z), as everywhere in this tree.
 
 import { clamp } from '../core/math.js';
 import { isNum } from '../core/util.js';
-import { chunked } from '../core/async.js';
-import { buildParts, planArea, planBBox, partContains } from '../geom/ring.js';
-import { makeGridIndex } from '../data/index.js';
-import {
-  readHouseNumber, readLevels, readName, readRoofShape, readUnits,
-} from '../data/schema.js';
-import { islandBuildingHeight } from '../world/islands.js';
-import { MIN_RING_AREA, WALL_SINK, ringPlanArea } from '../world/ground.js';
-import { M, facadeMaterial } from './materials.js';
-import { assignLandmarks } from './landmarks.js';
-import { storeyModel } from './units.js';
-// Headroom a corridor and a building passage each demand of whatever crosses them: the portal
-// punched through a wall has to clear the same height the trench below it was cut to.
-import { PASSAGE_HEAD, UNDER_CLEAR } from '../world/grade.js';
+import { WALL_SINK } from '../world/ground.js';
 
 // Coplanar-geometry resolution (Amendment 8 work: the daytime flicker).
 //
 // Two surfaces at the same plane and the same facing are a z-fight no depth buffer resolves; the
 // massing extract is full of them because a real building is often several stacked slabs, each
 // carrying its own complete ring, and where two of those rings share an edge both records extrude
-// the same wall. WALL_TOL is how far apart two walls may be and still count as the same surface,
-// WALL_MIN_OVERLAP the shortest shared run worth resolving, and CAP_COPLANAR_TOL the height
-// difference under which two roof caps are the same plane.
+// the same wall. WALL_TOL is how far apart two walls may be and still count as the same surface
+// and WALL_MIN_OVERLAP the shortest shared run worth resolving. The rule that uses them lives in
+// city/coplanar.js; the primitives it is built out of live here, next to the emitter they feed.
 const WALL_TOL = 0.06;
 const WALL_MIN_OVERLAP = 0.25;
-const CAP_PLANE_TOL = 0.030;       // two roof caps closer than this in Y are the same plane
-const CAP_MIN_SEP = 0.020;         // ...and this is the separation the audit demands afterwards
-const CAP_STEP = 0.060;            // how far a losing roof cap steps down out of a shared plane.
-                                   // Comfortably more than CAP_PLANE_TOL, so one step always
-                                   // clears the band that put the two caps in the same group
-const CAP_MAX_STEP = 4;            // deepest a chain may go, so one pathological cluster cannot
-                                   // sink a roof half a metre below its own wall head
 const WALL_MIN_BAND = 0.05;        // a surviving strip of wall shorter than this is not worth a quad
-/* ============================================ coplanar face resolution == */
+
+/* =================================================== wall faces == */
 /**
  * THE OTHER HALF OF THE DAYTIME FLICKER.
  *
@@ -73,14 +57,15 @@ const WALL_MIN_BAND = 0.05;        // a surviving strip of wall shorter than thi
  * What is NOT a fight, and must not be "fixed": two neighbours sharing a party wall. Their rings
  * run in opposite directions along the shared line, so the two faces are back to back — each is a
  * back face from the other one's side and culling already resolves them. Only walls that face the
- * SAME way are a fight, which is what the co-orientation test below is for. Roughly two thirds of
- * all coincident wall pairs in the extract are party walls and are deliberately left alone.
+ * SAME way are a fight, which is what the co-orientation test in wallsCoincide() is for. Roughly
+ * two thirds of all coincident wall pairs in the extract are party walls and are deliberately left
+ * alone.
  *
  * The resolution is suppression, not displacement. Nudging one wall inward opens a slot at the
  * corner where its neighbours still meet the original plane, and back-face culling turns that slot
  * into a view straight through the building. Instead the loser stops where the winner starts:
  *
- *   winner  = the record whose wall reaches HIGHER (ties broken by edge order, so it is total and
+ *   winner  = the record whose wall reaches HIGHER (ties broken by edge key, so it is total and
  *             stable — a rule that is not total leaves a pair unresolved, or resolves it both
  *             ways and deletes the wall entirely)
  *   loser   = keeps only the band BELOW the winner's base, over exactly the length they share
@@ -89,6 +74,8 @@ const WALL_MIN_BAND = 0.05;        // a surviving strip of wall shorter than thi
  * interval [y0, cut] — there is never a hole in the middle of a wall — and the two together still
  * cover every square metre the pair used to. Where the loser is completely covered it emits
  * nothing, which is why this pass costs fewer vertices than it saves.
+ *
+ * city/coplanar.js applies that rule, a record at a time, on demand.
  */
 
 // One wall face waiting to be emitted: a plan-space edge (au, av) -> (bu, bv) extruded y0..y1.
@@ -101,15 +88,29 @@ function makeWallEdge(k, r, au, av, bu, bv, len, y0, y1) {
   };
 }
 
-function addWallRing(list, all, idx, r, co, y0, y1) {
+/**
+ * Extrude one ring into wall faces, append them to the record's list and index them.
+ *
+ * THE KEY IS COMPOSED, not counted: `base` is the record's key times a stride and the ordinal is
+ * the record's own edge count so far. The whole-city pass numbered edges by the order it happened
+ * to build them in — records in key order, and within a record parts, then rings, then edges — so
+ * a composed key induces exactly the same total order while depending on nothing outside the
+ * record. That is what lets the tie-break rule ("the earlier edge wins") survive being evaluated
+ * a building at a time, in whatever order the tiles ask.
+ *
+ * @param {object[]} list the record's wall faces, appended to
+ * @param {number} base the record's key times EDGE_STRIDE
+ * @param {object} idx the plan-space wall broadphase
+ * @param {object} rec the building record the faces belong to
+ */
+function addWallRing(list, base, idx, rec, co, y0, y1) {
   const n = co.length;
   for (let i = 0, j = n - 2; i < n; j = i, i += 2) {
     const au = co[j], av = co[j + 1], bu = co[i], bv = co[i + 1];
     const du = bu - au, dv = bv - av;
     const len = Math.sqrt(du * du + dv * dv);
     if (!(len > 1e-4)) continue;
-    const e = makeWallEdge(all.length, r, au, av, bu, bv, len, y0, y1);
-    all.push(e);
+    const e = makeWallEdge(base + list.length, rec, au, av, bu, bv, len, y0, y1);
     list.push(e);
     idx.add(Math.min(au, bu) - WALL_TOL, Math.min(av, bv) - WALL_TOL,
       Math.max(au, bu) + WALL_TOL, Math.max(av, bv) + WALL_TOL, e);
@@ -118,6 +119,11 @@ function addWallRing(list, all, idx, r, co, y0, y1) {
 
 // Do these two wall faces occupy the same plane, facing the same way, over a run worth resolving?
 // Fills _wp with the shared band and returns its length, or 0.
+//
+// MEASURED IN THE FIRST ARGUMENT'S FRAME, which is why the caller always passes the lower-keyed
+// edge first: the co-orientation test has a 15-degree threshold and the projection is onto e's
+// normal, so a pair a hair either side of it can coincide read one way and not the other. `ta/tb`
+// are the shared band along e, `sa/sb` the same band along f.
 const _wp = { ta: 0, tb: 0, sa: 0, sb: 0 };
 
 function wallsCoincide(e, f) {
@@ -140,20 +146,8 @@ function wallsCoincide(e, f) {
   return tb - ta;
 }
 
-// Every candidate pair, once. `visit(e, f, run)` is called with the shared run in _wp.
-function scanWallPairs(all, idx, visit) {
-  for (let k = 0; k < all.length; k++) {
-    const e = all[k];
-    const x0 = Math.min(e.au, e.bu) - WALL_TOL, x1 = Math.max(e.au, e.bu) + WALL_TOL;
-    const v0 = Math.min(e.av, e.bv) - WALL_TOL, v1 = Math.max(e.av, e.bv) + WALL_TOL;
-    idx.queryBox(x0, v0, x1, v1, (f) => {
-      if (f.k <= k) return;
-      if (Math.min(e.y1, f.y1) - Math.max(e.y0, f.y0) <= WALL_MIN_BAND) return;
-      const run = wallsCoincide(e, f);
-      if (run > 0) visit(e, f, run);
-    });
-  }
-}
+/** The shared band the last wallsCoincide() found. Written and read within one call. */
+function wallPair() { return _wp; }
 
 // The height a wall face still reaches at `t` metres along it, after every cut that covers it.
 function wallTopAt(e, t) {
@@ -176,59 +170,6 @@ function wallBaseAt(e, t) {
     if (t >= h[i] && t <= h[i + 1] && h[i + 2] > base) base = h[i + 2];
   }
   return base;
-}
-
-/**
- * Find every duplicated wall face and cut the loser back. Returns the audit.
- * @param {object[]} records prepped buildings, `parts` already built
- */
-function resolveCoplanarWalls(records, extent, stats) {
-  const cell = 10.0;
-  const u0 = -extent.x / 2 - 400, v0 = -extent.z / 2 - 400;
-  const idx = makeGridIndex(cell, u0, v0,
-    Math.ceil((extent.x + 800) / cell) + 1, Math.ceil((extent.z + 800) / cell) + 1);
-  const all = [];
-  for (let r = 0; r < records.length; r++) {
-    const b = records[r];
-    if (!b.parts || b.landmark === 'cn') continue;
-    const y0 = b.y - WALL_SINK, y1 = b.y + b.h;
-    const list = [];
-    for (let p = 0; p < b.parts.length; p++) {
-      const part = b.parts[p];
-      addWallRing(list, all, idx, r, part.outer, y0, y1);
-      for (let h = 0; h < part.holes.length; h++) addWallRing(list, all, idx, r, part.holes[h], y0, y1);
-    }
-    b.walls = list;
-  }
-
-  const A = stats.coplanar;
-  A.wallFaces = all.length;
-  scanWallPairs(all, idx, (e, f, run) => {
-    A.wallPairs++;
-    A.wallMetres += run;
-    // Total, stable order: the higher wall keeps the surface, ties go to the earlier edge.
-    const eWins = e.y1 > f.y1 || (e.y1 === f.y1 && e.k < f.k);
-    const L = eWins ? f : e;
-    const W = eWins ? e : f;
-    const cut = Math.max(L.y0, W.y0);
-    const ta = eWins ? _wp.sa : _wp.ta;
-    const tb = eWins ? _wp.sb : _wp.tb;
-    if (!L.cuts) L.cuts = [];
-    L.cuts.push(ta, tb, cut);
-  });
-
-  // Re-audit against what will actually be emitted rather than trusting the rule above. Any pair
-  // whose two survivors still share a band is a fight that got through, and must be zero.
-  scanWallPairs(all, idx, (e, f) => {
-    const t = (_wp.ta + _wp.tb) * 0.5;
-    const s = (_wp.sa + _wp.sb) * 0.5;
-    const eTop = wallTopAt(e, t);
-    const fTop = wallTopAt(f, s);
-    const lo = Math.max(e.y0, f.y0);
-    const hi = Math.min(eTop, fTop);
-    if (hi - lo > WALL_MIN_BAND) A.wallPairsLeft++;
-  });
-  return A;
 }
 
 // One wall quad between two stations along an edge. Winding follows the ring order, so a plan-CCW
@@ -281,421 +222,7 @@ function emitWallFace(mb, e, stats) {
   }
 }
 
-/**
- * CONTRACT 8.1 — "roads that pass under a rail corridor, an expressway or a building must be
- * MODELLED, not deleted". Modelling the road is only half of it: the structure ON TOP has to let
- * it through.
- *
- * York and Bay Streets dive under Union Station into the teamways, and a further 1.6 km of
- * building passages walk straight through the base of a tower. The massing knows nothing about any
- * of that, so its perimeter wall stands square across the carriageway and the underpass — which IS
- * built, and which the ground correctly dips into — dead-ends in a blank facade a pedestrian
- * cannot pass. That is the "roads just cut off" in the report, and this is where it is opened.
- *
- * Wherever a corridor or a passage CROSSES a wall face, the wall goes from its foot up to the head
- * the corridor needs, and the building stands on the lintel that is left. The head is the same
- * number `emitTrench` gives the soffit, so wall and ceiling meet on one line with no seam.
- *
- * Only a crossing wall opens. A building that merely lines a depressed street runs PARALLEL to it
- * with its facade at the back of the pavement — inside the corridor's outer envelope — and would
- * otherwise have its whole ground floor cut away; the direction test and the narrower carriageway
- * envelope are what keep it shut.
- */
-const PORTAL_MIN_RUN = 1.2;        // a shorter crossing than this is a corner nick, not a doorway
-const PORTAL_AXIS_MAX = 0.75;      // |cos| between wall and corridor: above this they are parallel
-
-function punchCorridorPortals(records, grade, terrainY, stats) {
-  if (!grade || typeof grade.span !== 'function') return;
-  const G = stats.grade;
-  for (let r = 0; r < records.length; r++) {
-    const b = records[r];
-    if (!b || !b.walls) continue;
-    for (let w = 0; w < b.walls.length; w++) {
-      const e = b.walls[w];
-      const steps = Math.max(2, Math.min(64, Math.ceil(e.len / 1.0)));
-      const dt = e.len / steps;
-      let runA = -1, runB = -1, runHead = 0;
-      for (let s = 0; s <= steps; s++) {
-        const t = s * dt;
-        const x = e.au + e.uu * t;
-        const z = -(e.av + e.uv * t);
-        const sp = grade.span(x, z);
-        let head = 0;
-        if (sp && sp.d2 <= sp.chw * sp.chw) {
-          // World direction of the wall is (uu, -uv); v is -z.
-          const dot = Math.abs(e.uu * sp.dx - e.uv * sp.dz);
-          if (dot < PORTAL_AXIS_MAX) {
-            const floorY = terrainY(x, z) - sp.dep;
-            head = floorY + (sp.pass ? PASSAGE_HEAD : UNDER_CLEAR);
-          }
-        }
-        if (head > 0) {
-          if (runA < 0) { runA = t; runHead = head; }
-          runB = t;
-          if (head > runHead) runHead = head;
-          if (s < steps) continue;
-        }
-        if (runA >= 0) {
-          const a = clamp(runA - dt * 0.5, 0, e.len);
-          const bb = clamp(runB + dt * 0.5, 0, e.len);
-          if (bb - a >= PORTAL_MIN_RUN && runHead > e.y0 + WALL_MIN_BAND) {
-            (e.holes || (e.holes = [])).push(a, bb, runHead);
-            G.wallPortals++;
-            G.wallPortalMetres += bb - a;
-          }
-          runA = -1; runB = -1; runHead = 0;
-        }
-      }
-    }
-  }
-}
-
-/**
- * Is every point of `part` inside record `o`? Tested at the ring's vertices AND its edge
- * midpoints, which is what catches a footprint that pokes out through the middle of a long edge.
- */
-function partInsideRecord(o, part) {
-  const co = part.outer;
-  const n = co.length;
-  const inside = (u, v) => {
-    for (let p = 0; p < o.parts.length; p++) if (partContains(o.parts[p], u, v)) return true;
-    return false;
-  };
-  for (let i = 0, j = n - 2; i < n; j = i, i += 2) {
-    if (!inside(co[j], co[j + 1])) return false;
-    // Walk the edge as well as its ends. A verdict of "buried" DELETES geometry, so a footprint
-    // that bows out through the middle of a long edge has to be caught: sample every couple of
-    // metres, capped so one 300 m stadium edge cannot dominate the pass.
-    const du = co[i] - co[j], dv = co[i + 1] - co[j + 1];
-    const len = Math.sqrt(du * du + dv * dv);
-    const steps = Math.min(24, Math.max(1, Math.round(len / 2.0)));
-    for (let k = 1; k < steps; k++) {
-      const t = k / steps;
-      if (!inside(co[j] + du * t, co[j + 1] + dv * t)) return false;
-    }
-  }
-  return true;
-}
-
-// Do two footprint parts share any ground? Bounding boxes first, then vertices and centroids of
-// each against the other — which is every overlap the massing data actually produces, because a
-// footprint is a building outline and not a pinwheel.
-function partsOverlap(a, b) {
-  const ab = a.bbox, bb = b.bbox;
-  if (ab[0] > bb[2] || ab[2] < bb[0] || ab[1] > bb[3] || ab[3] < bb[1]) return false;
-  if (partContains(b, (ab[0] + ab[2]) * 0.5, (ab[1] + ab[3]) * 0.5)) return true;
-  if (partContains(a, (bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5)) return true;
-  const ca = a.outer, cb = b.outer;
-  for (let i = 0; i < ca.length; i += 2) if (partContains(b, ca[i], ca[i + 1])) return true;
-  for (let i = 0; i < cb.length; i += 2) if (partContains(a, cb[i], cb[i + 1])) return true;
-  return false;
-}
-
-// A total order over roof caps sharing a plane: the bigger footprint keeps the surface, the record
-// key breaks a tie, the part index breaks that. Total matters — a rule with ties either leaves a
-// pair unresolved or drops both caps.
-function capOutranks(o, oi, b, bi) {
-  const oa = o.parts[oi].capArea, ba = b.parts[bi].capArea;
-  if (oa !== ba) return oa > ba;
-  if (o.key !== b.key) return o.key < b.key;
-  return oi < bi;
-}
-
-/**
- * Roof caps. A cap is a horizontal face, so its fight is with another cap at the same height —
- * and its other failure is simply being INSIDE something taller, where it costs vertices to draw
- * a roof nobody can see.
- *
- * Two answers, because there are two shapes of problem:
- *   * a cap wholly inside a record that reaches above it is DELETED. Where every part of a record
- *     is wholly inside a neighbour that also starts at or below it, the record is dropped whole —
- *     walls, cap, beacon, ground floor and rooftop plant, all of which were previously being
- *     built inside somebody else's tower.
- *   * two caps on the same plane that merely OVERLAP cannot be resolved by deletion without
- *     clipping one polygon against the other, so the loser STEPS DOWN instead. A roof 6 cm below
- *     its own wall head is a parapet; two roofs at the same height are a fight.
- *
- * The step has to be a chain depth, not a neighbour count. Where A beats B and B beats C but A
- * and C never touch, counting neighbours puts B and C on the same step and hands the fight
- * straight back; taking each cap's level as one more than the deepest cap that beats it and
- * overlaps it cannot. Ranking is a total order, so processing the caps in it visits every
- * dominator before its dependant and one sweep is enough.
- */
-function resolveCoplanarCaps(records, bIndex, stats) {
-  const A = stats.coplanar;
-  for (let r = 0; r < records.length; r++) {
-    const b = records[r];
-    if (!b.parts) continue;
-    for (let p = 0; p < b.parts.length; p++) {
-      const part = b.parts[p];
-      part.capArea = Math.abs(planArea(part.outer));
-      part.capBuried = false;
-      part.capDrop = 0;
-      part.capLevel = -1;
-    }
-  }
-
-  /* --- burial ------------------------------------------------------------ */
-  const live = [];
-  for (let r = 0; r < records.length; r++) {
-    const b = records[r];
-    if (!b.parts || b.landmark === 'cn') continue;
-    const top = b.y + b.h;
-    const base = b.y - WALL_SINK;
-    let allBuried = true;
-    for (let p = 0; p < b.parts.length; p++) {
-      const part = b.parts[p];
-      const bb = part.bbox;
-      const qx = (bb[0] + bb[2]) * 0.5, qz = -(bb[1] + bb[3]) * 0.5;
-      const qr = Math.max(bb[2] - bb[0], bb[3] - bb[1]) * 0.5 + 1;
-      let buried = false, whole = false;
-      bIndex.query(qx, qz, qr, (o) => {
-        if (buried || o === b || !o.parts || o.landmark === 'cn') return;
-        const oTop = o.y + o.h;
-        const oBase = o.y - WALL_SINK;
-        if (oTop > top + CAP_PLANE_TOL) {
-          if (oBase > top || !partInsideRecord(o, part)) return;
-          buried = true;
-          if (oBase <= base + 0.05) whole = true;
-          return;
-        }
-        if (oTop < top - CAP_PLANE_TOL) return;
-        for (let q = 0; q < o.parts.length; q++) {
-          if (capOutranks(o, q, b, p) && partInsideRecord(o, part)) { buried = true; return; }
-        }
-      });
-      part.capBuried = buried;
-      if (buried) {
-        A.capsBuried++;
-        if (!whole) allBuried = false;
-      } else {
-        allBuried = false;
-        live.push(b, p);
-      }
-    }
-    b.buried = allBuried;
-    if (allBuried) A.buriedRecords++;
-  }
-
-  /* --- step-down --------------------------------------------------------- */
-  // Sorted into the ranking order, so every cap that can dominate this one already has a level.
-  const order = [];
-  for (let i = 0; i < live.length; i += 2) {
-    if (!live[i].buried) order.push(i);
-  }
-  order.sort((ia, ib) => {
-    const a = live[ia], ap = live[ia + 1];
-    const b = live[ib], bp = live[ib + 1];
-    return capOutranks(a, ap, b, bp) ? -1 : 1;
-  });
-  for (let k = 0; k < order.length; k++) {
-    const i = order[k];
-    const b = live[i], p = live[i + 1];
-    const part = b.parts[p];
-    const top = b.y + b.h;
-    const bb = part.bbox;
-    const qx = (bb[0] + bb[2]) * 0.5, qz = -(bb[1] + bb[3]) * 0.5;
-    const qr = Math.max(bb[2] - bb[0], bb[3] - bb[1]) * 0.5 + 1;
-    // Take the first step that is genuinely clear of every cap already placed, tested against the
-    // heights they were actually placed at. Counting dominators is not enough: a cap stepping out
-    // of ITS plane can land on a neighbouring one, which is exactly the case a chain depth misses.
-    let lvl = 0;
-    while (lvl <= CAP_MAX_STEP) {
-      const y = top - lvl * CAP_STEP;
-      let clash = false;
-      bIndex.query(qx, qz, qr, (o) => {
-        if (clash || o === b || !o.parts || o.buried || o.landmark === 'cn') return;
-        for (let q = 0; q < o.parts.length; q++) {
-          const other = o.parts[q];
-          if (other.capBuried || other.capLevel < 0) continue;
-          if (Math.abs((o.y + o.h - other.capDrop) - y) >= CAP_MIN_SEP) continue;
-          if (partsOverlap(other, part)) { clash = true; return false; }
-        }
-      });
-      if (!clash) break;
-      lvl++;
-    }
-    if (lvl > CAP_MAX_STEP) { lvl = CAP_MAX_STEP; A.capDropsClamped++; }
-    part.capLevel = lvl;
-    if (lvl > 0) { part.capDrop = lvl * CAP_STEP; A.capsStepped++; }
-  }
-
-  /* --- re-audit ---------------------------------------------------------- */
-  // Any two caps still left within CAP_MIN_SEP of each other with overlapping footprints.
-  for (let r = 0; r < records.length; r++) {
-    const b = records[r];
-    if (!b.parts || b.buried || b.landmark === 'cn') continue;
-    for (let p = 0; p < b.parts.length; p++) {
-      const part = b.parts[p];
-      if (part.capBuried) continue;
-      const top = b.y + b.h - part.capDrop;
-      const bb = part.bbox;
-      bIndex.query((bb[0] + bb[2]) * 0.5, -(bb[1] + bb[3]) * 0.5,
-        Math.max(bb[2] - bb[0], bb[3] - bb[1]) * 0.5 + 1, (o) => {
-          if (o === b || !o.parts || o.buried || o.key <= b.key || o.landmark === 'cn') return;
-          for (let q = 0; q < o.parts.length; q++) {
-            const other = o.parts[q];
-            if (other.capBuried) continue;
-            if (Math.abs((o.y + o.h - other.capDrop) - top) >= CAP_MIN_SEP) continue;
-            if (partsOverlap(other, part)) { A.capPairsLeft++; return false; }
-          }
-        });
-    }
-  }
-}
-
-
-/**
- * Prepare every building record: rings into oriented parts, material and lighting profile, the
- * storey model, the landmark claim, and the uniform-grid broadphase they all go into.
- *
- * NOTHING IS TRIANGULATED HERE. Ear clipping happens inside emitCap(), which runs per tile, so
- * the cost of the roof of a building nobody has flown near yet is never paid.
- *
- * @param {object} W the raw building list and everything a record's attributes depend on.
- * @returns {Promise<{prepped: Array, bIndex: object, cnX: number, cnZ: number, cnBaseY: number}>}
- */
-async function prepareBuildings(W) {
-  const { buildingsRaw, HARBOUR, SUR_FRINGE, extent, groundY, project, report, stats } = W;
-
-  const prepped = new Array(buildingsRaw.length);
-  for (let i = 0; i < buildingsRaw.length; i++) {
-    const b = buildingsRaw[i];
-    const rings = Array.isArray(b.r) ? b.r : [];
-    let cx = 0, cz = 0, n = 0;
-    const r0 = rings[0];
-    if (Array.isArray(r0)) {
-      for (let k = 0; k < r0.length; k++) {
-        if (!isNum(r0[k][0])) continue;
-        cx += r0[k][0]; cz += r0[k][1]; n++;
-      }
-    }
-    prepped[i] = {
-      key: i + 1,
-      // ISLANDS: on the island cottages the massing extract's height is the tree canopy over the
-      // roof, not the roof. islandBuildingHeight() caps a small island footprint at a plausible
-      // house; everywhere else it returns b.h untouched. See harbour.js.
-      h: islandBuildingHeight(HARBOUR, n ? cx / n : 0, n ? cz / n : 0, ringPlanArea(r0),
-        isNum(b.h) ? b.h : 0),
-      y: isNum(b.y) ? b.y : 0,
-      cx: n ? cx / n : 0,
-      cz: n ? cz / n : 0,
-      rings,
-      // Surveyed per-building attributes: lighting profile, facade colour, material, name.
-      t: b.t,
-      c: b.c,
-      m: b.m,
-      name: readName(b),
-      // THE SURVEYED GROUND FLOOR. `units` are the premises OSM has on this building's frontage,
-      // in order along it, each carrying the footprint SEGMENT and the parameter along it that
-      // says where it really is; `hn` its street number; `lv` its real storey count; `roof` its
-      // roof shape. Everything the block-face model below builds comes off these four.
-      units: readUnits(b),
-      hn: readHouseNumber(b),
-      lv: readLevels(b),
-      roof: readRoofShape(b),
-      // Storey model, resolved once by storeyModel(): levels, floor-to-floor, ground storey.
-      levels: 0, storeyH: 0, groundH: 0, levelsFromData: false,
-      parts: null,
-      mainPart: null,
-      area: 0,
-      mat: null,
-      profile: 0,
-      cls: '',
-      landmark: null,
-      bbox: null,
-      towerSign: -1,
-      // Street frontage, filled in by findFrontage() during the facade pass.
-      frontX: 0, frontZ: 0, frontYaw: 0, frontLen: 0, frontNU: 1, frontNV: 0,
-    };
-  }
-  const claims = assignLandmarks(prepped, project);
-
-  // Wide enough to hold the reachable part of the synthesised fringe as well as the survey: a
-  // fringe mass indexed outside these bounds would be clamped into a boundary cell, and that cell
-  // would then be queried by everything along the whole edge of the map.
-  const B_PAD = 200 + SUR_FRINGE;
-  const bIndex = makeGridIndex(48, -extent.x / 2 - B_PAD, -extent.z / 2 - B_PAD,
-    Math.ceil((extent.x + B_PAD * 2) / 48) + 1, Math.ceil((extent.z + B_PAD * 2) / 48) + 1);
-
-  const cnPoint = project(-79.3871, 43.6426);
-  let cnBuilding = null;
-  let cnDone = false;
-
-  // Footprint preparation only: rings are split into parts and oriented, but NOTHING is
-  // triangulated here. Ear clipping happens inside emitCap(), which now runs per tile, so the
-  // cost of the roof of a building nobody has flown near yet is never paid.
-  report(0.46, 'reading footprints');
-  await chunked(prepped.length, 600, (i) => {
-    const b = prepped[i];
-    if (b.h <= 0.5) return;
-    const parts = buildParts(b.rings, MIN_RING_AREA);
-    if (!parts) { stats.ringsSkipped++; return; }
-    b.parts = parts;
-    let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
-    let area = 0, bestArea = -1;
-    for (let p = 0; p < parts.length; p++) {
-      const bb = planBBox(parts[p].outer);
-      x0 = Math.min(x0, bb[0]); x1 = Math.max(x1, bb[2]);
-      z0 = Math.min(z0, -bb[3]); z1 = Math.max(z1, -bb[1]);
-      const a = Math.abs(planArea(parts[p].outer));
-      area += a;
-      // The detail pass hangs the frontage, the roofscape and the parapet off ONE part; a stacked
-      // massing record has several, and the biggest is the one a pedestrian actually meets.
-      if (a > bestArea) { bestArea = a; b.mainPart = parts[p]; }
-    }
-    b.bbox = [x0, z0, x1, z1];
-    b.area = bestArea > 0 ? bestArea : area;
-    bIndex.add(x0, z0, x1, z1, b);
-    stats.buildings++;
-    stats.rings += parts.length;
-
-    const L = claims[i];
-    b.landmark = L ? L.key : null;
-    if (L) stats.landmarkHeights[L.key] = Math.max(stats.landmarkHeights[L.key] || 0, b.h);
-    const isCN = L && L.key === 'cn';
-    if (isCN && !cnDone) {
-      cnDone = true;
-      cnBuilding = b;
-      b.mat = M.cnShaft;
-      b.profile = 0;
-      b.cls = 'concrete';
-      b.glass = false;
-      stats.materials.concrete = (stats.materials.concrete || 0) + 1;
-      stats.profiles[0]++;
-      return;
-    }
-    if (isCN) return;
-
-    const spec = facadeMaterial(b, L);
-    b.mat = spec.mat;
-    b.profile = spec.profile;
-    b.cls = spec.cls;
-    b.glass = spec.glassy;
-    stats.materials[spec.cls] = (stats.materials[spec.cls] || 0) + 1;
-    stats.profiles[spec.profile]++;
-    if (spec.tagged) stats.surveyedColour++;
-    // The storey model, resolved ONCE here rather than per tile: it is a property of the
-    // building, every pass that lays anything out vertically reads it, and it is also where the
-    // surveyed level count gets accepted or rejected.
-    storeyModel(b);
-    const FA = stats.facades;
-    if (b.levelsFromData) FA.levelsFromData++;
-    else {
-      FA.levelsDerived++;
-      if (b.lv > 0) FA.levelsRejected++;
-    }
-  }, (f) => report(0.46 + f * 0.06, 'reading footprints'));
-
-  // The CN Tower must exist even if the massing record was rejected. Either way it is a feature
-  // like any other, anchored in the tile that holds it.
-  const cnX = cnBuilding ? cnBuilding.cx : cnPoint[0];
-  const cnZ = cnBuilding ? cnBuilding.cz : cnPoint[1];
-  const cnBaseY = cnBuilding ? cnBuilding.y - 0.6 : groundY(cnPoint[0], cnPoint[1]);
-
-  return { prepped, bIndex, cnX, cnZ, cnBaseY };
-}
-
 export {
-  prepareBuildings, resolveCoplanarWalls, emitWallFace, punchCorridorPortals, resolveCoplanarCaps,
+  WALL_TOL, WALL_MIN_BAND,
+  addWallRing, wallsCoincide, wallPair, wallTopAt, emitWallFace,
 };

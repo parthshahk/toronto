@@ -472,6 +472,20 @@ export function harbourCarFree(H, x, z) {
  * small island footprint is capped at a plausible cottage height, hashed on world position so it
  * is the same house every time.
  */
+/**
+ * Is this record even a candidate for the island height cap?
+ *
+ * Everything islandBuildingHeight() decides from before it looks at the footprint AREA. Splitting
+ * it out means the placement pass does not have to run a shoelace over every ring in the city to
+ * answer a question that is "no" for all but a few hundred cottages on Ward's and Algonquin.
+ */
+export function islandCapCandidate(H, cx, cz, h) {
+  const isle = H && H.isle;
+  if (!isle || !isNum(h) || !isNum(cx) || !isNum(cz)) return false;
+  if (h <= 8) return false;
+  return !(cx < isle.bbox[0] || cx > isle.bbox[2] || cz < isle.bbox[1] || cz > isle.bbox[3]);
+}
+
 export function islandBuildingHeight(H, cx, cz, area, h) {
   const isle = H && H.isle;
   if (!isle || !isNum(h) || !isNum(area) || !isNum(cx) || !isNum(cz)) return h;

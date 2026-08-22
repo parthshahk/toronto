@@ -12,8 +12,11 @@
 //                             band a point is, and easing the camera to a halt at the edge.
 //   streetNameAt(x, z)        the nearest named carriageway, for the HUD.
 //
-// Collision reads `parts`, which is prepared for EVERY building at load and never evicted: the
-// player must not be able to walk through a tower merely because its geometry is not resident.
+// Collision reads `parts`, and a record's parts are prepared the first time anything asks about it
+// (city/prep.js) — including this. `bIndex` prepares whatever a query reaches before answering it,
+// so the player cannot walk through a tower merely because its geometry is not resident, and once
+// prepared a record is never given back: what you can collide with is the survey, not the flight
+// path.
 
 import { clamp } from '../core/math.js';
 import { isNum } from '../core/util.js';
@@ -61,9 +64,9 @@ function makeQuerySurface(W) {
    * field, so what you can see through is exactly what you can walk through). Called with three
    * arguments, as every prop and pedestrian pass does, it behaves exactly as it always has.
    *
-   * Note that collision reads `parts`, which is prepared for EVERY building at load and never
-   * evicted: the player must not be able to walk through a tower merely because its geometry is
-   * not resident.
+   * Note that collision reads `parts`. A record's parts are prepared when something first asks
+   * about it, and the broadphase prepares whatever a query reaches before answering it, so a
+   * footprint blocks the player whether or not its geometry is resident.
    */
   function collide(x, z, r, feetY) {
     const out = { x, z, hit: false };
@@ -197,25 +200,35 @@ function makeQuerySurface(W) {
   }
 
   /* --------------------------------------------------------- street naming */
-  const sIndex = makeGridIndex(64, -extent.x / 2 - 400, -extent.z / 2 - 400,
-    Math.ceil((extent.x + 800) / 64) + 1, Math.ceil((extent.z + 800) / 64) + 1);
-  for (let i = 0; i < roadsRaw.length; i++) {
-    const r = roadsRaw[i];
-    // A tunnel is still a street, and the HUD should say so when you are standing in it.
-    if (!r || !r.n || !Array.isArray(r.p) || r.p.length < 2) continue;
-    if (G.kind[i] === WAY_SUB) continue;               // ...but the concourse is a level below
-    for (let k = 1; k < r.p.length; k++) {
-      const a = r.p[k - 1], b = r.p[k];
-      if (!isNum(a[0]) || !isNum(b[0])) continue;
-      sIndex.add(Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[0], b[0]), Math.max(a[1], b[1]),
-        [a[0], a[1], b[0], b[1], r.n]);
+  // BUILT ON THE FIRST QUESTION, not before the first frame. This is a segment index over every
+  // named way in the city and its only reader is the HUD's "what street am I on" line, which
+  // nothing asks until a frame has been drawn and a player is standing somewhere. Over Old
+  // Toronto that is roughly 120,000 ways' worth of segments filed into a 64 m grid — hundreds of
+  // milliseconds in front of a first frame to answer a question nobody has asked yet.
+  let sIndex = null;
+  function streetIndex() {
+    if (sIndex) return sIndex;
+    sIndex = makeGridIndex(64, -extent.x / 2 - 400, -extent.z / 2 - 400,
+      Math.ceil((extent.x + 800) / 64) + 1, Math.ceil((extent.z + 800) / 64) + 1);
+    for (let i = 0; i < roadsRaw.length; i++) {
+      const r = roadsRaw[i];
+      // A tunnel is still a street, and the HUD should say so when you are standing in it.
+      if (!r || !r.n || !Array.isArray(r.p) || r.p.length < 2) continue;
+      if (G.kind[i] === WAY_SUB) continue;             // ...but the concourse is a level below
+      for (let k = 1; k < r.p.length; k++) {
+        const a = r.p[k - 1], b = r.p[k];
+        if (!isNum(a[0]) || !isNum(b[0])) continue;
+        sIndex.add(Math.min(a[0], b[0]), Math.min(a[1], b[1]),
+          Math.max(a[0], b[0]), Math.max(a[1], b[1]), [a[0], a[1], b[0], b[1], r.n]);
+      }
     }
+    return sIndex;
   }
 
   function streetNameAt(x, z, maxDist = 25) {
     if (!isNum(x) || !isNum(z)) return '';
     let best = maxDist * maxDist, name = '';
-    sIndex.query(x, z, maxDist, (s) => {
+    streetIndex().query(x, z, maxDist, (s) => {
       const dx = s[2] - s[0], dz = s[3] - s[1];
       const l2 = dx * dx + dz * dz;
       let t = 0;

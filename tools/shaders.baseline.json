@@ -5,9 +5,9 @@
   {
    "label": "scene",
    "vsSha": "91358383b719a2c9",
-   "fsSha": "d0fb869cb8259ef1",
+   "fsSha": "27d4ac4defa10daf",
    "vsLines": 32,
-   "fsLines": 1572,
+   "fsLines": 1587,
    "declared": [
     "uAlpha:float",
     "uAmbientGround:vec3",
@@ -64,9 +64,9 @@
   {
    "label": "sky",
    "vsSha": "e2cfb4f60af6c5e6",
-   "fsSha": "f8843f489a336eeb",
+   "fsSha": "fbe70c5972aa2998",
    "vsLines": 11,
-   "fsLines": 809,
+   "fsLines": 823,
    "declared": [
     "uCloudAmount:float",
     "uCloudCover:float",
@@ -91,9 +91,9 @@
   {
    "label": "water",
    "vsSha": "43da4a765f8c9d01",
-   "fsSha": "523996821cc68412",
+   "fsSha": "0d249402d1523da4",
    "vsLines": 24,
-   "fsLines": 852,
+   "fsLines": 866,
    "declared": [
     "uAmbientGround:vec3",
     "uAmbientSky:vec3",
@@ -133,9 +133,9 @@
   {
    "label": "gshadow",
    "vsSha": "b97ddb895b8b8097",
-   "fsSha": "587178d2c5b56d6a",
+   "fsSha": "9faca4a50dde95b6",
    "vsLines": 14,
-   "fsLines": 538,
+   "fsLines": 552,
    "declared": [
     "uAlpha:float",
     "uCameraPos:vec3",
@@ -168,9 +168,9 @@
   {
    "label": "text",
    "vsSha": "63a65e5f659f59b3",
-   "fsSha": "3f4b2dca233c7865",
+   "fsSha": "efcf6e51c2483cda",
    "vsLines": 35,
-   "fsLines": 908,
+   "fsLines": 922,
    "declared": [
     "uAlpha:float",
     "uAmbientGround:vec3",
@@ -219,9 +219,9 @@
   {
    "label": "bright",
    "vsSha": "4ea6328ad5004bf4",
-   "fsSha": "4832de1392bdef9d",
+   "fsSha": "c27d0a2928140556",
    "vsLines": 11,
-   "fsLines": 721,
+   "fsLines": 735,
    "declared": [
     "uDecode:float",
     "uFirefly:float",
@@ -255,9 +255,9 @@
   {
    "label": "comp",
    "vsSha": "4ea6328ad5004bf4",
-   "fsSha": "80ede1fac2b8ecd4",
+   "fsSha": "0dac69f79dd453d0",
    "vsLines": 11,
-   "fsLines": 800,
+   "fsLines": 814,
    "declared": [
     "uB0:sampler2D",
     "uB1:sampler2D",
@@ -282,9 +282,9 @@
   {
    "label": "ssao",
    "vsSha": "4ea6328ad5004bf4",
-   "fsSha": "3b05790001a9cae7",
+   "fsSha": "59f9bd51045f7924",
    "vsLines": 11,
-   "fsLines": 632,
+   "fsLines": 646,
    "declared": [
     "uAoParams:vec4",
     "uDepth:sampler2D",
@@ -301,9 +301,9 @@
   {
    "label": "aoBlur",
    "vsSha": "4ea6328ad5004bf4",
-   "fsSha": "05f0317abbdb556c",
+   "fsSha": "5dee4bdcfdde50c2",
    "vsLines": 11,
-   "fsLines": 567,
+   "fsLines": 581,
    "declared": [
     "uDepth:sampler2D",
     "uInvProj:mat4",
@@ -320,9 +320,9 @@
   {
    "label": "ssr",
    "vsSha": "4ea6328ad5004bf4",
-   "fsSha": "35dd6e5798ca83f0",
+   "fsSha": "046f5ce8a368f44a",
    "vsLines": 11,
-   "fsLines": 818,
+   "fsLines": 832,
    "declared": [
     "uAmbientGround:vec3",
     "uDecode:float",
@@ -348,9 +348,9 @@
   {
    "label": "resolve",
    "vsSha": "4ea6328ad5004bf4",
-   "fsSha": "790707c6916c3358",
+   "fsSha": "bc3d6f44642b5316",
    "vsLines": 11,
-   "fsLines": 784,
+   "fsLines": 798,
    "declared": [
     "uAO:sampler2D",
     "uAmbientGround:vec3",
@@ -381,9 +381,9 @@
   {
    "label": "fxaa",
    "vsSha": "4ea6328ad5004bf4",
-   "fsSha": "d106df997e6d1cd7",
+   "fsSha": "ac67220e6bb6d12b",
    "vsLines": 11,
-   "fsLines": 559,
+   "fsLines": 573,
    "declared": [
     "uGrain:float",
     "uSrc:sampler2D",

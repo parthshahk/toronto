@@ -40,15 +40,14 @@ const _spans = [];
  * Mutates `grid.tiles[k].f` and the capture; returns nothing. Everything it needs arrives in one
  * object so that the pass has no hidden inputs and can be read top to bottom.
  */
-async function indexTiles(W) {
-  const {
-    G, HARBOUR, SUR, T, areaParts, cap, cnBaseY, cnX, cnZ, footJobs, grid, groundY,
-    junctions, poisRaw, prepped, railsRaw, recs, report, roadsRaw, stats, subJobs,
-    termCaps, terrainY, worstCut,
-  } = W;
-
-  report(0.76, 'indexing tiles');
-
+/**
+ * Give every tile its empty feature lists.
+ *
+ * Split out of indexTiles() because the building placement pass now files a record's DRAW BOX on
+ * its tile before anything is indexed, and the tile builder appends that tile's prepared records
+ * to `f.b` when it runs. Both need the lists to exist from the moment the grid does.
+ */
+function initTileFeatures(grid) {
   for (let k = 0; k < grid.tiles.length; k++) {
     grid.tiles[k].f = {
       i0: 0, i1: 0, j0: 0, j1: 0,
@@ -58,9 +57,22 @@ async function indexTiles(W) {
       pois: [],
       // CONTRACT §9.1 / §9.3: designed termini, and the synthesised fringe.
       caps: [], sroads: [], sblocks: [],
+      // Captures delivered after this pass ran — see city/lod.js deliverCapture(). An analysis
+      // that finishes behind the first frame still has geometry to hand over.
+      late: null,
     };
     grid.tiles[k].built = [false, false, false];   // one flag per stage: massing, detail, signs
   }
+}
+
+async function indexTiles(W) {
+  const {
+    G, HARBOUR, SUR, T, areaParts, cap, cnBaseY, cnX, cnZ, footJobs, grid, groundY,
+    junctions, poisRaw, railsRaw, recs, report, roadsRaw, stats, subJobs,
+    termCaps, terrainY, worstCut,
+  } = W;
+
+  report(0.76, 'indexing tiles');
 
   // --- terrain cells. Quad (i, j) belongs to the tile holding its centre, so the whole sheet is
   // still emitted exactly once and neighbouring tiles share their edge vertices to the bit.
@@ -102,14 +114,18 @@ async function indexTiles(W) {
     }
   }
 
-  // --- buildings, by footprint centroid.
-  for (let i = 0; i < prepped.length; i++) {
-    const b = prepped[i];
-    if (!b.parts || b.buried) continue;
-    const t = grid.at(b.cx, b.cz);
-    t.f.b.push(b);
-    grid.cover(t, b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3], b.y - 2, b.y + b.h + 6);
-  }
+  // --- buildings. NOT INDEXED HERE ANY MORE.
+  //
+  // A record's draw box was filed on its tile by the placement pass (city/prep.js) from the raw
+  // ring box, which contains the prepared one; the record itself is appended to `f.b` by the tile
+  // builder, which prepares that tile's records the first time it runs. Both are in file order,
+  // so a tile holds exactly what a single up-front pass put in it.
+  //
+  // A BURIED RECORD IS INDEXED LIKE ANY OTHER. Whether a record is wholly inside something taller
+  // is a cap verdict, and cap verdicts are resolved when a tile asks for the record rather than
+  // before it is filed (city/coplanar.js). Filing one costs nothing — every emitter skips it —
+  // and it cannot move a draw box either: a buried record's footprint is inside the record that
+  // buries it and its height range is inside that record's too, so the union is unchanged.
   {
     const t = grid.at(cnX, cnZ);
     t.f.cn = true;
@@ -326,4 +342,4 @@ async function indexTiles(W) {
 
 }
 
-export { indexTiles };
+export { indexTiles, initTileFeatures };

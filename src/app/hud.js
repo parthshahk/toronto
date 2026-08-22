@@ -267,7 +267,7 @@ export function drawHud(G, input) {
   // A phone is 375 px wide and the street name and the centred compass were drawn straight
   // through each other there. On a narrow screen the name goes BELOW the compass instead, a size
   // smaller; the wide layout is exactly as it was.
-  const street = (player.street || 'Downtown Toronto').toUpperCase();
+  const street = (player.street || 'Old Toronto').toUpperCase();
   const nameY = narrow ? T + 64 : T + 26;
   setFont(ctx, narrow ? 15 : 19, HUD.sans, '200', '0.09em');
   ctx.fillStyle = HUD.text;

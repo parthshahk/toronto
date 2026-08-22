@@ -39,18 +39,16 @@ const WATER_MIN_Z = 300.0;
 const WATER_DEPTH = -2.2;
 /* ================================================================ terrain == */
 
-function makeTerrain(src, extent, infraLines, waterAreas, surveyedShore) {
-  const nx = Math.max(2, src.nx | 0);
-  const nz = Math.max(2, src.nz | 0);
-  const cell = isNum(src.cell) && src.cell > 0 ? src.cell : 25;
-  const x0 = -extent.x / 2;
-  const z0 = -extent.z / 2;
-  const h = new Float32Array(nx * nz);
-  for (let i = 0; i < nx * nz; i++) h[i] = isNum(src.h[i]) ? src.h[i] : 0;
-
-  // --- open water mask -----------------------------------------------------------------------
-  // Rasterise every road, path, rail, pier and footprint edge into the terrain grid, then run a
-  // chamfer distance transform. Cells far from ALL of it, south of WATER_MIN_Z, are open water.
+/**
+ * The FALLBACK shoreline: which terrain cells are open water, decided by the absence of anything
+ * built on them.
+ *
+ * Rasterise every road, path, rail, pier and footprint edge into the grid, run a two-pass chamfer
+ * distance transform, and call the cells far from all of it — and south of WATER_MIN_Z — water.
+ * This is only ever used for an extract with NO surveyed shoreline; makeTerrain skips it entirely
+ * otherwise, which is why it is a function of its own rather than a block in the middle of one.
+ */
+function openWaterMask(nx, nz, cell, x0, z0, infraLines) {
   const dist = new Float32Array(nx * nz).fill(1e9);
   const mark = (x, z) => {
     const i = Math.round((x - x0) / cell);
@@ -124,6 +122,31 @@ function makeTerrain(src, extent, infraLines, waterAreas, surveyedShore) {
     }
     mask.set(tmp);
   }
+  return mask;
+}
+
+function makeTerrain(src, extent, infraLines, waterAreas, surveyedShore) {
+  const nx = Math.max(2, src.nx | 0);
+  const nz = Math.max(2, src.nz | 0);
+  const cell = isNum(src.cell) && src.cell > 0 ? src.cell : 25;
+  const x0 = -extent.x / 2;
+  const z0 = -extent.z / 2;
+  const h = new Float32Array(nx * nz);
+  for (let i = 0; i < nx * nz; i++) h[i] = isNum(src.h[i]) ? src.h[i] : 0;
+
+  // --- open water mask -----------------------------------------------------------------------
+  // Rasterise every road, path, rail, pier and footprint edge into the terrain grid, then run a
+  // chamfer distance transform. Cells far from ALL of it, south of WATER_MIN_Z, are open water.
+  //
+  // THE WHOLE BLOCK IS THE FALLBACK, and it is skipped outright where the extract carries a
+  // surveyed shoreline: harbour.js then carves the water from the real geometry (CONTRACT §8.3)
+  // and `mask` is never read again — not by the height field below, not by the terrain emitter,
+  // not by anything downstream. It used to be built regardless, which cost a rasterisation of
+  // every road and every building ring in the city, a two-pass chamfer transform and two box
+  // blurs over the whole grid, all of it thrown away. Both of those scale — one with the extract,
+  // one with its area — and neither buys anything here.
+  let mask = null;
+  if (!surveyedShore) mask = openWaterMask(nx, nz, cell, x0, z0, infraLines);
   // HARBOURFRONT: where the extract carries a surveyed shoreline the synthesised mask is not
   // applied at all — harbour.js carves the water from the real geometry (CONTRACT §8.3).
   for (let i = 0; i < nx * nz; i++) {

@@ -42,21 +42,59 @@ const LANDMARKS = [
 
 const LANDMARK_INHERIT_R = 48.0;   // stacked massing slabs of the same tower
 const LANDMARK_INHERIT_H = 0.75;
-function assignLandmarks(buildings, project) {
+
+/**
+ * Match every massing record against the landmark table.
+ *
+ * Reads the PLACEMENT arrays city/prep.js produces — height, and the centroid of the first ring —
+ * rather than prepared records, because it runs before any record has been prepared and its
+ * answer is one of the inputs to preparing one.
+ *
+ * The table is seven points inside a few hundred metres of King and Bay, and a record can only
+ * claim within `radius` of one or inherit within LANDMARK_INHERIT_R of a claimant. So the whole
+ * pass is restricted to the box those two reaches describe: over the pre-1998 city that is a
+ * fraction of a per cent of the records, and outside it the answer is provably null.
+ *
+ * @param {number} n          how many records there are
+ * @param {Float64Array} hA   height per record, after the island cap
+ * @param {Float64Array} cxA  first-ring centroid, east
+ * @param {Float64Array} czA  first-ring centroid, south
+ * @param {Function} project  lon/lat to local metres
+ * @returns {Array} one landmark entry or null per record
+ */
+function assignLandmarks(n, hA, cxA, czA, project) {
   const pts = LANDMARKS.map((L) => {
     const p = project(L.lon, L.lat);
     return { L, x: p[0], z: p[1] };
   });
-  const claim = new Array(buildings.length).fill(null);
-  for (let i = 0; i < buildings.length; i++) {
-    const b = buildings[i];
+  let bx0 = Infinity, bz0 = Infinity, bx1 = -Infinity, bz1 = -Infinity;
+  let minH = Infinity;
+  for (let k = 0; k < pts.length; k++) {
+    const { L, x, z } = pts[k];
+    const r = L.radius + LANDMARK_INHERIT_R;
+    if (x - r < bx0) bx0 = x - r;
+    if (z - r < bz0) bz0 = z - r;
+    if (x + r > bx1) bx1 = x + r;
+    if (z + r > bz1) bz1 = z + r;
+    if (L.minH * LANDMARK_INHERIT_H < minH) minH = L.minH * LANDMARK_INHERIT_H;
+  }
+  const near = [];
+  for (let i = 0; i < n; i++) {
+    if (hA[i] < minH) continue;
+    if (cxA[i] < bx0 || cxA[i] > bx1 || czA[i] < bz0 || czA[i] > bz1) continue;
+    near.push(i);
+  }
+
+  const claim = new Array(n).fill(null);
+  for (let q = 0; q < near.length; q++) {
+    const i = near[q];
     let best = null, bestScore = Infinity;
     for (let k = 0; k < pts.length; k++) {
       const { L, x, z } = pts[k];
-      if (b.h < L.minH) continue;
-      const d = Math.hypot(b.cx - x, b.cz - z);
+      if (hA[i] < L.minH) continue;
+      const d = Math.hypot(cxA[i] - x, czA[i] - z);
       if (d > L.radius) continue;
-      const hd = Math.abs(b.h - L.h) / L.h;
+      const hd = Math.abs(hA[i] - L.h) / L.h;
       if (hd > L.tol) continue;
       const score = hd * 2.0 + d / L.radius;
       if (score < bestScore) { bestScore = score; best = L; }
@@ -65,15 +103,15 @@ function assignLandmarks(buildings, project) {
   }
   // One non-cascading expansion pass: stacked massing slabs of a claimed tower inherit its material.
   const seeds = [];
-  for (let i = 0; i < claim.length; i++) if (claim[i]) seeds.push(i);
-  for (let i = 0; i < buildings.length; i++) {
+  for (let q = 0; q < near.length; q++) if (claim[near[q]]) seeds.push(near[q]);
+  for (let q = 0; q < near.length; q++) {
+    const i = near[q];
     if (claim[i]) continue;
-    const b = buildings[i];
     for (let s = 0; s < seeds.length; s++) {
-      const o = buildings[seeds[s]];
-      if (b.h < o.h * LANDMARK_INHERIT_H) continue;
-      if (Math.hypot(b.cx - o.cx, b.cz - o.cz) > LANDMARK_INHERIT_R) continue;
-      claim[i] = claim[seeds[s]];
+      const o = seeds[s];
+      if (hA[i] < hA[o] * LANDMARK_INHERIT_H) continue;
+      if (Math.hypot(cxA[i] - cxA[o], czA[i] - czA[o]) > LANDMARK_INHERIT_R) continue;
+      claim[i] = claim[o];
       break;
     }
   }

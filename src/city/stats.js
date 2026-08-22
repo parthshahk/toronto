@@ -22,6 +22,10 @@ function makeCityStats() {
   return {
     buildings: 0, verts: 0, tris: 0, roads: 0, rings: 0, ringsSkipped: 0,
     capFail: 0, seconds: 0, meshes: {},
+    // WHERE THE LOAD SPENT ITS TIME, one entry per named phase, in milliseconds. Excluded from
+    // the fingerprint by name (every key ending in `Ms` is), because a wall clock is the one part
+    // of a build that cannot reproduce. See makePhaseTimer() below.
+    phaseMs: {},
     // Facade audit: how many buildings each material family and lighting profile claimed, and
     // how many took a surveyed OSM colour rather than a hashed one.
     materials: {}, profiles: [0, 0, 0, 0, 0, 0], surveyedColour: 0,
@@ -145,4 +149,31 @@ function makeCityStats() {
   };
 }
 
-export { makeCityStats };
+/**
+ * A wall clock over the named phases of a load.
+ *
+ * The loader calls `at(name)` after each phase; the time since the previous call is added to
+ * `stats.phaseMs[name]`. `skip()` restarts the clock without attributing anything, which is what
+ * a cooperative yield wants — the frame the browser took back is not the phase's cost. Entries
+ * accumulate, so a phase that runs in several pieces (or once per tile) totals correctly.
+ *
+ * This is a MEASUREMENT, not a control: nothing in the tree branches on it, and the whole map is
+ * excluded from tools/fingerprint.mjs by the `Ms` suffix rule.
+ */
+function makePhaseTimer(stats, clock) {
+  const now = typeof clock === 'function' ? clock : () => Date.now();
+  const into = stats.phaseMs;
+  let last = now();
+  return {
+    at(name) {
+      const t = now();
+      into[name] = (into[name] || 0) + (t - last);
+      last = t;
+    },
+    skip() { last = now(); },
+    /** Attribute an externally measured span, for a phase that times itself. */
+    add(name, ms) { into[name] = (into[name] || 0) + ms; },
+  };
+}
+
+export { makeCityStats, makePhaseTimer };

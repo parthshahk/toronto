@@ -252,23 +252,37 @@ vec3 vhSkyIrradiance(vec3 N, vec3 zen, vec3 hor, vec3 west, vec3 sunDir, vec3 gn
 }
 
 // --- local grade ----------------------------------------------------------------------------
-// Downtown Toronto rises about 30 m from the lake up to Queen St, so "height above the street"
-// is NOT world Y: at King & Bay grade sits near 16 m, at the ferry docks near 2 m. The shopfront
-// band, the parking decks, the street-lamp spill and the contact darkening all need the local
-// figure, and there is no terrain sampler in the fragment stage.
+// Toronto climbs off the lake plain and keeps climbing, so "height above the street" is NOT world
+// Y: grade is near 2 m at the ferry docks, 10 m at King and Bay, 25 m on University at Gerrard,
+// 74 m at Casa Loma and 120 m at the Eglinton edge. The shopfront band, the parking decks, the
+// street-lamp spill and the contact darkening are all placed by this, and there is no terrain
+// sampler in the fragment stage.
 //
-// This is a least-squares cubic fitted (offline, against data/toronto.json) to the base elevation
-// of all 4,818 building records. Residual against the retail stock that actually uses it:
-// 0.73 m RMS, 1.10 m at p90, 2.51 m at p99 — comfortably inside the metre-scale soft edges every
-// consumer below applies. x and z are in KILOMETRES to keep the cubic terms well conditioned.
+// A least-squares cubic in (x, z), fitted offline against the base elevation of every building
+// record in data/toronto.json. x and z are in KILOMETRES to keep the cubic terms conditioned.
+//
+// REFITTED FOR OLD TORONTO, and honestly worse than it was. The downtown fit ran over 4,818
+// records in a 6.8 km box with 30 m of relief and landed at 0.73 m RMS. This one runs over
+// 181,426 records in a 17.3 km box with 120 m of relief and lands at 8.77 m RMS (5.25 m median,
+// 14.2 m at p90) — because Toronto's relief is not a smooth bowl, it is a lake plain, a step at
+// the Davenport escarpment, and a ramp behind it, and no cubic follows a step. It is close in the
+// built-up core (1.3 m under at King and Bay, 2.2 m over on University) and worst on the
+// escarpment crest itself (15 m under at Casa Loma).
+//
+// It is kept because the alternative is much worse, not because it is good: the downtown
+// coefficients extrapolated over this box read 27 m at Casa Loma against a real 74 m, and the old
+// 32 m clamp made every point above 32 m wrong by construction, which switched the contact
+// darkening and the lamp spill off across the whole northern half of the city. The real fix is a
+// terrain sampler in the fragment stage — a small R16 height texture and one texture read - and
+// that is the open item this comment exists to name.
 float vhGroundApprox(vec2 xz) {
   float x = xz.x * 0.001;
   float z = xz.y * 0.001;
-  float g = 8.31393 + z * (-7.83471 + z * (1.32740 + z * -0.29971));
-  g += x * (-4.36553 + z * (2.26119 + z * 0.39096));
-  g += x * x * (-0.36846 + z * -0.85491);
-  g += x * x * x * 0.00940;
-  return clamp(g, 0.0, 32.0);
+  float g = 42.52959 + z * (-11.86915 + z * (-0.34223 + z * 0.07247));
+  g += x * (-4.84836 + z * (-0.35422 + z * -0.08041));
+  g += x * x * (-0.08508 + z * -0.01240);
+  g += x * x * x * 0.06143;
+  return clamp(g, 0.0, 125.0);
 }
 
 // --- interior light palette ------------------------------------------------------------------

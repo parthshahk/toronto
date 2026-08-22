@@ -78,37 +78,29 @@ function nearestOnSeg(px, pz, ax, az, bx, bz) {
   return _seg;
 }
 
-/** A footprint index over the RAW rings, so the terminus pass can run before buildParts(). */
-function makeFootprintProbe(buildingsRaw, extent) {
-  const cell = 64;
-  const x0 = -extent.x / 2 - 600, z0 = -extent.z / 2 - 600;
-  const nx = Math.ceil((extent.x + 1200) / cell) + 1;
-  const nz = Math.ceil((extent.z + 1200) / cell) + 1;
-  const idx = makeGridIndex(cell, x0, z0, nx, nz);
-  for (let i = 0; i < buildingsRaw.length; i++) {
-    const b = buildingsRaw[i];
-    if (!b || !Array.isArray(b.r) || !b.r.length || !(isNum(b.h) && b.h > 0.5)) continue;
-    const ring = b.r[0];
-    if (!Array.isArray(ring) || ring.length < 3) continue;
-    let bx0 = Infinity, bz0 = Infinity, bx1 = -Infinity, bz1 = -Infinity;
-    for (let k = 0; k < ring.length; k++) {
-      const p = ring[k];
-      if (!isNum(p[0]) || !isNum(p[1])) continue;
-      if (p[0] < bx0) bx0 = p[0];
-      if (p[0] > bx1) bx1 = p[0];
-      if (p[1] < bz0) bz0 = p[1];
-      if (p[1] > bz1) bz1 = p[1];
-    }
-    if (!(bx0 <= bx1)) continue;
-    idx.add(bx0, bz0, bx1, bz1, { r: b.r, bb: [bx0, bz0, bx1, bz1] });
-  }
+/**
+ * The footprint probe, over the RAW rings, so the terminus pass can run before buildParts().
+ *
+ * `rawNear(x, z, r, visit)` enumerates the candidate records, handing each one its FIRST RING's
+ * box — not the record's full extent, because a stacked massing slab's other rings are
+ * deliberately outside it and this probe's answer depends on that. city/prep.js's placement pass
+ * already measured both, so this no longer builds a whole-city footprint index of its own. It used
+ * to, and that index was the one piece of the dangling-end pass whose cost was a function of
+ * BUILDING count rather than of way count — a walk over every footprint in the city, in front of
+ * the first frame, to answer a few thousand questions with a 3.6 m radius.
+ *
+ * The enumeration is a SUPERSET of what that index held (it is filed under every ring's box rather
+ * than the first one's), so the first-ring rejection is applied here, per candidate, instead of at
+ * insertion.
+ */
+function makeFootprintProbe(rawNear) {
   return {
     /** Distance from a point to the nearest footprint edge, capped at `r`. */
     near(x, z, r) {
       let best = r * r;
-      idx.query(x, z, r, (rec) => {
-        const bb = rec.bb;
-        if (x < bb[0] - r || x > bb[2] + r || z < bb[1] - r || z > bb[3] + r) return;
+      rawNear(x, z, r, (rec, bb, o) => {
+        if (!(bb[o] <= bb[o + 2])) return;
+        if (x < bb[o] - r || x > bb[o + 2] + r || z < bb[o + 1] - r || z > bb[o + 3] + r) return;
         for (let g = 0; g < rec.r.length; g++) {
           const ring = rec.r[g];
           if (!Array.isArray(ring) || ring.length < 3) continue;
@@ -127,8 +119,9 @@ function makeFootprintProbe(buildingsRaw, extent) {
       const mx = (ax + bx) * 0.5, mz = (az + bz) * 0.5;
       const r = Math.hypot(bx - ax, bz - az) * 0.5 + 1;
       let hit = false;
-      idx.query(mx, mz, r, (rec) => {
+      rawNear(mx, mz, r, (rec, bb, o) => {
         if (hit) return false;
+        if (!(bb[o] <= bb[o + 2])) return;
         for (let g = 0; g < rec.r.length; g++) {
           const ring = rec.r[g];
           if (!Array.isArray(ring) || ring.length < 3) continue;
@@ -166,11 +159,11 @@ function termCompatible(a, b) {
  * MUTATES the raw polylines. Returns the list of designed termini that still have to be BUILT —
  * turning heads, barrier lines and buffer stops — for the tile builder to emit.
  */
-function resolveTermini(roadsRaw, railsRaw, buildingsRaw, extent, stats) {
+function resolveTermini(roadsRaw, railsRaw, rawNear, extent, stats) {
   const E = stats.edge;
   const t0 = now();
   const EX = extent.x / 2, EZ = extent.z / 2;
-  const probe = makeFootprintProbe(buildingsRaw, extent);
+  const probe = makeFootprintProbe(rawNear);
 
   // --- 1. every ground-level linear feature, in one list ---------------------
   const feats = [];
@@ -310,16 +303,33 @@ function resolveTermini(roadsRaw, railsRaw, buildingsRaw, extent, stats) {
   const gx0 = -EX - 500, gz0 = -EZ - 500;
   const idxNX = Math.ceil((extent.x + 1000) / 28) + 1;
   const idxNZ = Math.ceil((extent.z + 1000) / 28) + 1;
+  // THE SEGMENT TABLE, flat. The index holds an ORDINAL into `SX`/`SF` rather than a five-element
+  // array literal per segment: this is built twice over every way in the city, which downtown is
+  // 176,000 short-lived arrays and over Old Toronto a million, none of which outlive the pass.
+  // Iteration order — cells in order, members in insertion order — is untouched, and section 4b
+  // below walks the buckets directly, so the enumeration is the same one, allocating nothing.
+  let SX = new Float64Array(0);
+  let SF = new Int32Array(0);
   const buildSegIdx = () => {
     const idx = makeGridIndex(28, gx0, gz0, idxNX, idxNZ);
+    let cap = 0;
+    for (let f = 0; f < feats.length; f++) {
+      const p = feats[f].raw.p;
+      if (p.length > 1) cap += p.length - 1;
+    }
+    if (SX.length < cap * 4) { SX = new Float64Array(cap * 4); SF = new Int32Array(cap); }
+    let ns = 0;
     for (let f = 0; f < feats.length; f++) {
       const p = feats[f].raw.p;
       for (let k = 1; k < p.length; k++) {
         const a = p[k - 1], b = p[k];
         if (!isNum(a[0]) || !isNum(b[0])) continue;
+        const o = ns * 4;
+        SX[o] = a[0]; SX[o + 1] = a[1]; SX[o + 2] = b[0]; SX[o + 3] = b[1];
+        SF[ns] = f;
         idx.add(Math.min(a[0], b[0]) - 1, Math.min(a[1], b[1]) - 1,
-          Math.max(a[0], b[0]) + 1, Math.max(a[1], b[1]) + 1,
-          [f, a[0], a[1], b[0], b[1]]);
+          Math.max(a[0], b[0]) + 1, Math.max(a[1], b[1]) + 1, ns);
+        ns++;
       }
     }
     return idx;
@@ -346,11 +356,12 @@ function resolveTermini(roadsRaw, railsRaw, buildingsRaw, extent, stats) {
     if (probe.near(t.x, t.z, TERM_BUILDING) < TERM_BUILDING) continue;
     let bestD = TERM_REACH, bestF = -1, bx = 0, bz = 0;
     segIdx.query(t.x, t.z, TERM_REACH, (rec) => {
-      const of = rec[0];
+      const of = SF[rec];
       if (of === t.f) return;
       const O = feats[of];
       if (!termCompatible(t.F, O)) return;
-      const s = nearestOnSeg(t.x, t.z, rec[1], rec[2], rec[3], rec[4]);
+      const o = rec * 4;
+      const s = nearestOnSeg(t.x, t.z, SX[o], SX[o + 1], SX[o + 2], SX[o + 3]);
       const d = Math.sqrt(s.d2);
       if (d >= bestD || d < 1e-4) return;
       // Ahead, or close enough beside that the gap is obviously a survey artifact.
@@ -403,28 +414,30 @@ function resolveTermini(roadsRaw, railsRaw, buildingsRaw, extent, stats) {
       if (!arr || arr.length < 2) continue;
       const ci = c % nxi, cj = (c / nxi) | 0;
       for (let a = 0; a < arr.length; a++) {
-        const ra = arr[a];
-        const A = feats[ra[0]];
+        const oa = arr[a] * 4, fa = SF[arr[a]];
+        const A = feats[fa];
         if (A.rail || !WALK_CLASS[A.cls]) continue;
+        const ra1 = SX[oa], ra2 = SX[oa + 1], ra3 = SX[oa + 2], ra4 = SX[oa + 3];
         for (let b = a + 1; b < arr.length; b++) {
-          const rb = arr[b];
-          if (ra[0] === rb[0]) continue;
-          const B = feats[rb[0]];
+          const ob = arr[b] * 4, fbi = SF[arr[b]];
+          if (fa === fbi) continue;
+          const B = feats[fbi];
           if (B.rail || !WALK_CLASS[B.cls]) continue;
           if (level(A) !== level(B)) continue;
-          const d = (ra[3] - ra[1]) * (rb[4] - rb[2]) - (ra[4] - ra[2]) * (rb[3] - rb[1]);
+          const rb1 = SX[ob], rb2 = SX[ob + 1], rb3 = SX[ob + 2], rb4 = SX[ob + 3];
+          const d = (ra3 - ra1) * (rb4 - rb2) - (ra4 - ra2) * (rb3 - rb1);
           if (Math.abs(d) < 1e-9) continue;
-          const t = ((rb[1] - ra[1]) * (rb[4] - rb[2]) - (rb[2] - ra[2]) * (rb[3] - rb[1])) / d;
-          const u = ((rb[1] - ra[1]) * (ra[4] - ra[2]) - (rb[2] - ra[2]) * (ra[3] - ra[1])) / d;
+          const t = ((rb1 - ra1) * (rb4 - rb2) - (rb2 - ra2) * (rb3 - rb1)) / d;
+          const u = ((rb1 - ra1) * (ra4 - ra2) - (rb2 - ra2) * (ra3 - ra1)) / d;
           if (t < 0 || t > 1 || u < 0 || u > 1) continue;
-          const cxp = ra[1] + (ra[3] - ra[1]) * t, czp = ra[2] + (ra[4] - ra[2]) * t;
+          const cxp = ra1 + (ra3 - ra1) * t, czp = ra2 + (ra4 - ra2) * t;
           if (segIdx.ci(cxp) !== ci || segIdx.cj(czp) !== cj) continue;
           // Already sharing a node there? Then the weld has it and nothing is missing.
-          if (Math.hypot(ra[1] - cxp, ra[2] - czp) < 0.9) continue;
-          if (Math.hypot(ra[3] - cxp, ra[4] - czp) < 0.9) continue;
-          if (Math.hypot(rb[1] - cxp, rb[2] - czp) < 0.9) continue;
-          if (Math.hypot(rb[3] - cxp, rb[4] - czp) < 0.9) continue;
-          for (const f of [ra[0], rb[0]]) {
+          if (Math.hypot(ra1 - cxp, ra2 - czp) < 0.9) continue;
+          if (Math.hypot(ra3 - cxp, ra4 - czp) < 0.9) continue;
+          if (Math.hypot(rb1 - cxp, rb2 - czp) < 0.9) continue;
+          if (Math.hypot(rb3 - cxp, rb4 - czp) < 0.9) continue;
+          for (const f of [fa, fbi]) {
             const list = pend.get(f);
             if (list) list.push([cxp, czp]);
             else pend.set(f, [[cxp, czp]]);

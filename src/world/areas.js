@@ -29,7 +29,7 @@ import { MAX_BOATS } from './marine.js';
  * @returns {Promise<Array>} every area part, in file order, for the tile index to file.
  */
 async function prepareAreas(W) {
-  const { areasRaw, prepped, C, HARBOUR, cap, extent, report } = W;
+  const { areasRaw, prep, C, HARBOUR, cap, extent, report, buriedOf } = W;
 
   // Parks, grass, surface lots and piers, prepared but not filled. Each PART is indexed
   // separately: a park mapped as three polygons belongs in three tiles, not one.
@@ -103,22 +103,35 @@ async function prepareAreas(W) {
     big.sort((p, q) => Math.abs(planArea(q.outer)) - Math.abs(planArea(p.outer)));
     for (let i = 0; i < Math.min(MAX_CRANES, big.length); i++) big[i].crane = true;
 
+    // THE CROWN SIGNS. Ranked over the whole city, resolved over almost none of it.
+    //
+    // Which towers carry a crown sign is a global decision — the tallest few with real street
+    // frontage — and it used to be taken by walking every prepared record in the city. Nothing is
+    // prepared yet, so the ranking is taken over the PLACEMENT arrays instead: `prep.heightOf`
+    // and the first-ring centroid exist for every record from the moment the load starts, and
+    // they are exactly the two numbers the comparator reads. The list is then walked in that
+    // order and a record is prepared only when it is actually reached, which stops at the eighth
+    // sign — a couple of dozen records rather than 181,000.
+    //
+    // A crown sign must not be spent on a record that is inside somebody else's tower, and
+    // "inside" is a verdict city/coplanar.js reaches lazily; burial is a local question, so
+    // asking for it costs the handful of neighbours that record touches.
     const tall = [];
-    for (let i = 0; i < prepped.length; i++) {
-      const b = prepped[i];
-      if (!b.parts || b.buried || b.landmark === 'cn' || b.h < 108) continue;
-      tall.push(b);
-    }
-    tall.sort((p, q) => (q.h - p.h) || (p.cx - q.cx));
-    // A tower only carries crown signage if it has real street frontage to hang it on, and the
-    // facade pass does not run until the tile is built. Resolve the frontage HERE, for the
-    // hundred tallest candidates only, so the eight that get a sign are the eight the old
-    // single-pass build would have chosen and not whichever happen to be built first.
+    for (let i = 0; i < prep.count; i++) if (prep.heightOf(i) >= 108) tall.push(i);
+    tall.sort((p, q) => (prep.heightOf(q) - prep.heightOf(p)) ||
+      (prep.centreXOf(p) - prep.centreXOf(q)));
     let signs = 0;
     for (let i = 0; i < tall.length && signs < MAX_TOWER_SIGNS; i++) {
-      findFrontage(C, tall[i]);
-      if (tall[i].frontLen < 7) continue;
-      tall[i].towerSign = signs++;
+      const b = prep.ready(tall[i]);
+      if (!b.parts || b.landmark === 'cn') continue;
+      if (typeof buriedOf === 'function' ? buriedOf(b) : b.buried) continue;
+      // A tower only carries crown signage if it has real street frontage to hang it on, and the
+      // facade pass does not run until the tile is built. Resolve the frontage HERE so the eight
+      // that get a sign are the eight a single up-front pass would have chosen and not whichever
+      // happen to be built first.
+      findFrontage(C, b);
+      if (b.frontLen < 7) continue;
+      b.towerSign = signs++;
     }
   }
   await frame();

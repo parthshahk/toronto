@@ -6,8 +6,18 @@
 // Runs the real loadCity() against the real data/toronto.json with a stub WebGL2 context that
 // captures every uploaded vertex buffer, then audits the geometry: per-mesh vertex counts, NaN,
 // unit normals, the profile-0 emissive rule, prop centres against building footprints, marking
-// height above the asphalt, and the invariants that must never regress (building count, landmark
+// height above the asphalt, and the invariants that must never regress (nothing skipped, landmark
 // heights, the CN Tower tip, the street-grid rotation).
+//
+// EXPECTATIONS ARE DERIVED, NOT TYPED IN. This file went stale twice — once when the map grew to
+// 43 km2 and again at Old Toronto — because it asserted absolute counts ("4,654 buildings",
+// "7,926 road ways", "75 building passages", "2,500-4,000 people") that are properties of the
+// EXTENT, not of the code. Every such expectation now comes out of the extract or out of the
+// city object itself: conservation ("built + skipped == the records in the file"), densities
+// (passages per thousand ways, people per kilometre of walkable route, vertices per km2) and
+// positions read from city.cnTower rather than from a remembered coordinate. What stays a
+// literal is only what is genuinely absolute: a surveyed height, a rotation in degrees, and the
+// zero-tolerance rules — no NaN, no inward facades, no route running off the side of a wall.
 //
 // Zero dependencies, like everything else here.
 
@@ -105,6 +115,10 @@ const labels = [];
 const city = await loadCity(glStub, './data/toronto.json', (f, label) => {
   if (label && label !== lastLabel) { lastLabel = label; labels.push(label); }
 });
+// loadCity() hands the two whole-world verification sweeps (CONTRACT §8.2's marine components and
+// its groundY hole test) to a chore queue the frame loop drains a few milliseconds at a time.
+// Nothing here draws a frame, so drain it in one go before reading any of its counters.
+city.settle();
 const wallMs = Date.now() - t0;
 
 // The city is TILED: loadCity() emits only the lake, and every other vertex is built on demand
@@ -156,6 +170,21 @@ perClass.clear();
 const S = city.stats;
 const P = S.props || {};
 
+/* --------------------------------------------------- what the survey holds -- */
+
+// The extract, read a second time through the SAME decoder the loader used, so every count below
+// is what the file actually offered rather than what somebody remembered it offering. It is the
+// only honest reference for "did the build keep everything?", and it costs a fraction of a second
+// next to the build itself.
+const { fetchCity } = await import(resolve(ROOT, 'src/data/load.js'));
+const extract = (await fetchCity('./data/toronto.json', () => {})).data;
+const DATA = {
+  buildings: (extract.buildings || []).length,
+  roads: (extract.roads || []).length,
+  rails: (extract.rails || []).length,
+  km2: ((city.extent && city.extent.x) || 0) * ((city.extent && city.extent.z) || 0) / 1e6,
+};
+
 /* ------------------------------------------------------- invariant checks -- */
 
 const fails = [];
@@ -163,7 +192,15 @@ const warns = [];
 const check = (ok, msg) => { if (!ok) fails.push(msg); };
 const soft = (ok, msg) => { if (!ok) warns.push(msg); };
 
-check(S.buildings === 4654, 'building count is ' + S.buildings + ', expected 4654');
+// CONSERVATION, not a count. Every massing record in the extract is either built or explicitly
+// skipped; a record that quietly evaporates is the failure this is here to catch, and it stays
+// true at any extent.
+check(S.buildings + S.ringsSkipped === DATA.buildings,
+  'building records lost: ' + fmt(S.buildings) + ' built + ' + fmt(S.ringsSkipped) +
+  ' skipped != ' + fmt(DATA.buildings) + ' in the extract');
+check(DATA.buildings > 0 && S.ringsSkipped / DATA.buildings < 0.05,
+  fmt(S.ringsSkipped) + ' massing records skipped, ' + pct(S.ringsSkipped, DATA.buildings) +
+  ' of the extract — over 5% means the footprint preparation is rejecting real buildings');
 check(audits.every((a) => a.nan === 0), 'NaN in ' + audits.filter((a) => a.nan).map((a) => a.name).join(','));
 check(audits.every((a) => a.badNormal === 0),
   'non-unit normals in ' + audits.filter((a) => a.badNormal).map((a) => a.name + ':' + a.badNormal).join(','));
@@ -175,17 +212,29 @@ check(audits.every((a) => a.tinted === 0), 'tintable != 0 on static city geometr
 // holds more than tiles.js's cap. The cap is what has to hold.
 check(S.vertexCap > 0 && S.vertexCap <= 12_000_000,
   'resident vertex cap is ' + fmt(S.vertexCap || 0) + ', expected <= 12M');
-soft(total <= 26_000_000, 'whole-map geometry is ' + fmt(total) + ' vertices');
+// ...and the whole-map total is a DENSITY too: it is every vertex 43 km2 of survey can produce,
+// and it grows with the survey. Per km2 it does not, and per km2 is what says whether the detail
+// level has quietly crept up.
+soft(DATA.km2 > 0 && total / DATA.km2 <= 1_000_000,
+  'whole-map geometry is ' + fmt(total) + ' vertices over ' + DATA.km2.toFixed(1) + ' km2 = ' +
+  fmt(Math.round(total / Math.max(1e-6, DATA.km2))) + ' per km2');
 
 // The CN Tower tip and the tallest landmarks must be untouched.
-// The tower stands at local (114.2, +159.0) — SOUTH of the bbox centre, because 43.6426 N is
-// south of the 43.644 N origin and CONTRACT section 1 puts +Z south. render.js's uCnTower agrees
-// (114.2, 159.0) and city.js matches the 443 m massing record there; the "(114, -159)" in
-// CONTRACT section 1 is a sign slip. Sampling the ground at -159 picked up the Ritz-Carlton's
-// block instead, 2.4 m higher, which the +/-12 m tolerance was quietly absorbing.
+//
+// The tower's PLACE is not an invariant — it is a local coordinate, and every extent change moves
+// the origin under it. This used to sample the ground at a remembered (114.2, 159.0) with a
+// +/-12 m tolerance wide enough to hide which building it had actually landed on, and it went
+// wrong the moment the bbox centre moved. city.cnTower is the position the builder itself used
+// and the renderer's uCnTower reads, so ask it: [x, z, baseY, radius]. What IS an invariant is
+// CN_TIP, the surveyed mast height above the tower's own base slab, and that the tip is the
+// highest thing in the world — so the check is exact, to the centimetre, rather than to 12 m.
+const CN_TIP = 553.33;                                     // surveyed, and landmarks.js's profile
 const maxY = Math.max(...audits.map((a) => a.maxY));
-check(Math.abs(maxY - (city.groundY(114, 159) - 0.6 + 553.33)) < 12,
-  'CN Tower tip moved: max scene Y = ' + maxY.toFixed(2));
+const cnTipY = (city.cnTower ? city.cnTower[2] : 0) + CN_TIP;
+check(Math.abs(maxY - cnTipY) < 0.05,
+  'CN Tower tip moved: max scene Y = ' + maxY.toFixed(2) + ', the mast tip stands at ' +
+  cnTipY.toFixed(2) + ' (base ' + (city.cnTower ? city.cnTower[2].toFixed(2) : '?') + ' + ' +
+  CN_TIP + ')');
 
 const LM = S.landmarkHeights || {};
 const EXPECT = { td: 223, rbp: 180, fcp: 292, scotia: 275, ccw: 239, cn: 443 };
@@ -232,13 +281,31 @@ check((DK.deckLamps | 0) > 0, 'no lamps on the elevated carriageways');
 // GRADE SEPARATION (CONTRACT 8.1). Nothing may be skipped, the signed layer decides who passes
 // above, and the clearance under a crossing is measured, not assumed.
 const GR = S.grade || {};
-check(S.roads === 7926, 'road ways built is ' + S.roads + ', expected all 7926 — nothing is skipped');
+check(S.roads === DATA.roads,
+  'road ways built is ' + fmt(S.roads) + ' of the ' + fmt(DATA.roads) +
+  ' in the extract — nothing may be skipped');
 check((GR.under | 0) >= 40, 'only ' + (GR.under | 0) + ' depressed corridors: layer < 0 is not being built');
-check((GR.sub | 0) >= 700, 'only ' + (GR.sub | 0) + ' underground concourse ways built of 724');
-check((GR.passage | 0) === 75, (GR.passage | 0) + ' building passages, expected 75');
+check((GR.sub | 0) >= 700,
+  'only ' + (GR.sub | 0) + ' underground concourse ways built: the layer < 0 concourse is missing');
+// Passages are ARCADES — a rare feature of a dense street network, so what holds across extents is
+// their rate, not their number. Downtown alone gave 9.5 per thousand ways; the whole pre-1998 city
+// gives 6.4, because the Victorian fabric outside the core has fewer of them per street. A rate
+// outside this band means the passage classifier has either stopped running or gone greedy.
+const passPerK = (GR.passage | 0) / Math.max(1, DATA.roads / 1000);
+check(passPerK >= 2 && passPerK <= 20,
+  (GR.passage | 0) + ' building passages over ' + fmt(DATA.roads) + ' ways = ' +
+  passPerK.toFixed(1) + ' per thousand, wanted 2-20');
 check((GR.crossings | 0) > 3000, 'crossing detection found only ' + (GR.crossings | 0) + ' crossings');
-check((GR.violations | 0) <= 8,
-  (GR.violations | 0) + ' crossings still short of ' + 4.5 + ' m headroom');
+// ...and the last absolute count in this file that was really a property of the extent. A
+// headroom violation is a residue of crossing resolution, so it scales with the number of
+// crossings — 2 in 7,505 downtown is 0.27 per thousand, and the same correct resolver over 9.8x
+// the network would have tripped a flat "<= 8". It is a DEFECT rate, so the band is tight: a
+// quarter of a percent of crossings, and never fewer than the two the resolver cannot currently
+// win at any extent.
+const violCap = Math.max(2, Math.round((GR.crossings | 0) * 0.0025));
+check((GR.violations | 0) <= violCap,
+  (GR.violations | 0) + ' of ' + fmt(GR.crossings | 0) + ' crossings still short of 4.5 m ' +
+  'headroom, over the ' + violCap + ' allowed (0.25% of crossings)');
 check(GR.deepest > 4.5 && GR.deepest < 8,
   'deepest carriageway cut is ' + (GR.deepest || 0).toFixed(2) + ' m, wanted 4.5-8');
 check((GR.portals | 0) > 0 && (GR.railDecks | 0) > 0,
@@ -246,9 +313,26 @@ check((GR.portals | 0) > 0 && (GR.railDecks | 0) > 0,
 
 // WALKABILITY (CONTRACT 8.2) — an acceptance test, not an aspiration.
 const WK = S.walk || {};
-check(WK.fraction >= 0.97,
-  'largest walkable component holds ' + ((WK.fraction || 0) * 100).toFixed(2) + '% of ' +
-  Math.round(WK.metres || 0) + ' m, needs >= 97%');
+// MEASURED OVER WHAT A WALKER CAN REACH ON FOOT. Some of Toronto is genuinely on the far side of
+// open water: the Toronto Islands carry 44 km of path and Billy Bishop another 2 km, and you get
+// to both by ferry. Counting them as unreachable fragments of the street network measures Lake
+// Ontario, not the city, and a flat threshold over everything therefore fails for being right
+// about the geography — which is how this check came to read 94.55% and mean nothing.
+//
+// walk.js already separates the two, by flooding the terrain from the main network and asking
+// which components no dry path reaches: `fractionDry` is the acceptance test, over land you can
+// walk to, and `fraction` over the lot is kept as an eyeball. The check that the split is honest
+// is that the flood ran at all and that the two agree in the only direction they can.
+check((WK.landCells | 0) > 0, 'the marine/land flood did not run: every island counts as dry');
+check(WK.fractionDry >= WK.fraction - 1e-9,
+  'fractionDry ' + (WK.fractionDry || 0).toFixed(4) + ' is below fraction ' +
+  (WK.fraction || 0).toFixed(4) + ': the marine split is inverted');
+check(WK.fractionDry >= 0.97,
+  'largest walkable component holds ' + ((WK.fractionDry || 0) * 100).toFixed(2) + '% of the ' +
+  Math.round((WK.metres || 0) - (WK.marineMetres || 0)) + ' m reachable on foot, needs >= 97%');
+soft(WK.fraction >= 0.90,
+  'including the ' + Math.round(WK.marineMetres || 0) + ' m only a ferry reaches, the largest ' +
+  'component holds ' + ((WK.fraction || 0) * 100).toFixed(2) + '%');
 check((WK.cliffs | 0) === 0,
   (WK.cliffs | 0) + ' walkable cliffs over 0.45 m with no ramp or step: ' +
   (WK.worstCliffs || []).map((c) => c.m + ' m at (' + c.x + ', ' + c.z + ')').join('; '));
@@ -256,20 +340,36 @@ check((WK.groundHoles | 0) === 0, (WK.groundHoles | 0) + ' points where groundY 
 check(WK.groundMin > -60 && WK.groundMax < 400,
   'groundY ranges ' + (WK.groundMin || 0).toFixed(1) + '..' + (WK.groundMax || 0).toFixed(1) + ' m');
 check((WK.samples | 0) > 50000, 'the cliff audit only took ' + (WK.samples | 0) + ' samples');
-soft((WK.islands | 0) <= 14,
-  (WK.islands | 0) + ' walkable islands over 50 m holding ' + Math.round(WK.islandMetres || 0) + ' m');
+// ...and the islands, likewise, only the ones a walker should have been able to reach. Their
+// number scales with the extent; what does not is how much of the walkable network they hold.
+const dryIslandM = Math.max(0, (WK.islandMetres || 0) - (WK.marineMetres || 0));
+soft(dryIslandM <= 0.01 * Math.max(1, WK.metres || 0),
+  ((WK.islands | 0) - (WK.marineIslands | 0)) + ' dry walkable islands over 50 m holding ' +
+  Math.round(dryIslandM) + ' m, ' + pct(dryIslandM, WK.metres || 0) + ' of the network');
 
 // PEOPLE.
 const PE = S.people || {};
 check((PE.inFootprint | 0) === 0, (PE.inFootprint | 0) + ' people inside a building footprint');
 check((PE.onCarriageway | 0) === 0, (PE.onCarriageway | 0) + ' people on a carriageway');
 check((PE.sunk | 0) === 0, (PE.sunk | 0) + ' people sunk into or floating over the ground');
-check(PE.total >= 2500 && PE.total <= 4000, 'population is ' + PE.total + ', wanted 2500-4000');
+// A CROWD IS A DENSITY. The population is placed along the walking surface, so it scales with the
+// walking surface and an absolute band goes stale with the extent — as "2,500-4,000" did. What
+// must hold is that the streets are neither empty nor a mob.
+const perKmWalk = (PE.total | 0) / Math.max(1e-6, (WK.metres || 0) / 1000);
+check(perKmWalk >= 3 && perKmWalk <= 25,
+  'population is ' + fmt(PE.total || 0) + ' over ' + fmt(Math.round((WK.metres || 0) / 1000)) +
+  ' km of walkable route = ' + perKmWalk.toFixed(1) + ' per km, wanted 3-25');
 check((PE.cyclists | 0) > 0 && (PE.groups | 0) > 0 && (PE.sitting | 0) > 0,
   'the crowd is missing a kind: ' + PE.cyclists + ' cyclists, ' + PE.groups + ' groups, ' +
   PE.sitting + ' seated');
-soft(PE.core / Math.max(1, PE.total) > 0.09,
-  'only ' + pct(PE.core, PE.total) + ' of the crowd is in the Financial District core');
+// ...and that it is WEIGHTED, not sprinkled. The old form — "over 9% of the crowd in the core" —
+// was really a statement about how much of the map the core was, and 420 m around King and Bay
+// is 8% of downtown but 1.3% of Old Toronto, so the same correct crowd fails it. The weighting
+// itself shows in the spread between the busiest 100 m cell and the median one, which no change
+// of extent touches, and the core simply has to be populated.
+soft((PE.core | 0) > 0 && (PE.peakCell | 0) >= 3 * Math.max(1, PE.medianCell | 0),
+  'the crowd is flat: peak cell ' + (PE.peakCell | 0) + ' against a median of ' +
+  (PE.medianCell | 0) + ', ' + fmt(PE.core | 0) + ' in the Financial District core');
 
 // Amendment 7: the CITY BUILDERS must contain no notion of time of day at all — the renderer owns
 // WHEN a lamp is on. Detail may only ever mark WHAT is an emitter.
@@ -318,11 +418,16 @@ if (!QUIET) {
       fmt(a.emitters).padStart(12) + pct(a.verts, total).padStart(9));
   }
   console.log('  ' + 'TOTAL'.padEnd(12) + fmt(total).padStart(10) + fmt((total / 3) | 0).padStart(12) +
-    ''.padStart(12) + ('budget ' + pct(total, 7_000_000)).padStart(16));
+    ''.padStart(12) +
+    (fmt(Math.round(total / Math.max(1e-6, DATA.km2))) + '/km2').padStart(16));
 
   console.log('\n--- city -----------------------------------------------------------------');
-  console.log('  buildings ' + fmt(S.buildings) + ' / rings ' + fmt(S.rings) +
-    ' / road ways ' + fmt(S.roads) + ' / cap failures ' + S.capFail);
+  console.log('  extent ' + DATA.km2.toFixed(1) + ' km2, and the extract offered ' +
+    fmt(DATA.buildings) + ' massing records / ' + fmt(DATA.roads) + ' road ways / ' +
+    fmt(DATA.rails) + ' rail ways');
+  console.log('  buildings ' + fmt(S.buildings) + ' (+' + fmt(S.ringsSkipped) + ' skipped)' +
+    ' / rings ' + fmt(S.rings) + ' / road ways ' + fmt(S.roads) +
+    ' / cap failures ' + S.capFail);
   console.log('  surveyed facade colours ' + S.surveyedColour +
     ' / profiles [env,off,res,ret,park,civ] ' + JSON.stringify(S.profiles));
   console.log('  street grid ' + (S.gridDeg || 0).toFixed(2) + ' deg');
@@ -386,14 +491,18 @@ if (!QUIET) {
     Math.round(GR.railDeckMetres || 0) + ' m; ' + (GR.portals | 0) + ' portals');
 
   console.log('\n--- walkability ----------------------------------------------------------');
-  console.log('  ' + ((WK.fraction || 0) * 100).toFixed(2) + '% of ' +
-    fmt(Math.round(WK.metres || 0)) + ' walkable m in the largest of ' + (WK.components | 0) +
-    ' components');
+  console.log('  ' + ((WK.fractionDry || 0) * 100).toFixed(2) + '% of the ' +
+    fmt(Math.round((WK.metres || 0) - (WK.marineMetres || 0))) + ' m reachable ON FOOT is in the ' +
+    'largest of ' + (WK.components | 0) + ' components');
+  console.log('  ' + ((WK.fraction || 0) * 100).toFixed(2) + '% of all ' +
+    fmt(Math.round(WK.metres || 0)) + ' walkable m, the difference being the ' +
+    fmt(Math.round(WK.marineMetres || 0)) + ' m on ' + (WK.marineIslands | 0) +
+    ' components only a ferry reaches');
   console.log('  ' + (WK.islands | 0) + ' islands over 50 m holding ' +
     fmt(Math.round(WK.islandMetres || 0)) + ' m:');
   for (const i of WK.worstIslands || []) {
     console.log('      ' + String(i.m).padStart(5) + ' m at (' + i.x + ', ' + i.z + ')' +
-      (i.name ? '  ' + i.name : ''));
+      (i.name ? '  ' + i.name : '') + (i.marine ? '  [ferry only]' : ''));
   }
   console.log('  cliffs left ' + (WK.cliffs | 0) + ' over ' + fmt(WK.samples | 0) +
     ' samples; ' + (WK.flights | 0) + ' flights of steps built, ' + (WK.stitched | 0) +

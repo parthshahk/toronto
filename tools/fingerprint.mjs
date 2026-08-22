@@ -295,6 +295,11 @@ const { loadCity } = await import(resolve(ROOT, 'src/city.js'));
 
 const wall0 = Date.now();
 const city = await loadCity(glStub, DATA_URL, () => {});
+// THE DEFERRED AUDITS. loadCity() now hands the two whole-world verification sweeps (CONTRACT
+// §8.2's marine components and its groundY hole test) to a chore queue the frame loop drains a
+// couple of milliseconds at a time. Nothing here draws a frame, so drain it in one go — the
+// fingerprint must cover every counter the city produces, whenever it produces it.
+city.settle();
 const S = city.stats;
 
 // The two meshes loadCity uploads itself: the lake and the surround apron. Neither is tiled,

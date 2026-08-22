@@ -163,7 +163,7 @@ function surroundVerts(mb) {
  * the float run it owns. Every triangle lands in exactly one tile, so nothing is dropped and
  * nothing is drawn twice.
  */
-function captureSplit(grid, cap, stageOf, tileChunks) {
+function* splitCapture(grid, cap, stageOf, tileChunks) {
   const VF = VERT_FLOATS;
   for (let c = 0; c < MESH_CLASSES.length; c++) {
     const name = MESH_CLASSES[c];
@@ -171,9 +171,12 @@ function captureSplit(grid, cap, stageOf, tileChunks) {
     const data = cap[name].data();
     const n = data.length;
     if (n < VF * 3) continue;
+    yield;
     const step = VF * 3;
     const count = new Map();
+    let since = 0;
     for (let i = 0; i + step <= n; i += step) {
+      if (++since >= SPLIT_TRIS_PER_YIELD) { since = 0; yield; }
       const x = (data[i] + data[i + VF] + data[i + VF * 2]) / 3;
       const z = (data[i + 2] + data[i + VF + 2] + data[i + VF * 2 + 2]) / 3;
       const id = grid.idAt(x, z);
@@ -182,7 +185,9 @@ function captureSplit(grid, cap, stageOf, tileChunks) {
     const buf = new Map();
     const at = new Map();
     for (const [id, tris] of count) { buf.set(id, new Float32Array(tris * step)); at.set(id, 0); }
+    since = 0;
     for (let i = 0; i + step <= n; i += step) {
+      if (++since >= SPLIT_TRIS_PER_YIELD) { since = 0; yield; }
       const x = (data[i] + data[i + VF] + data[i + VF * 2]) / 3;
       const z = (data[i + 2] + data[i + VF + 2] + data[i + VF * 2 + 2]) / 3;
       const id = grid.idAt(x, z);
@@ -209,9 +214,57 @@ function captureSplit(grid, cap, stageOf, tileChunks) {
         if (z > z1) z1 = z;
       }
       grid.cover(grid.tiles[id], x0, z0, x1, z1, y0, y1);
+      yield;
     }
     cap[name].reset();
   }
+}
+
+/** The same split, run to completion, for a caller that is not on a frame budget. */
+function captureSplit(grid, cap, stageOf, tileChunks) {
+  const it = splitCapture(grid, cap, stageOf, tileChunks);
+  for (;;) { if (it.next().done) return; }
+}
+
+/**
+ * Hand a LATE capture to the tiles that own it, and rebuild whichever of them were already
+ * standing.
+ *
+ * captureSplit() above is for a pass that runs before the tiles are indexed. This is for one that
+ * runs AFTER the first frame — the walkability solve, whose connectors and flights of steps are
+ * worth far less than the second they used to cost in front of the player. The split is the same;
+ * what is new is that a tile may already have geometry, so its share goes on a list rather than
+ * into the single slot indexTiles() fills, and the stages that received anything are invalidated
+ * so the scheduler generates them again on the next frame.
+ *
+ * The vertices are identical either way — the same emitters wrote the same floats into the same
+ * capture — so a city built through this path is the city built through the other one, and the
+ * geometry fingerprint says so.
+ *
+ * A GENERATOR, because splitting a capture is not free: the quay is 400,000 vertices and cutting
+ * them up is a fifth of a second. Doing that in one step would replace the stall this whole change
+ * exists to remove with a smaller one in the same place.
+ *
+ * @param {object} W grid, tiles (may be null), cap (a builder set), stageOf, stats
+ */
+function* deliverCapture(W) {
+  const { grid, tiles, cap, stageOf, stats } = W;
+  const tileChunks = new Map();
+  yield* splitCapture(grid, cap, stageOf || {}, tileChunks);
+  let verts = 0;
+  for (const [id, rec] of tileChunks) {
+    const t = grid.tiles[id];
+    if (!t || !t.f) continue;
+    if (!t.f.late) t.f.late = [];
+    t.f.late.push(rec);
+    t.empty = false;
+    for (let s = 0; s < rec.length; s++) {
+      if (!rec[s]) continue;
+      for (const c in rec[s]) verts += rec[s][c].length / VERT_FLOATS;
+      if (tiles) tiles.invalidate(t, s);
+    }
+  }
+  if (stats) stats.chunkVerts = Math.round((stats.chunkVerts || 0) + verts);
 }
 
 // Append a captured float run into a live builder, verbatim. MeshBuilder.append() with an
@@ -224,6 +277,10 @@ function appendChunk(mb, arr) {
   mb.append(_chunkShim, 0, 0, 0, 0, 1);
   _chunkShim._data = null;
 }
+
+// Triangles a capture split may copy between yields. One is a centroid, a grid lookup and a
+// 42-float copy; 8,192 of them is a fraction of a millisecond.
+const SPLIT_TRIS_PER_YIELD = 8192;
 
 const MAX_CRANES = 7;
 const MAX_TOWER_SIGNS = 8;
@@ -239,5 +296,5 @@ export {
   S_MASS, S_DETAIL, S_SIGNS,
   MASS_RANGE, MASS_DROP, DETAIL_RANGE, DETAIL_DROP, SIGN_RANGE, SIGN_DROP,
   VERTEX_CAP, TILE_BUDGET_MS, TILE_EVICT_MS,
-  CityTiles, makeBuilders, surroundVerts, captureSplit, appendChunk,
+  CityTiles, makeBuilders, surroundVerts, captureSplit, deliverCapture, appendChunk,
 };

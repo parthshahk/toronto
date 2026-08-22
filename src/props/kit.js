@@ -111,10 +111,20 @@ export function finAngle(v, d) {
   return r > Math.PI ? r - TAU : (r <= -Math.PI ? r + TAU : r);
 }
 
-// A guarded draw from the city's seeded rng. A non-function or a non-finite draw must never be
-// allowed to reach a vertex — one NaN silently deletes the triangle it lands in.
+// A guarded draw from the city's seeded rng. A non-finite draw must never be allowed to reach a
+// vertex — one NaN silently deletes the triangle it lands in.
+//
+// THE RNG IS REQUIRED. This used to fall back to Math.random() when a caller passed none, which
+// is the one way a build can come out different twice running: nothing crashes, nothing is
+// logged, a handful of props simply move, and the geometry fingerprint fails intermittently
+// instead of repeatably — the hardest kind of failure to chase. A missing rng is a caller bug, so
+// it is reported as one, immediately and every time. A builder that genuinely has no rng to
+// thread has hash2(x, z) below: deterministic, seeded on world position, and reproducible.
 export function rnd(rng) {
-  const v = typeof rng === 'function' ? rng() : Math.random();
+  if (typeof rng !== 'function') {
+    throw new TypeError('props: rnd() needs the seeded rng — pass one, or use hash2(x, z)');
+  }
+  const v = rng();
   if (!Number.isFinite(v)) return 0.5;
   return v < 0 ? 0 : (v >= 1 ? 0.99999994 : v);
 }

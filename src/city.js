@@ -14,7 +14,8 @@
 //   world/water.js        the surveyed harbour, which carves the terrain to the real shoreline
 //   world/termini.js      dangling ends, resolved on the raw polylines BEFORE anything reads them
 //   world/grade.js        the grade solve: which way passes over which, and by how much
-//   city/buildings.js     footprint preparation, materials, and the coplanar resolution
+//   city/prep.js          where every building is, up front; what it is made of, on demand
+//   city/coplanar.js      who owns a shared surface, resolved a building at a time, on demand
 //   world/roads.js        the prepared road records and their spatial indices
 //   world/junctions.js    the intersection graph
 //   world/context.js      the one context object every detail pass reads
@@ -81,14 +82,14 @@ import { buildJunctionGraph } from './world/junctions.js';
 import { RAIL_PROUD, TRACK_SLAB_Y } from './world/rail.js';
 import { prepareAreas } from './world/areas.js';
 import { noteProp, noteLight, makeDetailContext } from './world/context.js';
-import { auditWalkability } from './world/walk.js';
+import { walkAudit } from './world/walk.js';
 import { resolveTermini } from './world/termini.js';
 import {
   SUR_ENABLED, SUR_FRINGE_FRAC, SUR_FRINGE_MIN, SUR_FRINGE_MAX, HAZE_REACH, buildSurround,
 } from './world/surround.js';
 import { forEachSurroundMass, emitSurroundApron } from './world/fringe.js';
 import { makeLimits, auditHorizon } from './world/limits.js';
-import { setAudit } from './world/audit.js';
+import { ribbonAudit, setAudit } from './world/audit.js';
 
 // HARBOURFRONT AND THE ISLANDS (CONTRACT §8.3). The surveyed shoreline, the quay wall and
 // everything on the water are built by world/water.js, world/quay.js and world/islands.js;
@@ -100,18 +101,17 @@ import { islandStats } from './world/islands.js';
 // THE CITY. Materials, the building prep and the coplanar resolution, the per-tile generator and
 // the tile assignment, the level-of-detail budget, the stats surface and the runtime queries.
 import { MESH_CLASSES, LAST_OPAQUE_CLASS, SIGN_CLASS } from './city/materials.js';
-import {
-  prepareBuildings, resolveCoplanarWalls, punchCorridorPortals, resolveCoplanarCaps,
-} from './city/buildings.js';
+import { prepareBuildings } from './city/prep.js';
+import { makeCoplanarResolver } from './city/coplanar.js';
 import { resetFacadeAudit } from './city/facadekit.js';
 import {
   MASS_RANGE, MASS_DROP, DETAIL_RANGE, DETAIL_DROP, SIGN_RANGE, SIGN_DROP, VERTEX_CAP,
-  TILE_BUDGET_MS, TILE_EVICT_MS, CityTiles, makeBuilders,
+  TILE_BUDGET_MS, TILE_EVICT_MS, CityTiles, makeBuilders, deliverCapture, S_DETAIL,
 } from './city/lod.js';
 import { makeTileBuilder } from './city/tilebuild.js';
-import { indexTiles } from './city/tileindex.js';
+import { indexTiles, initTileFeatures } from './city/tileindex.js';
 import { makeQuerySurface } from './city/queries.js';
-import { makeCityStats } from './city/stats.js';
+import { makeCityStats, makePhaseTimer } from './city/stats.js';
 import { logCitySummary } from './city/report.js';
 
 // SIGNAGE. The glyph atlas, shared with the renderer, which binds the same texture.
@@ -119,78 +119,29 @@ import { getFont } from './render/text.js';
 
 // SPATIAL TILING. The city is one merged mesh per material class PER TILE, built on demand and
 // thrown away when it goes out of range. See tiles.js for why, and for the level-of-detail stages.
-import { TILE_SIZE } from './tiles.js';
-
-
-
-
-
-
-
-
-
-
-/* ================================================================ helpers == */
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/* ================================================================ loading == */
-
-/* ================================================================== tiling == */
-
-// One merged mesh per material class per tile. `water` is deliberately absent: the lake is a
-// single 30 k-vertex sheet that is visible from almost everywhere, has its own shader pass, and
-// would gain nothing from being cut up.
-
-
-
-
-/* ====================================================== islands and airport == */
-//
-// The south half of the map — the Toronto Islands, the Western and Eastern Gaps and Billy Bishop
-// — is built by harbour.js, which owns the surveyed shoreline and everything on the water. This
-// section is the whole of city.js's side of it: a tile flag, a draw box, and the placement
-// context the island passes need (the occupancy grid, the footprint index, the ground field).
-//
-// Nothing about the islands is special-cased anywhere else in this file. The two other island
-// touch points are marked ISLANDS in place: the cottage height fix in the building prep, and the
-// car-free guard in the two parked-car passes.
-
-
-
-
+import { TILE_SIZE, makeTileGrid } from './tiles.js';
 
 /**
  * Load the city and stand up the tile system.
  *
- * The load is now two things rather than one. Everything TOPOLOGICAL — the terrain, the harbour,
- * the grade solve, footprint preparation, coplanar resolution, the road records, the junction
- * graph, the walkability audit — runs once, up front, and produces no vertices at all. Everything
- * GEOMETRIC is deferred to tiles.js, which builds a tile the first time the camera needs it and
- * throws the geometry away when it has been out of range long enough.
+ * THE LOAD IS THREE THINGS, not one, and the split is by WHEN rather than by what.
+ *
+ *   before the first frame   the ground and the topology every later stage reads: the height
+ *                            field and the lake, the surveyed harbour, the dangling-end
+ *                            resolution, the grade solve, WHERE every building is, the road
+ *                            records, the junction graph, and the tile index. No vertices, and
+ *                            nothing here that a tile could have answered for itself.
+ *   when a tile is built     everything geometric, and the analysis that is a property of one
+ *                            record and its neighbours: what that record is made of (city/prep.js
+ *                            — rings into parts, material, storey model, broadphase), who owns a
+ *                            shared wall, which roof caps are buried, where a corridor opens a
+ *                            portal (city/coplanar.js).
+ *   after the first frame    the chore queue, drained a couple of milliseconds a frame: the sweep
+ *                            that prepares the records no tile ever asked for, the walkability
+ *                            audit (CONTRACT §8.2), the quay wall and everything on the water
+ *                            (§8.3), and the sweep that finishes the coplanar analysis. Each is an
+ *                            interruptible generator; the two that emit geometry hand it to their
+ *                            tiles when they finish and rebuild whatever was already standing.
  *
  * @param {WebGL2RenderingContext} gl
  * @param {string} url
@@ -231,6 +182,12 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   setAudit(stats);
   resetFacadeAudit();
 
+  // WHERE THE TIME GOES. One entry per named phase, in milliseconds, on stats.phaseMs. Purely a
+  // measurement: nothing branches on it, and the fingerprint excludes every `...Ms` key because a
+  // wall clock cannot reproduce. `P.skip()` after a cooperative yield keeps the frame the browser
+  // took back out of the next phase's total.
+  const P = makePhaseTimer(stats, now);
+
   // Scratch builders for the two passes that genuinely cannot run a tile at a time; their output
   // is cut up by captureSplit() below and handed to the tiles that own it.
   const cap = makeBuilders();
@@ -240,14 +197,31 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
 
   /* ---------------------------------------------------------------- terrain */
   report(0.36, 'building terrain');
+  // THE SURVEYED SHORELINE decides how much of this there is to do. `infra` is the input to
+  // makeTerrain's FALLBACK water mask — the one that recovers the harbour from the fact that land
+  // is densely built on and the lake is not — and where data.shore exists, which it does for
+  // Toronto, that mask is never built and the list is never read (CONTRACT §8.3). Collecting it
+  // regardless meant walking every road, every ring of every building and every rail line before
+  // the first frame to fill an array nothing looked at; at 181 k buildings that is seconds of the
+  // critical path spent on a code path the city does not take. The pond rings are read either
+  // way, so that loop stays.
+  const surveyedShore = Array.isArray(data.shore) && data.shore.length > 0;
   const infra = [];
-  for (let i = 0; i < roadsRaw.length; i++) {
-    if (Array.isArray(roadsRaw[i].p) && roadsRaw[i].p.length) infra.push(roadsRaw[i].p);
-  }
-  for (let i = 0; i < buildingsRaw.length; i++) {
-    const rr = buildingsRaw[i].r;
-    if (!Array.isArray(rr)) continue;
-    for (let k = 0; k < rr.length; k++) if (Array.isArray(rr[k]) && rr[k].length) infra.push(rr[k]);
+  if (!surveyedShore) {
+    for (let i = 0; i < roadsRaw.length; i++) {
+      if (Array.isArray(roadsRaw[i].p) && roadsRaw[i].p.length) infra.push(roadsRaw[i].p);
+    }
+    for (let i = 0; i < buildingsRaw.length; i++) {
+      const rr = buildingsRaw[i].r;
+      if (!Array.isArray(rr)) continue;
+      for (let k = 0; k < rr.length; k++) {
+        if (Array.isArray(rr[k]) && rr[k].length) infra.push(rr[k]);
+      }
+    }
+    for (let i = 0; i < railsRaw.length; i++) {
+      if (railsRaw[i].k === 'subway') continue;
+      if (Array.isArray(railsRaw[i].p) && railsRaw[i].p.length) infra.push(railsRaw[i].p);
+    }
   }
   const pondRings = [];
   for (let i = 0; i < areasRaw.length; i++) {
@@ -258,14 +232,11 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
       if (co && Math.abs(planArea(co)) > 20) pondRings.push(co);
       continue;
     }
-    infra.push(a.p);
-  }
-  for (let i = 0; i < railsRaw.length; i++) {
-    if (railsRaw[i].k === 'subway') continue;
-    if (Array.isArray(railsRaw[i].p) && railsRaw[i].p.length) infra.push(railsRaw[i].p);
+    if (!surveyedShore) infra.push(a.p);
   }
   const T = makeTerrain(data.terrain || { nx: 2, nz: 2, cell: 25, h: [0, 0, 0, 0] },
-    extent, infra, pondRings, Array.isArray(data.shore) && data.shore.length > 0);
+    extent, infra, pondRings, surveyedShore);
+  P.at('terrain');
 
   /* ------------------------------------------------------------ harbourfront */
   // CONTRACT §8.3. The surveyed shoreline replaces the guessed one: harbour.js brings the terrain
@@ -274,6 +245,7 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   // Must run before anything reads T.groundY or emits the terrain mesh.
   const HARBOUR = buildHarbour(data, { extent, terrain: T, waterY: WATER_Y });
   if (HARBOUR) carveHarbourTerrain(T, HARBOUR);
+  P.at('harbour');
 
   /* --------------------------------------------------------- world boundary */
   // CONTRACT §9.3. The ground has to keep going past the survey, so the grid does. AFTER the
@@ -311,67 +283,93 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   // The natural ground. Everything that is NOT part of the walking surface — the terrain mesh, the
   // lake, the railway, a bridge deck's own reference — reads this one.
   const terrainY = T.groundY;
+  P.at('boundary');
   await frame();
+  P.skip();
+
+  /* ------------------------------------------------- tile grid and placement */
+  // The grid exists BEFORE anything is prepared, because what a record's preparation is scheduled
+  // against is the tile that will build it. It reaches past the data far enough to hold the whole
+  // synthesised fringe and the padded terrain under it, or a surround feature would be indexed
+  // into an edge tile whose draw box then swells to cover a kilometre of nothing.
+  //
+  // PLACEMENT ONLY — where every record is, how tall it is, and which tile will build it — and it
+  // runs HERE, ahead of the dangling-end pass, because the ring-box index it leaves behind is what
+  // that pass asks "is this way end stopping at a facade?". Everything else about a record is a
+  // property of that record and is done when something first asks: when its tile is built, when a
+  // neighbour's coplanar verdict reaches across a party wall, or when the player walks into it.
+  // See city/prep.js.
+  const grid = makeTileGrid(extent, TILE_SIZE, SUR_FRINGE + 420);
+  initTileFeatures(grid);
+  const { prepped, bIndex, cnRec, cnX, cnZ, prep } = await prepareBuildings({
+    buildingsRaw, HARBOUR, SUR_FRINGE, extent, grid, project, report, stats,
+  });
+  P.at('footprints');
+  await frame();
+  P.skip();
 
   /* ------------------------------------------------------------- dangling ends */
   // CONTRACT §9.1, and it runs HERE for a reason: it mutates the raw polylines, and everything
   // after this line — the grade solve, the junction table, the walkability audit, the ribbons,
   // the street-name index — is built from them. Correcting the topology anywhere later would
   // leave two of those disagreeing about where the network joins up.
-  report(0.38, 'closing the dangling ends');
-  const termCaps = resolveTermini(roadsRaw, railsRaw, buildingsRaw, extent, stats);
+  report(0.40, 'closing the dangling ends');
+  const termCaps = resolveTermini(roadsRaw, railsRaw, prep.rawNear, extent, stats);
+  P.at('termini');
   await frame();
+  P.skip();
 
   /* ------------------------------------------------------- grade separation */
-  report(0.40, 'cutting the underpasses');
-  const G = solveGrade(roadsRaw, railsRaw, buildingsRaw, extent, terrainY, stats);
+  report(0.42, 'cutting the underpasses');
+  const G = solveGrade(roadsRaw, railsRaw, extent, terrainY, stats);
   const gradeField = G.field;
+  P.at('grade');
   await frame();
+  P.skip();
 
   // ...and the WALKING surface, which is the terrain with every depressed corridor cut into it.
   // One composition, read by the carriageway ribbons, the pavement, every prop, the pedestrians
   // and the player, so no two of them can ever disagree about where the ground is.
   const groundY = (x, z) => terrainY(x, z) + gradeField.offset(x, z);
+  // Where the tower's base slab sits. Taken off the record where the massing extract has one and
+  // off the walking surface where it does not, which is why it waits for the grade solve.
+  const cnBaseY = cnRec ? cnRec.y - 0.6 : groundY(cnX, cnZ);
   terrainNormals(T);
   // The lake is the one surface that is not tiled: 30 k vertices, visible from nearly every
   // viewpoint in the world, and drawn by its own reflection pass.
   emitWaterMesh(waterMB, T, extent, HARBOUR, HAZE_REACH);
+  P.at('lake');
   report(0.44, 'shoreline');
   await frame();
-
-  /* -------------------------------------------------------------- buildings */
-
-  const { prepped, bIndex, cnX, cnZ, cnBaseY } = await prepareBuildings({
-    buildingsRaw, HARBOUR, SUR_FRINGE, extent, groundY, project, report, stats,
-  });
+  P.skip();
 
   /* ------------------------------------------------- coplanar resolution -- */
-  // Which faces are worth drawing depends on what the NEIGHBOURING records draw, and no record
-  // knows its neighbours until every ring is built. This is a global pass and stays one: it is
-  // pure analysis, it produces no vertices, and it decides what each tile is allowed to emit.
-  report(0.52, 'resolving coplanar faces');
-  await frame();
-  resolveCoplanarWalls(prepped, extent, stats);
-  await frame();
-  // Open every wall a corridor or a passage runs through, before a single quad is emitted.
-  punchCorridorPortals(prepped, gradeField, terrainY, stats);
-  await frame();
-  resolveCoplanarCaps(prepped, bIndex, stats);
-  await frame();
+  // Which faces are worth drawing depends on what the NEIGHBOURING records draw — but ONLY on the
+  // neighbours, and only on the ones close enough to touch. That is why this is no longer a
+  // whole-city pass in front of the first frame: the resolver answers one record at a time, when
+  // the tile holding it is built, and pulls in whatever neighbours that record's answer depends
+  // on. What is left over — the audit totals, and the records that are buried and therefore in no
+  // tile at all — is swept up by the chore queue afterwards. See city/coplanar.js.
+  const COP = makeCoplanarResolver({
+    extent, bIndex, stats, grade: gradeField, terrainY,
+  });
+  P.at('coplanar');
 
   /* ------------------------------------------------------------------ roads */
 
   const {
-    grid, recs, roadIdx, deckIdx, roadJobs, footJobs, subJobs, gx0, gz0, worstCut,
+    recs, roadIdx, deckIdx, roadJobs, footJobs, subJobs, gx0, gz0, worstCut,
   } = await buildRoadRecords({
-    roadsRaw, data, extent, terrainY, G, SUR_FRINGE, report, stats,
+    roadsRaw, data, extent, terrainY, G, grid, report, stats,
   });
+  P.at('roads');
 
   /* -------------------------------------------------------------- junctions */
 
   const { junctions, realFoot } = buildJunctionGraph({
     roadsRaw, roadJobs, recs, G, extent, gx0, gz0, poisRaw, bIndex, stats,
   });
+  P.at('junctions');
 
   /* --------------------------------------------------------- detail context */
   const C = makeDetailContext({
@@ -379,44 +377,24 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     poisRaw, railsRaw, recs, stats, font: getFont(gl), surWalk: LIMITS.out + 120,
     harbour: HARBOUR, rawY: rawTerrainY, realFoot,
   });
+  P.at('context');
 
-  /* ------------------------------------------------------------- walkability */
-  // CONTRACT 8.2. A global pass by nature — a connected component is not a local property — and
-  // it BUILDS things: paved connectors over gaps and real flights of steps at cliffs. Its
-  // geometry goes into the capture and is cut up per tile below.
-  report(0.63, 'checking the walk');
-  await frame();
-  auditWalkability(C, G, roadsRaw, extent, stats);
-  await frame();
-
-  /* ------------------------------------------------------------ harbourfront */
-  // CONTRACT §8.3. Everything on the water: the quay wall and its apron, the piers and their pile
-  // structure, the rubble mounds, the marina floats, the ferry terminal slips, the boardwalk and
-  // the trail, and the furniture that stands on all of it. harbour.js walks 32 km of surveyed
-  // shoreline as continuous runs and city.js does not own it, so it too runs once into the
-  // capture and is cut up afterwards.
+  // THE GLOBAL OCCUPANCY GRID, held by name. C.occ is rebound to the tile under construction once
+  // tiles start building, and the quay pass below now runs BETWEEN tile builds; a harbour bollard
+  // must claim its site on the grid the whole harbour shares, not on whichever tile happened to be
+  // half-built when the chore was resumed.
+  const worldOcc = C.occ;
+  // Every site the harbour furniture reserves, as flat [x, z, r] triples. The quay pass fills it
+  // from the chore queue; each tile replays whatever falls inside it into its own occupancy grid,
+  // so a Queens Quay bin cannot be planted inside a mooring bollard that was placed first.
   const hClaims = [];
-  if (HARBOUR) {
-    report(0.68, 'building the quay');
-    appendHarbour(HARBOUR, {
-      mb: cap,
-      data,
-      claim: (x, z, r) => {
-        if (!C.occ.claim(x, z, r)) return false;
-        hClaims.push(x, z, r);
-        return true;
-      },
-      note: (kind) => noteProp(C, kind),
-      light: (kind, x, y, z) => noteLight(C, kind, x, y, z),
-    });
-    await frame();
-  }
 
   /* ------------------------------------------------------------------ areas */
 
   const areaParts = await prepareAreas({
-    areasRaw, prepped, C, HARBOUR, cap, extent, report,
+    areasRaw, prep, C, HARBOUR, cap, extent, report, buriedOf: COP.isBuried,
   });
+  P.at('areas');
 
   /* ------------------------------------------------------ synthesised surround */
   // CONTRACT §9.3. Measured out of the boundary strip and generated ONCE, as a few thousand small
@@ -431,6 +409,7 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   const SUR = SUR_ENABLED
     ? buildSurround({ extent, fringe: SUR_FRINGE, landAt, terrainY, roadsRaw, buildingsRaw, stats })
     : { roads: [], blocks: [], strips: [] };
+  P.at('surround');
   // Everything the player can physically reach is a real obstacle. The reachable band is thin —
   // the soft limit is SOFT_OUT past the data and a body radius past that — so only the first few
   // rings are registered, and they are registered from the SAME pure enumeration the geometry
@@ -455,11 +434,13 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
 
   /* ================================================================= tiles == */
 
+  P.skip();
   await indexTiles({
     G, HARBOUR, SUR, T, areaParts, cap, cnBaseY, cnX, cnZ, footJobs, grid, groundY,
-    junctions, poisRaw, prepped, railsRaw, recs, report, roadsRaw, stats, subJobs,
+    junctions, poisRaw, railsRaw, recs, report, roadsRaw, stats, subJobs,
     termCaps, terrainY, worstCut,
   });
+  P.at('indexTiles');
 
   /* ------------------------------------------------------- the tile builder */
 
@@ -467,8 +448,8 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   // `harbourClaims` replays those claims into each tile's own grid so a Queens Quay bin cannot be
   // planted inside a mooring bollard that was placed first.
   const buildTile = makeTileBuilder({
-    C, G, HARBOUR, T, cnBaseY, cnX, cnZ, data, extent, gradeField, groundY,
-    harbourClaims: hClaims, recs, scrap, stats, terrainY,
+    C, COP, G, HARBOUR, T, cnBaseY, cnX, cnZ, data, extent, gradeField, groundY,
+    harbourClaims: hClaims, prep, recs, scrap, stats, terrainY,
   });
 
   const tiles = new CityTiles({
@@ -487,6 +468,145 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     budgetMs: TILE_BUDGET_MS,
     evictMs: TILE_EVICT_MS,
   });
+
+  /* --------------------------------------------------------- deferred audits */
+  // WHAT THE FIRST FRAME DOES NOT NEED. CONTRACT §8.2 and §9.4 are acceptance tests: they measure
+  // the world, they never change it, and no vertex anywhere depends on their result. They are
+  // also the two passes in the load whose cost is an AREA rather than a network — a 20 m land
+  // lattice and an 8 m hole lattice over the whole map — so they are exactly the wrong thing to
+  // put in front of a player waiting for a first frame.
+  //
+  // Each entry is a generator that yields often enough to be interruptible. update() advances the
+  // head of the queue for a couple of milliseconds per frame, the way tiles.js spends a frame
+  // budget on geometry; settle() runs the lot in one go, which is what the headless tools want.
+  // The console summary waits for the queue so the numbers it prints are the finished ones.
+  const chores = [];
+  const CHORE_MS = 2.0;
+  // Scratch builder sets for the two deferred passes that emit geometry. They write here rather
+  // than into C.mb, which by now belongs to whichever tile is under construction.
+  const quayCap = makeBuilders();
+  const walkCap = makeBuilders();
+
+  /**
+   * Generate again every tile that overlaps a set of [x, z, r] claims.
+   *
+   * A deferred pass that RESERVES ground — the harbour furniture does — changes what the
+   * procedural furniture pass is allowed to put there. Tiles built before those reservations
+   * existed were right about everything except that, so they are dropped and rebuilt; the
+   * scheduler re-queues them next frame like any other empty stage. Nothing is standing yet when
+   * the chores are drained in one go, which is the case the geometry fingerprint measures.
+   */
+  function rebuildNear(claims) {
+    if (!claims.length) return;
+    let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+    for (let i = 0; i < claims.length; i += 3) {
+      const r = claims[i + 2];
+      if (claims[i] - r < x0) x0 = claims[i] - r;
+      if (claims[i] + r > x1) x1 = claims[i] + r;
+      if (claims[i + 1] - r < z0) z0 = claims[i + 1] - r;
+      if (claims[i + 1] + r > z1) z1 = claims[i + 1] + r;
+    }
+    for (let k = 0; k < grid.tiles.length; k++) {
+      const t = grid.tiles[k];
+      if (t.cx1 < x0 || t.cx0 > x1 || t.cz1 < z0 || t.cz0 > z1) continue;
+      tiles.invalidate(t);
+    }
+  }
+
+  // CONTRACT §8.2, ENTIRELY OFF THE CRITICAL PATH. The walkable graph is global — a connected
+  // component is not a local property — so it cannot be sharded per tile; but nothing about it is
+  // needed before a first frame either. It measures the world, and the only thing it CHANGES is
+  // two kinds of local repair: a paved connector across a survey gap, and a flight of steps at a
+  // cliff. Those go into a capture of its own and are handed to their tiles the moment the solve
+  // finishes (deliverCapture), which rebuilds the handful that were already standing.
+  /* ------------------------------------------------------------ harbourfront */
+  // CONTRACT §8.3. Everything on the water: the quay wall and its apron, the piers and their pile
+  // structure, the rubble mounds, the marina floats, the ferry terminal slips, the boardwalk and
+  // the trail, and the furniture that stands on all of it.
+  //
+  // world/quay.js walks 32 km of surveyed shoreline as continuous runs, which no tile owns, so
+  // this is the other pass that genuinely cannot be sharded — and, like the walkability audit, it
+  // is not something a first frame needs. It runs from the chore queue as an interruptible
+  // generator; when it finishes, the geometry is cut up per tile and the tiles that were already
+  // standing anywhere near the water are generated again, because a Queens Quay bin cannot be
+  // planted inside a mooring bollard whose claim had not been made yet.
+  if (HARBOUR) {
+    chores.push((function* buildQuay() {
+      yield* appendHarbour(HARBOUR, {
+        mb: quayCap,
+        data,
+        claim: (x, z, r) => {
+          if (!worldOcc.claim(x, z, r)) return false;
+          hClaims.push(x, z, r);
+          return true;
+        },
+        note: (kind) => noteProp(C, kind),
+        light: (kind, x, y, z) => noteLight(C, kind, x, y, z),
+      });
+      yield* deliverCapture({ grid, tiles, cap: quayCap, stageOf: { props: S_DETAIL }, stats });
+      rebuildNear(hClaims);
+    })());
+  }
+
+  // WHAT THE TILES DID NOT ASK FOR — the buildings first, then their coplanar verdicts.
+  //
+  // Footprint preparation happens when the tile holding a record is built, so what the player can
+  // see is always prepared; but the audit's building, material and storey counters are meant to
+  // describe the SURVEY rather than the flight path, and the coplanar sweep needs a record array
+  // with no holes in it. Both finish the rest of the city from the chore queue, a tile at a time,
+  // behind the first frame — which is also how a record that is buried, and therefore indexed
+  // into no tile at all, still gets its verdict.
+  chores.push(prep.sweep());
+  chores.push(COP.sweep(prepped));
+
+  chores.push(walkAudit({
+    C, G, roadsRaw, extent, stats, mb: walkCap,
+    deliver: (mb) => deliverCapture({ grid, tiles, cap: mb, stageOf: {}, stats }),
+  }));
+
+  /**
+   * Advance the head of the chore queue for a couple of milliseconds.
+   *
+   * THE AUDIT BINDINGS ARE SAVED AND RESTORED around the slice. A chore runs BETWEEN tile builds,
+   * and a tile build that has been suspended mid-generator has left `C.stats` and the ribbon audit
+   * pointing at the scrap counters of a rebuild. A chore is never a rebuild, so its counters
+   * belong to the real stats object; and the suspended build's binding has to come back untouched
+   * or the rest of that tile would be counted twice.
+   */
+  function pumpChores(ms) {
+    if (!chores.length) return;
+    const t0c = now();
+    const until = t0c + (isNum(ms) && ms > 0 ? ms : CHORE_MS);
+    const heldStats = C.stats;
+    const heldAudit = ribbonAudit();
+    C.stats = stats;
+    setAudit(stats);
+    while (chores.length) {
+      if (chores[0].next().done) { chores.shift(); continue; }
+      if (now() >= until) break;
+    }
+    C.stats = heldStats;
+    setAudit(heldAudit);
+    P.add('deferred', now() - t0c);
+    if (!chores.length) choresDone();
+  }
+
+  /** Run every outstanding deferred audit to completion, synchronously. */
+  function settle() {
+    const t0c = now();
+    const heldStats = C.stats;
+    const heldAudit = ribbonAudit();
+    C.stats = stats;
+    setAudit(stats);
+    while (chores.length) {
+      if (chores[0].next().done) chores.shift();
+    }
+    C.stats = heldStats;
+    setAudit(heldAudit);
+    P.add('deferred', now() - t0c);
+    choresDone();
+    return stats;
+  }
 
   /* ------------------------------------------------------------- self-audit */
   report(0.86, 'checking the ground plane');
@@ -531,6 +651,7 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   // CONTRACT §9.4: prove that the world never visibly ends, from the whole perimeter of the soft
   // limit, at five altitudes, along twenty-four bearings, at all four time presets.
   auditHorizon(T, LIMITS, HAZE_REACH, groundY, stats);
+  P.at('horizon');
 
   stats.isle = islandStats(HARBOUR);
   stats.seconds = (now() - t0) / 1000;
@@ -545,14 +666,24 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   const { buildingAt, collide, limitFrac, confine, streetNameAt } = makeQuerySurface({
     bIndex, gradeField, terrainY, LIMITS, extent, roadsRaw, G,
   });
+  P.at('queries');
 
   /* -------------------------------------------------------------- reporting */
 
   let logged = false;
+  let logWanted = false;
   function logSummary() {
     if (logged) return;
+    // The summary reports the walkability audit, and the audit is still running. Printing half of
+    // it and never correcting it would be worse than printing it a second later.
+    if (chores.length) { logWanted = true; return; }
     logged = true;
     logCitySummary(stats, tiles, grid, extent, HARBOUR);
+  }
+
+  /** Called once the chore queue empties, however it was drained. */
+  function choresDone() {
+    if (logWanted) logSummary();
   }
 
   /**
@@ -561,6 +692,9 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
    */
   function update(camera, nowMs, budgetMs) {
     tiles.frame(camera, nowMs, budgetMs);
+    // The deferred audits get their slice AFTER the geometry: a tile the player is looking at is
+    // worth more than a counter nobody has asked for yet.
+    pumpChores(CHORE_MS);
     flushLights();
     const TS = tiles.stats;
     stats.verts = TS.residentVerts + (meshes.water ? meshes.water.vertexCount : 0);
@@ -652,6 +786,9 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
     limitFrac,
     update,
     warm,
+    // Drain the deferred audits in one go. The frame loop does this a couple of milliseconds at a
+    // time through update(); a headless caller that never draws a frame calls this instead.
+    settle,
     dispose() {
       tiles.dispose();
       if (meshes.water) meshes.water.dispose();

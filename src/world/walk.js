@@ -13,6 +13,31 @@
 //
 // It emits geometry only where it finds a defect worth fixing — a stitch ribbon or a flight of
 // steps — so a clean city costs it no vertices at all.
+//
+// IT IS TWO PASSES, split on whether the result is geometry or a number, and NEITHER OF THEM IS
+// ON THE CRITICAL PATH TO A FIRST FRAME.
+//
+//   solveWalk()          the SOLVE. Builds the graph, stitches the gaps and cuts the flights of
+//                        steps. Its cost is the whole street network sampled at a metre — 574 ms
+//                        over 43 km2, and six times that over the pre-1998 city — and it used to
+//                        run before the tiles were indexed, because its vertices go into a
+//                        capture that is cut up per tile. It is now a GENERATOR: it yields often
+//                        enough to be interruptible, city.js drives it from the chore queue after
+//                        the first frame, and the few hundred vertices it does emit are delivered
+//                        to their tiles when it finishes (see city/lod.js deliverCapture).
+//   finishWalkAudit()    the VERIFICATION, as a generator city.js drives off the critical path.
+//                        Which components are across open water, and whether groundY is finite
+//                        everywhere: two fixed-lattice sweeps of the WHOLE WORLD that emit no
+//                        geometry, change no geometry, and — at 252 km2 — make 4.3 million ground
+//                        samples between them. Nothing a player does before it finishes depends
+//                        on it; nothing it measures can be changed by anything they do.
+//
+// WHY DEFERRING THE SOLVE IS SAFE. CONTRACT §8.2 is an acceptance test: the audit measures the
+// world and never changes it, apart from two REPAIRS — a paved connector across a survey gap and
+// a flight of steps at a cliff. Both are local, both are rare (tens of them over the whole city),
+// and neither is something a player standing on Queen Street in the first second of the session
+// can be anywhere near. Delivering them a second or two late, and rebuilding the handful of tiles
+// that own them, costs one tile build each and buys the whole solve off the first frame.
 
 import { clamp } from '../core/math.js';
 import { isNum } from '../core/util.js';
@@ -28,6 +53,8 @@ import { emitRibbon } from './audit.js';
 const WALK_STEP = 2.0;             // how finely a route is walked when testing for cliffs
 const WALK_CLIFF = 0.45;           // CONTRACT 8.2: a bigger step than this needs geometry
 const WALK_WALL = 1.20;            // ...and a bigger one than THIS is not a step, it is a wall
+const WALK_CLIFF_WALL = 3.0;       // ...and past a storey a "step" would be a lie about what is there
+const SEVER_REFINE = 2;            // sever stations per cliff station — see the sever pass below
 const WALK_BLOCK = 1.6;            // metres inside a footprint before a route is really blocked
 const STITCH_R = 8.0;              // how far a connector may reach to close a gap
 const STITCH_W = 1.9;              // and how wide it is built
@@ -35,6 +62,16 @@ const ISLAND_MIN = 50.0;           // CONTRACT 8.2: report every island longer t
 const MARINE_CELL = 20.0;          // cell size of the land-connectivity flood behind "marine"
 const STAIR_RISE = 0.17;
 const STAIR_RUN = 0.30;
+// How much of the solve to do between yields. Powers of two so the test is a mask, and sized by
+// measurement rather than taste: a batch is a group of ways whose whole length is sampled at a
+// metre against the footprint index and the walking surface, and at 64 ways a batch containing a
+// couple of arterials measured 23 ms — a dropped frame. At 8 the worst batch in the extract is
+// under three.
+const WALK_WAYS_PER_YIELD = 8;
+const WALK_NODES_PER_YIELD = 128;
+const WALK_EDGES_PER_YIELD = 32;
+// ...and for the two whole-graph sweeps, which are a union-find step per edge and nothing else.
+const EDGE_UNION_PER_YIELD = 8192;
 
 /** Union-find over the welded node set; the graph is built once and re-solved after stitching. */
 function makeUnionFind(n) {
@@ -97,8 +134,13 @@ function emitSteps(mb, ax, az, ay, bx, bz, by, halfW) {
  *
  * What it FIXES: gaps where two walkable ends nearly meet get a real paved connector, and a
  * remaining vertical discontinuity on a legal route gets a real flight of steps.
+ *
+ * A GENERATOR, driven from city.js's chore queue after the first frame. `mbSet` is a builder set
+ * of its own rather than C.mb, because C.mb is rebound to whichever tile is under construction and
+ * this pass now runs BETWEEN tile builds; writing through C would put a flight of steps into
+ * whatever tile happened to be half-built when the solve was resumed.
  */
-function auditWalkability(C, G, roadsRaw, extent, stats) {
+function* solveWalk(C, G, roadsRaw, extent, stats, mbSet) {
   const W = stats.walk;
   W.worstCliffs = [];
   const nodeCount = G.nodeCount;
@@ -151,17 +193,35 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
       // the extract and detached everything on the far side — measured at 26.8 km of walkable
       // street east of the Don Valley reported as an unreachable island, which is not what a
       // pedestrian standing on Queen Street East finds.
+      //
+      // SAMPLED ON THE SAME LINE AS THE CLIFF PASS, AT A STRICT REFINEMENT OF ITS STATIONS. Both
+      // passes ask the same question of the same edge, so they must never be able to disagree
+      // about it — and they used to. This one walked the RAW polyline every 1.5 m while the cliff
+      // pass walks the WELDED segment every WALK_STEP, so a ground feature narrower than either
+      // spacing could fall between this pass's stations and land on one of the cliff pass's. It
+      // did: a 1.0 m sliver of a river crossing's ground pad, standing 18.6 m proud of the lake
+      // bed under the Lower Don, was straddled here and hit there, and came out as a pair of
+      // 18.63 m "cliffs" on a route this pass had every reason to have taken out.
+      //
+      // Walking the welded segment with EXACTLY SEVER_REFINE times the cliff pass's station count
+      // makes every cliff station a sever station as well. Two adjacent cliff stations differing
+      // by d therefore have SEVER_REFINE sever intervals between them summing to at least d, so
+      // one of them is at least d / SEVER_REFINE. Any drop the cliff pass could call a wall is at
+      // least WALK_CLIFF_WALL, so the sever pass sees at least WALK_CLIFF_WALL / SEVER_REFINE =
+      // 1.50 m across one of its own intervals, clear of the 1.20 m WALK_WALL it severs on. The
+      // route comes out here first, by arithmetic rather than by luck, and the margin only widens
+      // if WALK_CLIFF_WALL rises or SEVER_REFINE does.
       const cor = G.corridor[i];
       const surf = cor
         ? (x, z) => C.terrainY(x, z) - corridorDepth(cor, x, z)
         : C.groundY;
       let sev = false;
-      const walk = kind === WAY_OVER ? 0 : Math.max(1, Math.ceil(len / 1.5));
-      let prev = surf(p[k - 1][0], p[k - 1][1]);
+      const walk = kind === WAY_OVER ? 0 : Math.max(1, Math.ceil(len / WALK_STEP)) * SEVER_REFINE;
+      let prev = surf(nx[a], nz[a]);
       for (let m = 1; m <= walk && !sev; m++) {
         const t = m / walk;
-        const x = p[k - 1][0] + (p[k][0] - p[k - 1][0]) * t;
-        const z = p[k - 1][1] + (p[k][1] - p[k - 1][1]) * t;
+        const x = nx[a] + (nx[b] - nx[a]) * t;
+        const z = nz[a] + (nz[b] - nz[a]) * t;
         const cur = surf(x, z);
         if (Math.abs(cur - prev) > WALK_WALL) sev = true;
         prev = cur;
@@ -169,15 +229,22 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
       if (sev) { severedMetres += len; continue; }
       edges.push(a, b, len, i);
     }
+    if ((i & (WALK_WAYS_PER_YIELD - 1)) === WALK_WAYS_PER_YIELD - 1) yield;
   }
 
   // --- 2. connectivity -------------------------------------------------------
+  yield;
   const uf = makeUnionFind(nodeCount);
-  for (let e = 0; e < edges.length; e += 4) uf.union(edges[e], edges[e + 1]);
+  yield;
+  for (let e = 0; e < edges.length; e += 4) {
+    if ((e & (EDGE_UNION_PER_YIELD * 4 - 1)) === 0) yield;
+    uf.union(edges[e], edges[e + 1]);
+  }
 
   const compLen = new Map();
   let total = 0;
   for (let e = 0; e < edges.length; e += 4) {
+    if ((e & (EDGE_UNION_PER_YIELD * 4 - 1)) === 0) yield;
     const root = uf.find(edges[e]);
     compLen.set(root, (compLen.get(root) || 0) + edges[e + 2]);
     total += edges[e + 2];
@@ -195,15 +262,17 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
   const buckets = new Map();
   const key = (x, z) => Math.floor(x / cell) + ':' + Math.floor(z / cell);
   for (let v = 0; v < nodeCount; v++) {
+    if ((v & 1023) === 1023) yield;
     if (!deg[v]) continue;
     const k = key(nx[v], nz[v]);
     const b = buckets.get(k);
     if (b) b.push(v); else buckets.set(k, [v]);
   }
-  const mb = C.mb.sidewalks;
+  const mb = mbSet.sidewalks;
   setMat(mb, M.path);
   let stitched = 0, stitchMetres = 0;
   for (let v = 0; v < nodeCount; v++) {
+    if ((v & (WALK_NODES_PER_YIELD - 1)) === WALK_NODES_PER_YIELD - 1) yield;
     if (!deg[v] || uf.find(v) === mainRoot) continue;
     if (compLen.get(uf.find(v)) === undefined) continue;
     let best = -1, bestD = STITCH_R;
@@ -252,10 +321,12 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
     stitchMetres += bestD;
   }
 
+  yield;
   if (stitched) {
     compLen.clear();
     total = 0;
     for (let e = 0; e < edges.length; e += 4) {
+      if ((e & (EDGE_UNION_PER_YIELD * 4 - 1)) === 0) yield;
       const root = uf.find(edges[e]);
       compLen.set(root, (compLen.get(root) || 0) + edges[e + 2]);
       total += edges[e + 2];
@@ -263,6 +334,116 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
     mainRoot = -1; mainLen = 0;
     for (const [root, len] of compLen) if (len > mainLen) { mainLen = len; mainRoot = root; }
   }
+
+  // --- 5. cliffs -------------------------------------------------------------
+  // Every walkable edge is walked at WALK_STEP and the surface under each pair of adjacent
+  // samples compared. A discontinuity bigger than WALK_CLIFF that has no ramp gets a real flight
+  // of steps built into it, and only what is left is counted.
+  let cliffs = 0, worstCliff = 0, samples = 0, steps = 0, flights = 0;
+  const gy = C.groundY;
+  for (let e = 0; e < edges.length; e += 4) {
+    if ((e & (WALK_EDGES_PER_YIELD * 4 - 1)) === 0) yield;
+    const a = edges[e], b = edges[e + 1], len = edges[e + 2];
+    // A deck is not the ground: an elevated way's walking surface is a ribbon this audit has no
+    // business sampling the terrain under. It is continuous by construction and it is measured for
+    // connectivity like everything else.
+    const way = edges[e + 3];
+    if (way >= 0 && G.kind[way] === WAY_OVER) continue;
+    // Inside a depressed corridor the surface underfoot is the carriageway, not the ground plane
+    // over the lid that carries a street across it. Sample what a pedestrian actually walks on.
+    const cor = way >= 0 ? G.corridor[way] : null;
+    const surf = cor
+      ? (x, z) => C.terrainY(x, z) - corridorDepth(cor, x, z)
+      : gy;
+    const n = Math.max(1, Math.ceil(len / WALK_STEP));
+    let px = nx[a], pz = nz[a], py = surf(px, pz);
+    for (let m = 1; m <= n; m++) {
+      const t = m / n;
+      const x = nx[a] + (nx[b] - nx[a]) * t, z = nz[a] + (nz[b] - nz[a]) * t;
+      const y = surf(x, z);
+      samples++;
+      const d = Math.abs(y - py);
+      if (d > WALK_CLIFF) {
+        if (d > worstCliff) worstCliff = d;
+        // A step is only worth building where the drop is a real one; beyond a storey it is a
+        // wall, and a staircase up the face of a retaining wall would be a lie.
+        if (d < WALK_CLIFF_WALL) {
+          setMat(mb, M.sidewalk);
+          steps += emitSteps(mb, px, pz, py, x, z, y, 1.1);
+          flights++;
+        } else {
+          // Bigger than a storey and it is not a step, it is a wall the sever test above should
+          // have taken the route out on — and, sampling a strict refinement of these very
+          // stations, provably did. So this branch is the proof standing guard over that
+          // argument, not a routine outcome: reaching it means the two passes have drifted apart
+          // again and a route has been left running off the side of something. Counted, located,
+          // and never papered over.
+          cliffs++;
+          if (W.worstCliffs.length < 8) {
+            W.worstCliffs.push({
+              m: Math.round(d * 100) / 100, x: Math.round(x), z: Math.round(z),
+            });
+          }
+        }
+      }
+      px = x; pz = z; py = y;
+    }
+  }
+
+  let subLen = 0;
+  const subUf = makeUnionFind(nodeCount);
+  for (let e = 0; e < sub.length; e += 3) { subUf.union(sub[e], sub[e + 1]); subLen += sub[e + 2]; }
+  const subComp = new Set();
+  for (let e = 0; e < sub.length; e += 3) subComp.add(subUf.find(sub[e]));
+
+  W.metres = total;
+  W.largest = mainLen;
+  W.fraction = total > 0 ? mainLen / total : 1;
+  W.components = compLen.size;
+  W.cliffs = cliffs;
+  W.cliffWorst = worstCliff;
+  W.samples = samples;
+  W.stitched = stitched;
+  W.stitchMetres = stitchMetres;
+  W.steps = steps;
+  W.flights = flights;
+  W.blockedMetres = blockedMetres;
+  W.severedMetres = severedMetres;
+  W.subNetMetres = subLen;
+  W.subComponents = subComp.size;
+
+  // WHAT IS LEFT IS PURE VERIFICATION. The two remaining sections — which components are across
+  // open water, and whether groundY is finite everywhere — sweep the WHOLE WORLD on a fixed
+  // lattice: an 8 m hole grid and a 20 m land grid, both of which cost an area, not a network. At
+  // the pre-1998 city boundary that is 4.3 million ground samples, and not one of them emits a
+  // vertex or changes one. finishWalkAudit() below runs them; everything above this line BUILDS —
+  // connectors and flights of steps the tiles have to be handed — and is why the solve has a
+  // capture of its own to write into.
+  return {
+    C, extent, stats, edges, uf, mainRoot, nx, nz, roadsRaw, compLen, mainLen, total,
+  };
+}
+
+// How many rows of the background sweeps to do between yields. A row of the hole sweep is ~860
+// samples of the walking surface, each of which is a terrain lookup and a harbour-deck query, so
+// 24 rows measured 15 ms — a dropped frame. Four is well under one and the loop overhead is still
+// noise.
+const AUDIT_ROWS = 4;
+
+/**
+ * The rest of CONTRACT §8.2, run off the critical path.
+ *
+ * A GENERATOR, driven by city.js's chore pump exactly as tiles.js's builders are driven by the
+ * frame loop: it yields every AUDIT_ROWS rows, so a sweep that takes a second in one go costs a
+ * fraction of a millisecond per frame instead. It emits NO geometry and reads nothing that a tile
+ * can change, so it is a pure function of the finished world however late it runs.
+ *
+ * @param {object} P what auditWalkability() returned, or null.
+ */
+function* finishWalkAudit(P) {
+  if (!P) return;
+  const { C, extent, stats, edges, uf, mainRoot, nx, nz, roadsRaw, compLen, mainLen, total } = P;
+  const W = stats.walk;
 
   // --- 4. islands ------------------------------------------------------------
   const islandNodes = new Map();
@@ -310,6 +491,7 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
         const y = C.rawY(ox + (i + 0.5) * MARINE_CELL, z);
         if (isNum(y) && y > WATER_Y + 0.2) land[j * gi + i] = 1;
       }
+      if (j % AUDIT_ROWS === AUDIT_ROWS - 1) yield;
     }
     const cellOf = (x, z) => {
       const i = Math.floor((x - ox) / MARINE_CELL), j = Math.floor((z - oz) / MARINE_CELL);
@@ -328,7 +510,9 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
         queue[tail++] = k;
       }
     }
+    let since = 0;
     while (head < tail) {
+      if (++since >= AUDIT_ROWS * 256) { since = 0; yield; }
       const k = queue[head++];
       const i = k % gi, j = (k / gi) | 0;
       for (let dj = -1; dj <= 1; dj++) {
@@ -382,61 +566,14 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
     }
   }
 
-  // --- 5. cliffs -------------------------------------------------------------
-  // Every walkable edge is walked at WALK_STEP and the surface under each pair of adjacent
-  // samples compared. A discontinuity bigger than WALK_CLIFF that has no ramp gets a real flight
-  // of steps built into it, and only what is left is counted.
-  let cliffs = 0, worstCliff = 0, samples = 0, steps = 0, flights = 0;
-  const gy = C.groundY;
-  for (let e = 0; e < edges.length; e += 4) {
-    const a = edges[e], b = edges[e + 1], len = edges[e + 2];
-    // A deck is not the ground: an elevated way's walking surface is a ribbon this audit has no
-    // business sampling the terrain under. It is continuous by construction and it is measured for
-    // connectivity like everything else.
-    const way = edges[e + 3];
-    if (way >= 0 && G.kind[way] === WAY_OVER) continue;
-    // Inside a depressed corridor the surface underfoot is the carriageway, not the ground plane
-    // over the lid that carries a street across it. Sample what a pedestrian actually walks on.
-    const cor = way >= 0 ? G.corridor[way] : null;
-    const surf = cor
-      ? (x, z) => C.terrainY(x, z) - corridorDepth(cor, x, z)
-      : gy;
-    const n = Math.max(1, Math.ceil(len / WALK_STEP));
-    let px = nx[a], pz = nz[a], py = surf(px, pz);
-    for (let m = 1; m <= n; m++) {
-      const t = m / n;
-      const x = nx[a] + (nx[b] - nx[a]) * t, z = nz[a] + (nz[b] - nz[a]) * t;
-      const y = surf(x, z);
-      samples++;
-      const d = Math.abs(y - py);
-      if (d > WALK_CLIFF) {
-        if (d > worstCliff) worstCliff = d;
-        // A step is only worth building where the drop is a real one; beyond a storey it is a
-        // wall, and a staircase up the face of a retaining wall would be a lie.
-        if (d < 3.0) {
-          setMat(C.mb.sidewalks, M.sidewalk);
-          steps += emitSteps(C.mb.sidewalks, px, pz, py, x, z, y, 1.1);
-          flights++;
-        } else {
-          // Bigger than a storey and it is not a step, it is a wall the sever test above should
-          // have taken the route out on. Counted, located, and never papered over.
-          cliffs++;
-          if (W.worstCliffs.length < 8) {
-            W.worstCliffs.push({
-              m: Math.round(d * 100) / 100, x: Math.round(x), z: Math.round(z),
-            });
-          }
-        }
-      }
-      px = x; pz = z; py = y;
-    }
-  }
 
   // --- 6. holes --------------------------------------------------------------
   // groundY must be finite and sane everywhere inside the world, including outside the mapped
   // extent, where the player can still walk: nothing may fall out of the world.
   let holes = 0, gMin = Infinity, gMax = -Infinity;
+  const gy = C.groundY;
   const hx = extent.x / 2 + 300, hz = extent.z / 2 + 300;
+  let row = 0;
   for (let z = -hz; z <= hz; z += 8) {
     for (let x = -hx; x <= hx; x += 8) {
       const y = gy(x, z);
@@ -444,38 +581,46 @@ function auditWalkability(C, G, roadsRaw, extent, stats) {
       if (y < gMin) gMin = y;
       if (y > gMax) gMax = y;
     }
+    if (++row % AUDIT_ROWS === 0) yield;
   }
 
-  let subLen = 0;
-  const subUf = makeUnionFind(nodeCount);
-  for (let e = 0; e < sub.length; e += 3) { subUf.union(sub[e], sub[e + 1]); subLen += sub[e + 2]; }
-  const subComp = new Set();
-  for (let e = 0; e < sub.length; e += 3) subComp.add(subUf.find(sub[e]));
 
-  W.metres = total;
-  W.largest = mainLen;
-  W.fraction = total > 0 ? mainLen / total : 1;
-  W.components = compLen.size;
   W.islands = islandCount;
   W.islandMetres = islandMetres;
   W.marineIslands = marineCount;
   W.marineMetres = marineMetres;
   W.fractionDry = total - marineMetres > 0 ? mainLen / (total - marineMetres) : 1;
   W.worstIslands = worst;
-  W.cliffs = cliffs;
-  W.cliffWorst = worstCliff;
-  W.samples = samples;
-  W.stitched = stitched;
-  W.stitchMetres = stitchMetres;
-  W.steps = steps;
-  W.flights = flights;
-  W.blockedMetres = blockedMetres;
-  W.severedMetres = severedMetres;
   W.groundHoles = holes;
   W.groundMin = isFinite(gMin) ? gMin : 0;
   W.groundMax = isFinite(gMax) ? gMax : 0;
-  W.subNetMetres = subLen;
-  W.subComponents = subComp.size;
 }
 
-export { auditWalkability };
+/**
+ * The whole of CONTRACT §8.2 as one interruptible chore: solve, hand the repairs to the tiles
+ * that own them, then verify.
+ *
+ * `deliver` is called once, with the builder set the solve wrote into, as soon as the last
+ * connector and the last flight of steps have been emitted — city.js cuts the capture up by tile
+ * and rebuilds whichever tiles were already standing. It may return a generator, in which case it
+ * is driven to completion here. It runs BEFORE the verification sweeps because the repairs are the
+ * only part of this pass a player can see, and they should land as early as they can.
+ *
+ * @param {object} args C, G, roadsRaw, extent, stats, mb (a builder set), deliver (fn)
+ */
+function* walkAudit(args) {
+  const { C, G, roadsRaw, extent, stats, mb, deliver } = args;
+  const P = yield* solveWalk(C, G, roadsRaw, extent, stats, mb);
+  // `deliver` hands the repairs to their tiles, and is itself a generator: cutting a capture up is
+  // not free, and doing it in one step would put back a stall of the kind this pass exists to
+  // avoid. A caller that returns nothing is fine — the audit runs on either way.
+  if (typeof deliver === 'function') {
+    const d = deliver(mb);
+    if (d && typeof d.next === 'function') yield* d;
+  }
+  yield;
+  yield* finishWalkAudit(P);
+}
+
+
+export { solveWalk, finishWalkAudit, walkAudit };

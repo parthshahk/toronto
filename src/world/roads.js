@@ -20,7 +20,6 @@ import { isNum, sgn } from '../core/util.js';
 import { polyResample, pruneSpikes, polyFrames, emitSkirt, MITER_OVER } from '../geom/ribbon.js';
 import { buildParts, planArea } from '../geom/ring.js';
 import { makeGridIndex, splitLongWay } from '../data/index.js';
-import { TILE_SIZE, makeTileGrid } from '../tiles.js';
 import { M, setMat } from '../city/materials.js';
 import {
   EPS, ROAD_Y, ROAD_MAX_SEG, CROWN, CURB, PATH_Y, SIDEWALK_W, PLAZA_MIN_AREA, ROAD_CLASS_OK,
@@ -251,12 +250,13 @@ function buildFootway(C, r) {
  * Harbourfront. Bridges get their own index, filed by SOFFIT height: what is overhead, rather
  * than what is underfoot.
  *
- * @param {object} W the raw ways, the grade solve, the extent and the natural ground sampler.
- * @returns {Promise<object>} the tile grid, the records, both indices, the job lists and the
- *   index origin every later grid in the load is aligned to.
+ * @param {object} W the raw ways, the grade solve, the tile grid, the extent and the natural
+ *   ground sampler.
+ * @returns {Promise<object>} the records, both indices, the job lists and the index origin every
+ *   later grid in the load is aligned to.
  */
 async function buildRoadRecords(W) {
-  const { roadsRaw, data, extent, terrainY, G, SUR_FRINGE, report, stats } = W;
+  const { roadsRaw, data, extent, terrainY, G, grid, report, stats } = W;
 
   report(0.58, 'reading the street network');
 
@@ -272,11 +272,6 @@ async function buildRoadRecords(W) {
       bridgeEnds.set(k, (bridgeEnds.get(k) || 0) + 1);
     }
   }
-
-  // The tile grid has to reach past the data far enough to hold the whole synthesised fringe and
-  // the padded terrain under it, or a surround feature would be indexed into an edge tile whose
-  // draw box then swells to cover a kilometre of nothing.
-  const grid = makeTileGrid(extent, TILE_SIZE, SUR_FRINGE + 420);
 
   // Footways are built LAST of the ground plane, because whether a walkway is worth building at
   // all depends on what the carriageways and their sidewalk ribbons already cover. NOTHING is
@@ -447,7 +442,7 @@ async function buildRoadRecords(W) {
   }
 
   return {
-    grid, recs, roadIdx, deckIdx, roadJobs, footJobs, subJobs, gx0, gz0, worstCut,
+    recs, roadIdx, deckIdx, roadJobs, footJobs, subJobs, gx0, gz0, worstCut,
   };
 }
 
