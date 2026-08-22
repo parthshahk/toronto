@@ -36,7 +36,9 @@ import { emitWallFace } from './buildings.js';
 import { buildFacade, buildSignage } from './frontage.js';
 import { placeRoofscape, roofShapeOf, roofBox, roofRise, ROOF_BOX } from './roofs.js';
 import {
-  S_MASS, S_DETAIL, S_SIGNS, appendChunk, surroundVerts, PARK_TREE_SPACING,
+  S_FAR, S_MASS, S_DETAIL, S_SIGNS, FAR_MIN_H, FAR_TERRAIN_STEP,
+  FAR_LOW_CELLS, FAR_LOW_MIN_AREA, FAR_ROAD_CLASSES,
+  appendChunk, surroundVerts, PARK_TREE_SPACING,
 } from './lod.js';
 import { emitRibbon, setAudit } from '../world/audit.js';
 import {
@@ -71,6 +73,13 @@ import { emitSurroundStreet, emitSurroundBlock, emitFringeBank } from '../world/
  *   ground samplers, the harbour's occupancy claims, the road records and the two stats objects.
  * @returns {GeneratorFunction} build(tile, stage, builders)
  */
+// Scratch for the far tier's low-rise lattice: four accumulators per cell (area, area*height,
+// area*x, area*z) plus the representative material. Module scope because a tile builder is
+// re-entered thousands of times and this must not allocate.
+const _farAcc = new Float64Array(64 * 4);
+const _farMat = new Array(64).fill(null);
+const _farMatA = new Float64Array(64);
+
 function makeTileBuilder(W) {
   const {
     C, COP, G, HARBOUR, T, cnBaseY, cnX, cnZ, data, extent, gradeField, groundY,
@@ -84,9 +93,19 @@ function makeTileBuilder(W) {
 
   /* ------------------------------------------------------- the tile builder */
 
-  const tileSeed = (t, stage) => (
+  // A STAGE'S SEED IS PINNED TO A SALT, NOT TO ITS INDEX.
+  //
+  // Every procedural placement in a stage is keyed on (tile, stage), so keying on the index means
+  // inserting a stage renumbers the ones after it and silently reseeds the entire city — measured
+  // when the far tier went in at index 0: every bin, condenser and pedestrian downtown moved,
+  // for no reason anyone asked for. The salts below keep massing, detail and signage on the
+  // streams they have always had; the far tier, which places nothing procedural, takes a fresh
+  // one. 7 is reserved for the pedestrian seed and must stay distinct.
+  const STAGE_SALT = [3, 0, 1, 2];
+  const saltOf = (stage) => (STAGE_SALT[stage] === undefined ? stage : STAGE_SALT[stage]);
+  const tileSeed = (t, salt) => (
     (SEED ^ Math.imul(t.i + 1, 0x9e3779b1) ^ Math.imul(t.j + 1, 0x85ebca6b) ^
-      Math.imul(stage + 1, 0x27d4eb2d)) >>> 0
+      Math.imul(salt + 1, 0x27d4eb2d)) >>> 0
   );
 
   // Captures that arrived AFTER the tile index was built — the walkability solve's connectors and
@@ -162,6 +181,84 @@ function makeTileBuilder(W) {
       const tx = -sz * 0.85, tz = sx * 0.85;
       boxAA(mbR, x, z, tx, tz, sx * (hw + 0.5), sz * (hw + 0.5), g - 0.6, top);
       C.stats.grade.abutments++;
+    }
+  }
+
+  /**
+   * A building as it reads from kilometres away: its real walls, its real facade colour and
+   * lighting profile, and a flat lid. No roof form, no mechanical deck, no aircraft beacon.
+   *
+   * The SAME walls as the massing stage, deliberately. Massing is already lean — 78 vertices for
+   * an average building over the whole extract — so there is nothing to win by simplifying the
+   * prism, and everything to lose: a different silhouette or a different albedo here would make
+   * the swap at the massing boundary visible. What the far tier saves is the three quarters of
+   * the building stock below FAR_MIN_H, which it never emits at all.
+   */
+  function emitBuildingFar(b) {
+    if (!b.parts || !b.walls || b.landmark === 'cn' || b.buried) return;
+    const wall = b.glass ? C.mb.glass : C.mb.buildings;
+    setMat(wall, b.mat);
+    for (let k = 0; k < b.walls.length; k++) emitWallFace(wall, b.walls[k], C.stats);
+    const y1 = b.y + b.h;
+    setMat(C.mb.buildings, roofMat(b.mat));
+    for (let p = 0; p < b.parts.length; p++) {
+      const part = b.parts[p];
+      if (!part.capBuried) emitCap(C.mb.buildings, part, y1 - part.capDrop, C.stats);
+    }
+  }
+
+  /**
+   * The low-rise fabric for one far tile: one merged block per lattice cell.
+   *
+   * A cell's block stands on the TOTAL footprint area of the sub-FAR_MIN_H buildings whose
+   * centres fall in it, at their area-weighted mean height, centred on their area-weighted
+   * centroid. Area rather than the cell itself, so the block never paves over the streets
+   * between the houses it stands for, and the density of a neighbourhood survives: a cell of
+   * detached houses gets a small block, a cell of solid mainstreet retail gets a broad one.
+   *
+   * Everything it reads — height, footprint, material — comes off the PREPARED record, so the
+   * three quarters of the stock this covers never pays for a coplanar resolve.
+   */
+  function emitFarFabric(tile, F) {
+    const N = FAR_LOW_CELLS;
+    const cw = (tile.cx1 - tile.cx0) / N;
+    const cd = (tile.cz1 - tile.cz0) / N;
+    if (!(cw > 0) || !(cd > 0)) return;
+    const acc = _farAcc;
+    acc.fill(0);
+    for (let k = 0; k < _farMat.length; k++) { _farMat[k] = null; _farMatA[k] = 0; }
+    for (let i = 0; i < F.b.length; i++) {
+      const b = F.b[i];
+      if (!isNum(b.h) || b.h >= FAR_MIN_H || b.buried || b.landmark === 'cn') continue;
+      const part = b.mainPart || (b.parts && b.parts[0]);
+      if (!part || !part.outer) continue;
+      const a = Math.abs(planArea(part.outer));
+      if (!(a > 0)) continue;
+      const bx = isNum(b.cx) ? b.cx : (part.bbox ? (part.bbox[0] + part.bbox[2]) * 0.5 : NaN);
+      const bz = isNum(b.cz) ? b.cz : (part.bbox ? -(part.bbox[1] + part.bbox[3]) * 0.5 : NaN);
+      if (!isNum(bx) || !isNum(bz)) continue;
+      let ci = ((bx - tile.cx0) / cw) | 0;
+      let cj = ((bz - tile.cz0) / cd) | 0;
+      if (ci < 0) ci = 0; else if (ci >= N) ci = N - 1;
+      if (cj < 0) cj = 0; else if (cj >= N) cj = N - 1;
+      const k = cj * N + ci;
+      acc[k * 4] += a;
+      acc[k * 4 + 1] += a * b.h;
+      acc[k * 4 + 2] += a * bx;
+      acc[k * 4 + 3] += a * bz;
+      if (a > _farMatA[k]) { _farMatA[k] = a; _farMat[k] = b.mat; }
+    }
+    for (let k = 0; k < N * N; k++) {
+      const a = acc[k * 4];
+      if (a < FAR_LOW_MIN_AREA || !_farMat[k]) continue;
+      const h = acc[k * 4 + 1] / a;
+      const x = acc[k * 4 + 2] / a;
+      const z = acc[k * 4 + 3] / a;
+      if (!isNum(h) || !isNum(x) || !isNum(z) || h <= 0.5) continue;
+      const side = Math.sqrt(a);
+      const g = terrainY(x, z);
+      setMat(C.mb.buildings, _farMat[k]);
+      C.mb.buildings.box(x, g + h * 0.5, z, side, h, side, 0);
     }
   }
 
@@ -290,10 +387,12 @@ function makeTileBuilder(W) {
 
   function beginTile(tile, stage) {
     const first = !tile.built[stage];
-    C.stats = first ? stats : scrap;
+    // The FAR tier re-describes buildings the massing stage already counted. The audit is meant
+    // to describe the SURVEY once, so the far stage always writes to scrap.
+    C.stats = (first && stage !== S_FAR) ? stats : scrap;
     setAudit(C.stats);
     C.mb = null;                       // set by the caller
-    C.rng = makeRng(tileSeed(tile, stage));
+    C.rng = makeRng(tileSeed(tile, saltOf(stage)));
     C.pedSeed = (PED_SEED ^ tileSeed(tile, 7)) >>> 0;
     C.tilePeople = 0;
     const ox = tile.bx0 - 24, oz = tile.bz0 - 24;
@@ -414,6 +513,49 @@ function makeTileBuilder(W) {
         const b = F.b[i];
         resolve(b);
         if (!b.buried) buildSignage(C, b);
+        if ((i & 31) === 31) yield;
+      }
+      endTile(tile, stage, first);
+      return;
+    }
+
+    if (stage === S_FAR) {
+      /* ------------------------------------------------------------ far tier */
+      // THE CITY FROM KILOMETRES AWAY. Ground, ground cover, the road network and every building
+      // tall enough to still be a shape — and nothing else. Drawn only where the massing stage
+      // has not reached; see CityTiles.forEachMesh. Held to a couple of thousand vertices a tile
+      // so the whole 17 km map can be resident for less than a kilometre of massing costs.
+      emitTerrainRange(builders.terrain, T, null, F.i0, F.i1, F.j0, F.j1, FAR_TERRAIN_STEP);
+      yield;
+      // Ground cover at the far tolerance, so a park is green from the air rather than bare grey.
+      for (let i = 0; i < F.areas.length; i++) {
+        const part = F.areas[i];
+        if (!part.drape) continue;
+        const gy = part.kind === 'pier' ? (x, z) => Math.max(terrainY(x, z), 0.9) : terrainY;
+        setMat(builders[part.target], part.mat);
+        emitDrapedCap(builders[part.target], part, gy, part.dy, C.stats, gradeField, true);
+        if ((i & 15) === 15) yield;
+      }
+      yield;
+      for (let i = 0; i < F.b.length; i++) {
+        const b = F.b[i];
+        // Height is read straight off the prepared record, BEFORE resolve(), so three quarters of
+        // the stock costs nothing but the test.
+        if (!isNum(b.h) || b.h < FAR_MIN_H) continue;
+        resolve(b);
+        emitBuildingFar(b);
+        if ((i & 63) === 63) yield;
+      }
+      // The CN Tower is 553 m and is the one building visible from everywhere in the extract.
+      if (F.cn) emitCNTower(builders.buildings, builders.glass, builders.props, cnX, cnZ, cnBaseY);
+      yield;
+      emitFarFabric(tile, F);
+      yield;
+      // The street grid is what makes an aerial view read as a city rather than as terrain —
+      // but only the streets. See FAR_ROAD_CLASSES.
+      for (let i = 0; i < F.recs.length; i++) {
+        if (!FAR_ROAD_CLASSES[F.recs[i].cls]) continue;
+        emitRoadMass(F.recs[i]);
         if ((i & 31) === 31) yield;
       }
       endTile(tile, stage, first);

@@ -534,6 +534,36 @@ if (!QUIET) {
   for (const k of Object.keys(F)) console.log('  ' + k.padEnd(24) + String(F[k]).padStart(12));
 }
 
+/* ------------------------------------------------ the island survey's frame -- */
+// src/world/islandplan.js holds SURVEY frozen in world metres — the Billy Bishop aeroway layout,
+// the beaches, the ferry routes, the Centreville rides, the lighthouse. World metres mean nothing
+// without an origin, and build_city.py derives the origin from the centre of its BBOX, so growing
+// the extract MOVES it and silently invalidates every number in that file.
+//
+// It has already happened once: the Old Toronto expansion moved the origin 4,062 m north and took
+// the runway with it, out into open harbour. Nothing failed, nothing warned — the airport was
+// simply somewhere nobody would fly. This is the check that would have caught it on the same day.
+// Fix with: node tools/rebase_islandplan.mjs --from <old lon>,<old lat>
+{
+  const { PLAN_ORIGIN } = await import(resolve(ROOT, 'src/world/islandplan.js'));
+  const live = extract.meta && extract.meta.origin ? extract.meta.origin : null;
+  if (!PLAN_ORIGIN) {
+    fails.push('islandplan.js has no PLAN_ORIGIN, so its frame cannot be verified');
+  } else if (!live) {
+    warns.push('city data carries no origin, so the island survey frame cannot be verified');
+  } else {
+    const dLon = Math.abs(PLAN_ORIGIN.lon - live.lon);
+    const dLat = Math.abs(PLAN_ORIGIN.lat - live.lat);
+    // 1e-6 degrees is about 0.1 m — far tighter than the 0.1 m the tables are rounded to.
+    if (dLon > 1e-6 || dLat > 1e-6) {
+      const m = Math.round(dLat * 111320);
+      fails.push('island survey is baked in a stale frame: islandplan.js is at '
+        + `${PLAN_ORIGIN.lon},${PLAN_ORIGIN.lat} but the city origin is ${live.lon},${live.lat}`
+        + ` (~${m} m adrift) — run tools/rebase_islandplan.mjs`);
+    }
+  }
+}
+
 console.log('\n--- verification ---------------------------------------------------------');
 if (!fails.length) console.log('  PASS  ' + fmt(total) + ' verts, 0 NaN, 0 bad normals, 0 profile-0 emissive violations');
 for (const w of warns) console.log('  WARN  ' + w);

@@ -74,13 +74,27 @@ export function emitCap(mb, part, y, stats) {
 const CAP_MAX_EDGE = 6.0;          // no point testing a split shorter than this
 const CAP_TOL = 0.012;             // metres the flat plane may cut across the real ground
 const CAP_MAX_SPLIT = 7;           // depth guard, so one pathological ring cannot run away
+// The far tier's budget for the same job. Measured over the whole map: the fine settings cost
+// 2.61 M vertices of draped ground cover, these cost about a tenth of that.
+const CAP_MAX_EDGE_COARSE = 34.0;
+const CAP_TOL_COARSE = 0.20;
+const CAP_MAX_SPLIT_COARSE = 2;
 const _capStack = [];
 
-export function emitDrapedCap(mb, part, groundY, dy, stats, grade) {
+export function emitDrapedCap(mb, part, groundY, dy, stats, grade, coarse) {
   const tris = triangulate(part.co, part.holeStarts);
   if (!tris.length) { if (stats) stats.capFail++; return 0; }
   const co = part.co;
   const S = _capStack;
+  // COARSE is the far tier's tolerance. The 12 mm figure exists so a ground cover laid four
+  // centimetres above the terrain cannot dip through it at the player's feet; at three kilometres
+  // that budget buys nothing and costs everything, because the splitter recurses to 2^7 triangles
+  // per ear chasing it. A park at 20 cm and two levels of split is the same green shape from the
+  // air for a fraction of the vertices, and the massing stage replaces it outright long before
+  // anyone is close enough to see the difference.
+  const tol = coarse ? CAP_TOL_COARSE : CAP_TOL;
+  const maxSplit = coarse ? CAP_MAX_SPLIT_COARSE : CAP_MAX_SPLIT;
+  const maxEdge2 = coarse ? CAP_MAX_EDGE_COARSE * CAP_MAX_EDGE_COARSE : CAP_MAX_EDGE * CAP_MAX_EDGE;
   let n = 0;
   for (let t = 0; t < tris.length; t += 3) {
     const a = tris[t] * 2, b = tris[t + 1] * 2, c = tris[t + 2] * 2;
@@ -95,11 +109,11 @@ export function emitDrapedCap(mb, part, groundY, dy, stats, grade) {
       const zb = S.pop(), yb = S.pop(), xb = S.pop();
       const za = S.pop(), ya = S.pop(), xa = S.pop();
       let split = 0;                                   // 0 none, 1 edge ab, 2 edge bc, 3 edge ca
-      if (d < CAP_MAX_SPLIT) {
+      if (d < maxSplit) {
         const e0 = (xb - xa) * (xb - xa) + (zb - za) * (zb - za);
         const e1 = (xc - xb) * (xc - xb) + (zc - zb) * (zc - zb);
         const e2 = (xa - xc) * (xa - xc) + (za - zc) * (za - zc);
-        const lim = CAP_MAX_EDGE * CAP_MAX_EDGE;
+        const lim = maxEdge2;
         if (e0 >= e1 && e0 >= e2) { if (e0 > lim) split = 1; }
         else if (e1 >= e2) { if (e1 > lim) split = 2; }
         else if (e2 > lim) split = 3;
@@ -111,7 +125,7 @@ export function emitDrapedCap(mb, part, groundY, dy, stats, grade) {
         const pz = split === 1 ? (za + zb) * 0.5 : (split === 2 ? (zb + zc) * 0.5 : (zc + za) * 0.5);
         const flat = split === 1 ? (ya + yb) * 0.5 : (split === 2 ? (yb + yc) * 0.5 : (yc + ya) * 0.5);
         const real = groundY(px, pz) + dy;
-        if (Math.abs(real - flat) <= CAP_TOL) split = 0;
+        if (Math.abs(real - flat) <= tol) split = 0;
         else if (split === 1) {
           S.push(xa, ya, za, px, real, pz, xc, yc, zc, d + 1);
           S.push(px, real, pz, xb, yb, zb, xc, yc, zc, d + 1);

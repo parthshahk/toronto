@@ -161,6 +161,26 @@ export function extractPlanes(m, out) {
   return out;
 }
 
+/**
+ * As boxOutside(), but with `m` metres of slack on every plane.
+ *
+ * The frustum a tile is DRAWN against has to be exact. The frustum a tile is BUILT against must
+ * not be: geometry has to already exist by the time a turn brings it on screen, so the want set
+ * is tested against a cone widened by a margin the caller scales with distance. The planes come
+ * out of extractPlanes() normalized, so `m` is plain metres and a margin of 0.35 x distance is
+ * about twenty degrees of extra half-angle at any range.
+ */
+export function boxOutsideMargin(pl, x0, y0, z0, x1, y1, z1, m) {
+  for (let i = 0; i < 24; i += 4) {
+    const a = pl[i], b = pl[i + 1], c = pl[i + 2], d = pl[i + 3];
+    const px = a >= 0 ? x1 : x0;
+    const py = b >= 0 ? y1 : y0;
+    const pz = c >= 0 ? z1 : z0;
+    if (a * px + b * py + c * pz + d + m < 0) return true;
+  }
+  return false;
+}
+
 export function boxOutside(pl, x0, y0, z0, x1, y1, z1) {
   for (let i = 0; i < 24; i += 4) {
     const a = pl[i], b = pl[i + 1], c = pl[i + 2], d = pl[i + 3];

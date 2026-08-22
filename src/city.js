@@ -105,7 +105,9 @@ import { prepareBuildings } from './city/prep.js';
 import { makeCoplanarResolver } from './city/coplanar.js';
 import { resetFacadeAudit } from './city/facadekit.js';
 import {
-  MASS_RANGE, MASS_DROP, DETAIL_RANGE, DETAIL_DROP, SIGN_RANGE, SIGN_DROP, VERTEX_CAP,
+  FAR_RANGE, FAR_DROP, FAR_FLOOR, FAR_NEAR, farRangeAt, S_FAR, S_MASS,
+  MASS_RANGE, MASS_DROP, DETAIL_RANGE, DETAIL_DROP, SIGN_RANGE, SIGN_DROP,
+  VERTEX_CAP,
   TILE_BUDGET_MS, TILE_EVICT_MS, CityTiles, makeBuilders, deliverCapture, S_DETAIL,
 } from './city/lod.js';
 import { makeTileBuilder } from './city/tilebuild.js';
@@ -455,10 +457,19 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   const tiles = new CityTiles({
     gl,
     grid,
+    // The cone the want set is built against. Measured at street level: the defaults were wide
+    // enough that 65 tiles of massing stood resident for the ~20 that were on screen.
+    viewMarginFrac: 0.30,
+    viewMarginMin: 350,
+    omniRadius: 900,
     classes: MESH_CLASSES,
     signClass: SIGN_CLASS,
     lastOpaque: LAST_OPAQUE_CLASS,
     stages: [
+      // The far tier serves an ANNULUS. Inside FAR_NEAR the massing stage draws over it, so a
+      // resident far tile there is geometry that is suppressed every frame it exists.
+      { name: 'far', range: FAR_RANGE, drop: FAR_DROP, floor: FAR_FLOOR, near: FAR_NEAR,
+        supersededBy: S_MASS },
       { name: 'massing', range: MASS_RANGE, drop: MASS_DROP },
       { name: 'detail', range: DETAIL_RANGE, drop: DETAIL_DROP },
       { name: 'signs', range: SIGN_RANGE, drop: SIGN_DROP },
@@ -559,9 +570,17 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
   chores.push(prep.sweep());
   chores.push(COP.sweep(prepped));
 
+  // THE WALKABILITY SOLVE IS STREET DETAIL, NOT MASSING. Everything it emits — dropped kerbs,
+  // flights of steps, the connectors that close a gap between two pavements — is pavement-scale
+  // and invisible past a couple of hundred metres. It used to default into the massing stage,
+  // which meant it was built out to the full massing radius: measured at 11.8 M vertices over
+  // the map, 34% of all massing geometry, none of it resolvable where most of it stood. Moving
+  // it to the detail stage is the single largest saving in the build.
   chores.push(walkAudit({
     C, G, roadsRaw, extent, stats, mb: walkCap,
-    deliver: (mb) => deliverCapture({ grid, tiles, cap: mb, stageOf: {}, stats }),
+    deliver: (mb) => deliverCapture({
+      grid, tiles, cap: mb, stageOf: {}, defaultStage: S_DETAIL, stats,
+    }),
   }));
 
   /**
@@ -691,6 +710,14 @@ export async function loadCity(gl, url = './data/toronto.json', onProgress) {
    * eviction. Call once per frame, before drawing.
    */
   function update(camera, nowMs, budgetMs) {
+    // The far tier's radius follows eye height — see farRangeAt(). Written straight onto the
+    // stage because range() and drop() read it every frame anyway, and the adaptive valve's
+    // scale multiplies whatever is there.
+    {
+      const st = tiles.stages[S_FAR];
+      const r = farRangeAt(camera && camera.pos ? camera.pos[1] : 0);
+      if (st && r !== st.range) { st.range = r; st.drop = Math.round(r * 1.15); }
+    }
     tiles.frame(camera, nowMs, budgetMs);
     // The deferred audits get their slice AFTER the geometry: a tile the player is looking at is
     // worth more than a counter nobody has asked for yet.

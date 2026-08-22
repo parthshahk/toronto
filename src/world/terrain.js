@@ -307,7 +307,53 @@ function terrainNormals(T) {
  * the whole grid is still emitted exactly once and adjacent tiles share their edge vertices to
  * the bit — the seam is not stitched, it simply cannot open.
  */
-function emitTerrainRange(mb, T, grade, i0, i1, j0, j1) {
+/**
+ * Decimated ground for the far tier. Corner heights are read straight off the height field at the
+ * sampled grid lines, so the coarse mesh meets the fine one exactly wherever their samples
+ * coincide and never drifts far from it in between; the last row and column are clamped to the
+ * rectangle so a tile whose span is not a multiple of `st` still closes.
+ */
+function emitTerrainCoarse(mb, T, nrm, ia, ib, ja, jb, st, isleLand) {
+  const { nx, cell, x0, z0, h } = T;
+  let isleMat = -1;
+  setMat(mb, M.terrain);
+  for (let j = ja; j < jb; j += st) {
+    const j1c = Math.min(j + st, jb);
+    if (j1c <= j) continue;
+    for (let i = ia; i < ib; i += st) {
+      const i1c = Math.min(i + st, ib);
+      if (i1c <= i) continue;
+      if (isleLand) {
+        const want = isleLand[j * nx + i] ? 1 : 0;
+        if (want !== isleMat) { isleMat = want; setMat(mb, want ? M.park : M.terrain); }
+      }
+      const a00 = (j * nx + i) * 3, a10 = (j * nx + i1c) * 3;
+      const a01 = (j1c * nx + i) * 3, a11 = (j1c * nx + i1c) * 3;
+      const x = x0 + i * cell, xr = x0 + i1c * cell;
+      const z = z0 + j * cell, zr = z0 + j1c * cell;
+      const y00 = h[j * nx + i], y10 = h[j * nx + i1c];
+      const y01 = h[j1c * nx + i], y11 = h[j1c * nx + i1c];
+      mb.vert(x, y01, zr, nrm[a01], nrm[a01 + 1], nrm[a01 + 2]);
+      mb.vert(xr, y11, zr, nrm[a11], nrm[a11 + 1], nrm[a11 + 2]);
+      mb.vert(xr, y10, z, nrm[a10], nrm[a10 + 1], nrm[a10 + 2]);
+      mb.vert(x, y01, zr, nrm[a01], nrm[a01 + 1], nrm[a01 + 2]);
+      mb.vert(xr, y10, z, nrm[a10], nrm[a10 + 1], nrm[a10 + 2]);
+      mb.vert(x, y00, z, nrm[a00], nrm[a00 + 1], nrm[a00 + 2]);
+    }
+  }
+}
+
+/**
+ * The ground mesh for one rectangle of the grid.
+ *
+ * `step` is the DECIMATION: 1 is every cell, and anything larger samples every step-th grid line
+ * and skips the graded-corridor cut cells entirely. That is the far tier's terrain — a trench
+ * profile and a 25 m cell are both invisible at three kilometres, and the full-resolution mesh
+ * costs 3,750 vertices a tile against 150 at step 5. The far stage's ground is replaced by the
+ * massing stage's the moment a tile comes close enough to have one, so the coarse mesh is never
+ * the ground the player walks on.
+ */
+function emitTerrainRange(mb, T, grade, i0, i1, j0, j1, step) {
   const { nx, nz, cell, x0, z0, h } = T;
   const nrm = terrainNormals(T);
   // ISLANDS: the Toronto Islands are parkland from shore to shore, and only about half of that
@@ -321,6 +367,8 @@ function emitTerrainRange(mb, T, grade, i0, i1, j0, j1) {
   const pz = (j) => z0 + j * cell;
   const ja = Math.max(0, j0), jb = Math.min(nz - 1, j1);
   const ia = Math.max(0, i0), ib = Math.min(nx - 1, i1);
+  const st = (Number.isFinite(step) && step > 1) ? Math.floor(step) : 1;
+  if (st > 1) { emitTerrainCoarse(mb, T, nrm, ia, ib, ja, jb, st, isleLand); return; }
   for (let j = ja; j < jb; j++) {
     for (let i = ia; i < ib; i++) {
       if (isleLand) {

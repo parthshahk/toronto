@@ -31,7 +31,7 @@
 
 import { MeshBuilder } from './core/gl.js';
 import {
-  TILE_SIZE, makeTileGrid, splitRuns, extractPlanes, boxOutside, boxDist,
+  TILE_SIZE, makeTileGrid, splitRuns, extractPlanes, boxOutside, boxOutsideMargin, boxDist,
 } from './tilegrid.js';
 
 // The grid moved to ./tilegrid.js when this file passed the ~800-line ceiling. It is still
@@ -39,6 +39,13 @@ import {
 export { TILE_SIZE, makeTileGrid, splitRuns };
 
 /* ================================================================ constants == */
+
+// Frame times the build budget steers between: under FRAME_ROOMY there is room to generate more
+// this frame, over FRAME_TIGHT the generation is already costing the player frames. The gap
+// between them is the deadband that stops it hunting.
+const FRAME_ROOMY = 19.0;
+const FRAME_TIGHT = 24.0;
+const BUDGET_STEP = 0.35;
 
 const STATE_EMPTY = 0;
 const STATE_BUILDING = 1;
@@ -84,14 +91,69 @@ export class TileManager {
       name: s.name || 'stage',
       range: Number.isFinite(s.range) ? s.range : 1000,
       drop: Number.isFinite(s.drop) ? s.drop : (Number.isFinite(s.range) ? s.range * 1.3 : 1300),
+      // How far the adaptive valve may wind this stage's radius back before it gives up. A stage
+      // that is cheap and carries the whole distant image — the far tier — sets a high floor so
+      // a squeeze somewhere else cannot take the horizon away.
+      floor: Number.isFinite(s.floor) ? s.floor : null,
+      // A stage may serve an ANNULUS rather than a disc: `near` is the distance inside which it
+      // is not wanted, and `supersededBy` names the stage that has to be STANDING for that to
+      // apply. The far tier uses both: inside `near` the massing stage draws over it, so holding
+      // it there is paying for geometry that is deliberately never drawn — but only once the
+      // massing is actually there. On distance alone, arriving somewhere new left a tile with no
+      // far tier and no massing yet, which is a hole in the ground exactly when the player is
+      // most likely to be looking at it.
+      near: Number.isFinite(s.near) ? s.near : 0,
+      supersededBy: Number.isFinite(s.supersededBy) ? s.supersededBy : -1,
     }));
     this.build = typeof o.build === 'function' ? o.build : null;
     this.vertexCap = Number.isFinite(o.vertexCap) ? o.vertexCap : 9000000;
     this.budgetMs = Number.isFinite(o.budgetMs) ? o.budgetMs : 4.0;
+
+    // THE BUILD BUDGET FINDS ITS OWN LEVEL.
+    //
+    // A fixed 3.5 ms a frame was set when a tile had two stages and the map was 6.8 km across.
+    // It is now four stages over 252 km2: a dense tile costs about 28 ms to generate, and filling
+    // the view after a fast move means roughly 150 of them — about 1,200 frames, or twenty
+    // seconds of watching the city assemble itself. That is most of what "the detail arrives too
+    // late" actually is; the radius is only the other half.
+    //
+    // So the budget grows while there is work queued and the frame is comfortably inside its
+    // slice, and gives ground the moment frames start slipping. Because spending more IS what
+    // makes frames slip, this settles by itself at whatever the machine can afford, and it costs
+    // nothing on a machine that cannot afford anything. With no work queued it decays back to
+    // the base, so a burst never inherits a budget the last one earned.
+    this.budgetMaxMs = Number.isFinite(o.budgetMaxMs) ? o.budgetMaxMs : 9.0;
+    this._budget = this.budgetMs;
+    this._prevNow = 0;
     this.evictMs = Number.isFinite(o.evictMs) ? o.evictMs : 12000;
     this.maxQueue = Number.isFinite(o.maxQueue) ? o.maxQueue : 512;
     this.dataBudgetMs = Number.isFinite(o.dataBudgetMs) ? o.dataBudgetMs : 2.0;
     this.dataAhead = Number.isFinite(o.dataAhead) ? o.dataAhead : 700;
+
+    // THE WANT SET IS SCOPED TO THE VIEW.
+    //
+    // Range alone decides what gets BUILT, and range is a disc: at 900 m over downtown that is
+    // ~200 tiles of massing queued so that ~40 can be drawn. Five sixths of the vertex budget
+    // went on geometry behind the camera, and because the budget is a hard cap the adaptive LOD
+    // valve paid for it by shrinking the radius of the stages in front — measured with the
+    // detail stage pinned at its 0.12 floor, 94 m of a possible 780 m, at every viewpoint in
+    // the city. Street furniture arrived a hundred metres away instead of eight hundred, and
+    // the massing stopped 2.6 km out instead of 5 km. Both are what the player actually sees.
+    //
+    // So a tile is only queued if it is inside a WIDENED frustum, or inside `omniRadius` of the
+    // camera, where turning on the spot must never rebuild anything. The margin is a fraction of
+    // the tile's own distance, which is a constant angle rather than a constant distance, plus a
+    // floor so close tiles are generous. Eviction is protected by a larger margin than building
+    // uses, so a tile drifting across the edge of the cone is not built and dropped repeatedly.
+    //
+    // Set `omniRadius` to Infinity to restore the pure-disc behaviour; the geometry tools build
+    // every tile directly through _startJob() and never consult any of this.
+    this.viewMarginFrac = Number.isFinite(o.viewMarginFrac) ? o.viewMarginFrac : 0.35;
+    this.viewMarginMin = Number.isFinite(o.viewMarginMin) ? o.viewMarginMin : 900;
+    this.omniRadius = (o.omniRadius === Infinity || Number.isFinite(o.omniRadius))
+      ? o.omniRadius : 1300;
+    // Hysteresis: what is kept is a wider cone than what is built.
+    this.viewKeepMult = Number.isFinite(o.viewKeepMult) ? o.viewKeepMult : 1.8;
 
     // Adaptive level-of-detail scale — the safety valve that keeps the WANT SET inside the cap.
     //
@@ -115,6 +177,10 @@ export class TileManager {
     this._lod = new Float64Array(this.stages.length).fill(1);
     this._lodCeil = new Float64Array(this.stages.length).fill(1);
     this._lodCeilCap = this.vertexCap;
+    this._lodTurn = 0;
+    // Resident vertices per stage, refreshed every frame. The valve needs to know which
+    // stage can actually pay for an overflow; see _adaptLod.
+    this._stageVerts = new Float64Array(this.stages.length);
     // Floors: massing is the silhouette and gives up radius only after every detail stage has
     // already bottomed out, so detail's floor is the lower of the two. They are set low enough
     // that the valve can ALWAYS reach a want set that fits — a stage whose range has gone to its
@@ -123,7 +189,8 @@ export class TileManager {
     // the cap is badly undersized for the hardware and the skyline will visibly shorten; that is
     // still the right failure, because the alternative measured at 6 M was a permanent treadmill
     // of 150 builds and 150 evictions per 200 frames with the camera standing still.
-    this._lodFloor = this.stages.map((s, i) => (i === 0 ? 0.20 : 0.12));
+    this._lodFloor = this.stages.map((s, i) => (
+      Number.isFinite(s.floor) ? s.floor : (i === 0 ? 0.20 : 0.12)));
     this._lodAnchor = [Infinity, Infinity, Infinity];
 
     const nStage = this.stages.length;
@@ -166,6 +233,7 @@ export class TileManager {
     this.stats = {
       residentVerts: 0, residentTiles: 0, visibleTiles: 0, drawMeshes: 0,
       built: 0, evicted: 0, evictedVerts: 0, queued: 0, buildMs: 0, lastBuildMs: 0,
+      buildBudgetMs: 0,
       peakResidentVerts: 0, uploads: 0, freed: 0, lodScale: 1, lodShrinks: 0, lodRelaxes: 0,
       evictedWanted: 0, staticVerts: 0, staticMeshes: 0,
       dataWaits: 0, dataMs: 0,
@@ -362,17 +430,35 @@ export class TileManager {
 
   _wantStage(tile, s) {
     // Stage 0 gates every later one: massing is what a tile IS, and detail proud of a wall that
-    // was never emitted would float in space.
+    // was never emitted would float in space. Only the OUTER limit gates — a stage that serves
+    // an annulus must not pull the stages behind it in with its inner edge.
     for (let k = 0; k <= s; k++) {
       if (tile.dist > this.range(k)) return false;
     }
+    if (this._superseded(tile, s, 1)) return false;
     return !tile.empty;
+  }
+
+  /**
+   * Is stage `s` of this tile close enough in that the stage which draws over it has taken over?
+   *
+   * Both conditions have to hold: inside the annulus AND the superseding stage actually standing.
+   * `slack` widens the radius for the keep test so the boundary cannot thrash.
+   */
+  _superseded(tile, s, slack) {
+    const st = this.stages[s];
+    if (!(st.near > 0) || tile.dist >= st.near * slack) return false;
+    const sup = st.supersededBy;
+    if (sup < 0) return true;
+    const rec = tile.st[sup];
+    return !!rec && rec.state === STATE_READY;
   }
 
   _keepStage(tile, s) {
     for (let k = 0; k <= s; k++) {
       if (tile.dist > this.drop(k)) return false;
     }
+    if (this._superseded(tile, s, 0.72)) return false;
     return true;
   }
 
@@ -402,20 +488,48 @@ export class TileManager {
     const dx = px - ax[0], dy = py - ax[1], dz = pz - ax[2];
     const moved = !(dx * dx + dy * dy + dz * dz < half * half);
     const capChanged = cap !== this._lodCeilCap;
-    const roomy = res < cap * 0.6 && !this._job && this._queue.length === 0;
+    // Forgiving the ceiling on genuine headroom. 0.6 was too strict once the far tier made the
+    // resident total depend on altitude: flying up frees several million vertices at once, and
+    // at 69% full the detail radius stayed pinned where a street-level squeeze had left it with
+    // 3.5 M vertices going unused. Overshooting costs one shrink, which the ceiling then pins
+    // again; not overshooting costs radius the player can see.
+    const roomy = res < cap * 0.82 && !this._job && this._queue.length === 0;
     if (moved || capChanged || roomy) {
       for (let s = 0; s < n; s++) this._lodCeil[s] = 1;
       this._lodCeilCap = cap;
       if (moved) { ax[0] = px; ax[1] = py; ax[2] = pz; }
     }
     if (res > cap) {
+      // SHRINK A STAGE THAT CAN ACTUALLY PAY.
+      //
+      // Walking from the most detailed stage down and taking the first one above its floor meant
+      // the signage stage — the last in the list and, at well under ten thousand resident
+      // vertices, the cheapest thing in the world — was driven from 165 m to its 20 m floor
+      // before the detail stage was touched even once. Twenty-two consecutive shrinks that freed
+      // nothing, because the overflow was never signage's to fix; and once bottomed out its
+      // ceiling pinned it there for the rest of the session. Shop names simply stopped existing
+      // downtown.
+      //
+      // So a stage is only asked to give up radius if it is holding enough for that to matter.
+      // If none is — the overflow is coming from somewhere a stage radius cannot reach — fall
+      // back to the old walk so the valve still always converges.
+      const payShare = cap * 0.02;
+      let pick = -1;
       for (let s = n - 1; s >= 0; s--) {
-        if (this._lod[s] > this._lodFloor[s] + 1e-6) {
-          this._lodCeil[s] = this._lod[s];
-          this._lod[s] = Math.max(this._lodFloor[s], this._lod[s] - this.lodStep);
-          this.stats.lodShrinks++;
-          break;
+        if (this._lod[s] <= this._lodFloor[s] + 1e-6) continue;
+        if (this._stageVerts[s] < payShare) continue;
+        pick = s;
+        break;
+      }
+      if (pick < 0) {
+        for (let s = n - 1; s >= 0; s--) {
+          if (this._lod[s] > this._lodFloor[s] + 1e-6) { pick = s; break; }
         }
+      }
+      if (pick >= 0) {
+        this._lodCeil[pick] = this._lod[pick];
+        this._lod[pick] = Math.max(this._lodFloor[pick], this._lod[pick] - this.lodStep);
+        this.stats.lodShrinks++;
       }
     } else if (res < cap && !this._job && this._queue.length === 0) {
       // Only with the want set fully satisfied — relaxing while tiles are still queued would
@@ -429,11 +543,21 @@ export class TileManager {
       // ceiling instead, which is the mechanism that actually knows where the edge was: one
       // relax overshoots by a single step, the shrink puts it back, and the ceiling then pins it
       // there.
-      for (let s = 0; s < n; s++) {
+      // ROUND ROBIN, so a cheap stage cannot be starved by an expensive one.
+      //
+      // Relaxing from s = 0 every time meant whichever stage was furthest below its ceiling won
+      // every turn. Downtown that is the detail stage, which is expensive enough that relaxing it
+      // overflows the cap immediately and is shrunk straight back — so the loop spent every frame
+      // on the same two steps and never reached the signage stage at all. Measured with 0.88 M
+      // vertices of headroom going unused and shop names pinned at 20 m of a possible 165 m, in a
+      // stage whose entire resident cost is under ten thousand vertices.
+      for (let k = 0; k < n; k++) {
+        const s = (this._lodTurn + k) % n;
         const ceil = Math.max(this._lodFloor[s], this._lodCeil[s] - this.lodStep);
         if (this._lod[s] < Math.min(1, ceil) - 1e-6) {
           this._lod[s] = Math.min(1, ceil, this._lod[s] + this.lodStep * 0.5);
           this.stats.lodRelaxes++;
+          this._lodTurn = (s + 1) % n;
           break;
         }
       }
@@ -610,6 +734,8 @@ export class TileManager {
     this._queue.length = 0;
     let resident = 0;
     let meshes = 0;
+    const sv = this._stageVerts;
+    sv.fill(0);
 
     const maxRange = this.stages.length ? this.drop(0) : 0;
     // THE READ-AHEAD. Records are asked for out to here, past the range anything is actually
@@ -636,7 +762,11 @@ export class TileManager {
       if (t.dist <= dataRange && !t.empty) this._data.want(t.id, this._now, t.dist);
       let ready = false;
       for (let s = 0; s < t.st.length; s++) {
-        if (t.st[s].state === STATE_READY) { resident += t.st[s].verts; ready = true; }
+        if (t.st[s].state === STATE_READY) {
+          resident += t.st[s].verts;
+          sv[s] += t.st[s].verts;
+          ready = true;
+        }
       }
       const inRange = t.dist <= maxRange;
       const shown = ready && inRange && !boxOutside(pl, t.bx0, t.by0, t.bz0, t.bx1, t.by1, t.bz1);
@@ -651,13 +781,25 @@ export class TileManager {
         }
       }
       if (!inRange || t.empty) continue;
+      // IN RANGE IS NOT ENOUGH — see viewMarginFrac. A tile is built when it is close enough
+      // that turning round must not stall, or when it is inside the widened cone; it is kept
+      // against a wider cone still, so the boundary cannot thrash.
+      const omni = t.dist <= this.omniRadius;
+      let wantable = omni, keepable = omni;
+      if (!omni) {
+        const m = Math.max(this.viewMarginMin, t.dist * this.viewMarginFrac);
+        keepable = !boxOutsideMargin(pl, t.bx0, t.by0, t.bz0, t.bx1, t.by1, t.bz1,
+          m * this.viewKeepMult);
+        wantable = keepable
+          && !boxOutsideMargin(pl, t.bx0, t.by0, t.bz0, t.bx1, t.by1, t.bz1, m);
+      }
       for (let s = 0; s < t.st.length; s++) {
         const rec = t.st[s];
         // Stamped whether or not the stage is resident yet: this is "when was this wanted",
         // which is what the eviction grace period has to be measured against.
-        if (this._keepStage(t, s)) rec.lastWant = this._now;
+        if (keepable && this._keepStage(t, s)) rec.lastWant = this._now;
         if (rec.state !== STATE_EMPTY) continue;
-        if (!this._wantStage(t, s)) continue;
+        if (!wantable || !this._wantStage(t, s)) continue;
         this._queue.push({ tile: t, stage: s, key: t.dist + s * 100000 });
       }
     }
@@ -673,7 +815,24 @@ export class TileManager {
     if (this._queue.length > 1) this._queue.sort((a, b) => a.key - b.key);
     if (this._queue.length > this.maxQueue) this._queue.length = this.maxQueue;
 
-    const budget = Number.isFinite(budgetMs) ? budgetMs : this.budgetMs;
+    // Adapt the budget before spending it. An explicit budgetMs (the loader, the headless tools)
+    // overrides the whole mechanism.
+    {
+      const prev = this._prevNow;
+      this._prevNow = this._now;
+      const dt = prev ? this._now - prev : 16.7;
+      if (this._queue.length || this._job) {
+        if (dt > 0 && dt < FRAME_ROOMY) {
+          this._budget = Math.min(this.budgetMaxMs, this._budget + BUDGET_STEP);
+        } else if (dt > FRAME_TIGHT) {
+          this._budget = Math.max(this.budgetMs * 0.5, this._budget - BUDGET_STEP * 2);
+        }
+      } else if (this._budget !== this.budgetMs) {
+        this._budget = this.budgetMs;
+      }
+      this.stats.buildBudgetMs = this._budget;
+    }
+    const budget = Number.isFinite(budgetMs) ? budgetMs : this._budget;
     // Data first: there is nothing to triangulate until the records land, and a build that finds
     // its payload missing costs a wasted queue slot.
     const dataMs = this._pumpData(budget);
@@ -757,4 +916,5 @@ export class TileManager {
   }
 }
 
+export { STATE_EMPTY, STATE_BUILDING, STATE_READY };
 export default { TILE_SIZE, makeTileGrid, splitRuns, TileManager };

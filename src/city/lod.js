@@ -19,7 +19,7 @@
 
 import { MeshBuilder } from '../core/gl.js';
 import { VERT_FLOATS } from '../core/vertex.js';
-import { TileManager } from '../tiles.js';
+import { TileManager, STATE_READY } from '../tiles.js';
 import { TEXT_RANGE, TEXT_DROP } from '../render/text.js';
 import { MESH_CLASSES } from './materials.js';
 
@@ -27,15 +27,25 @@ import { MESH_CLASSES } from './materials.js';
 // view: massing with its real facade colour and lighting profile, the ground it stands on, the
 // carriageway ribbons, the rails, the quay. Stage 1 is everything you can only resolve from the
 // pavement: markings, kerbs, shopfronts, balconies, street furniture, people.
-const S_MASS = 0;
-const S_DETAIL = 1;
+// Stage 0 is the FAR TIER: the city as it reads from kilometres away, and nothing else. Coarse
+// ground, the road network, and a prism for every building tall enough to still be a shape at
+// that range. It exists because the map is now 17.3 x 14.6 km while the massing stage reaches
+// 5 km, so from any altitude two thirds of the city simply was not there — the player flew over
+// open water until land snapped into existence. It is also the cheapest possible answer to that:
+// the whole map's worth of far tier costs less than a kilometre of massing.
+//
+// It is DRAWN ONLY WHERE MASSING IS NOT. See CityTiles.forEachMesh — a tile that has real massing
+// suppresses its own far geometry, so the two never z-fight and the swap happens deep in the fog.
+const S_FAR = 0;
+const S_MASS = 1;
+const S_DETAIL = 2;
 // Stage 2 is SIGNAGE: the glyph quads for shop names and house numbers. It is separate because a
 // 250 mm shop name is a smear past 150 m — render.js fades it out at TEXT_FADE_END and the
 // geometry is pure waste beyond that — and because it is the one class that is not drawn with
 // the scene shader. Everything it emits is a pure function of the building and the street
 // network, so the pass can be re-run in its own stage and land on exactly the fascias the
 // detail stage built.
-const S_SIGNS = 2;
+const S_SIGNS = 3;
 
 // Ranges, metres from the camera to the tile's own cell.
 //   MASS_RANGE   5.0 km. The map is 6.8 km across and the postcard viewpoint is 2 km out over
@@ -45,8 +55,80 @@ const S_SIGNS = 2;
 //                is under 2 px. Past that the geometry costs vertices and returns nothing.
 // The drop distances are ~25% further out, so a camera sitting exactly on a boundary does not
 // thrash a tile in and out.
-const MASS_RANGE = 5000;
-const MASS_DROP = 6200;
+// FAR_RANGE 13 km. The map's diagonal is 22.6 km and the far plane is 18.6 km, but fog closes the
+// horizon long before either: past about 13 km the aerial-perspective term has taken a building to
+// within a few percent of the sky, so geometry beyond it is paying for pixels that are already the
+// colour they would be without it.
+const FAR_RANGE = 13000;
+const FAR_DROP = 15000;
+// HOW FAR YOU CAN ACTUALLY SEE DEPENDS ON HOW HIGH YOU ARE.
+//
+// 13 km is what the far tier is worth from two thousand metres up. Standing on King Street it is
+// worth nothing at all: the next building blocks it, and the 4 M vertices it costs come straight
+// out of the street furniture the player IS looking at — measured with the detail stage pinned at
+// 94 m while the far tier held 425 tiles nobody could see.
+//
+// So the far range is driven by eye height. The floor is deliberately past MASS_DROP: stage 0
+// gates every later stage, so a far range shorter than the massing drop would pull the massing
+// in behind it and take the skyline away at street level, which is the opposite of the point.
+const FAR_EYE_BASE = 4000;
+const FAR_EYE_PER = 5.5;
+// Quantised, so a hovering camera does not re-plan the want set on every frame of a hover.
+const FAR_EYE_STEP = 500;
+
+/** The far tier's build radius for an eye at height `y`. */
+function farRangeAt(y) {
+  const want = FAR_EYE_BASE + Math.max(0, y || 0) * FAR_EYE_PER;
+  const q = Math.round(Math.min(FAR_RANGE, want) / FAR_EYE_STEP) * FAR_EYE_STEP;
+  return Math.max(FAR_EYE_BASE, Math.min(FAR_RANGE, q));
+}
+// Buildings shorter than this are left out of the far tier. 58.7% of the stock is 8-15 m and
+// 16.6% is under 8 m: house-scale, one or two pixels tall at the ranges this stage serves, and
+// three quarters of the building count. The roads and the ground carry those neighbourhoods.
+// The far tier is the DISTANT IMAGE, and it is cheap. The adaptive valve may wind it back to
+// 7.8 km under pressure and no further: past that the player would watch the far side of the
+// city dissolve, which is the exact failure this stage exists to remove.
+const FAR_FLOOR = 0.60;
+const FAR_MIN_H = 14;
+// Every third grid line: 486 vertices of ground a tile instead of 3,750.
+//
+// Chosen by measuring the chord error against the real height field, because Toronto is not flat
+// — the Don and the Humber cut ravines forty metres deep, and decimation is a chord across them.
+// Measured worst / 99th-percentile error over the whole map: step 5 gives 26.8 m / 7.1 m, which
+// flattens a ravine to a third of its depth and shows as a nine-pixel step at the massing
+// boundary; step 3 gives 11.5 m / 3.4 m, about one pixel at that boundary, for 486 vertices. Step
+// 2 would be 6.9 m / 1.9 m at 1,014. Terrain is a rounding error against the buildings in this
+// tier either way, so the ravines win.
+const FAR_TERRAIN_STEP = 3;
+
+// THE LOW-RISE FABRIC. Leaving out everything under FAR_MIN_H keeps the far tier affordable, but
+// leaving out three quarters of the building stock and keeping the streets makes a neighbourhood
+// read from the air as bare lots with roads ruled across them — which is worse than crude. So the
+// short stock comes back as ONE merged block per cell of a coarse lattice, standing on the total
+// footprint area of the buildings in that cell at their area-weighted mean height. Twenty-five
+// boxes a tile against the hundred and thirty buildings they stand for.
+const FAR_LOW_CELLS = 5;
+// A cell holding less built area than this is genuinely empty and gets nothing.
+const FAR_LOW_MIN_AREA = 260;
+
+// Road classes the far tier draws. 62% of the road network is `foot` and another 21% is
+// `service`: footpaths, alleys and driveways, none of which is resolvable at the ranges this
+// stage serves, all of which was being drawn as pale ribbon. Measured at 3.0 M vertices of the
+// far tier's 9.9 M, and it turned every distant neighbourhood into a white wash.
+const FAR_ROAD_CLASSES = { major: 1, minor: 1, motorway: 1 };
+
+// MASS_RANGE was 5 km when the map was 6.8 km across and the massing stage WAS the distance
+// tier. It is not any more: the far tier is, and full massing — real roof forms, graded trench
+// profiles, ballasted track, ground covers tessellated to 12 mm — only starts to read inside a
+// few kilometres. Measured cost of holding it at 5 km on the expanded map: 9.3 M of an 11 M
+// vertex budget, which left the detail stage pinned at its floor with street furniture appearing
+// 94 m away instead of 780 m.
+const MASS_RANGE = 2800;
+// Where the far tier stops being worth holding, because massing is drawn over it from here in.
+// Left well short of MASS_RANGE so a tile crossing outward has its coarse geometry standing long
+// before the massing is released: 1,100 m of overlap is thirteen seconds at the fly speed.
+const FAR_NEAR = 1700;
+const MASS_DROP = 3500;
 const DETAIL_RANGE = 780;
 const DETAIL_DROP = 980;
 // Signage. text.js exports the pair render.js fades over and the pair a tile stage should use;
@@ -126,17 +208,37 @@ class CityTiles extends TileManager {
     return null;
   }
 
+  /**
+   * Wrap a draw callback so a tile's FAR geometry is skipped once it has real massing.
+   *
+   * The far tier and the massing tier describe the same buildings on the same ground. Both
+   * resident and both drawn, they would z-fight everywhere they overlap. Rather than release the
+   * far stage when massing arrives — which would make flying outward pop, because the coarse
+   * geometry would then have to be rebuilt — the far stage stays resident and simply stops being
+   * drawn for that tile. It costs about 2 k vertices a tile to keep, and it means crossing the
+   * massing boundary in either direction is a swap between two things that already exist.
+   *
+   * Statics arrive with a null tile and stage -1 and are never gated.
+   */
+  _gate(fn) {
+    return (m, t, s) => {
+      if (s === S_FAR && t && t.st[S_MASS] && t.st[S_MASS].state === STATE_READY) return;
+      fn(m, t, s);
+    };
+  }
+
   forEachMesh(cls, fn) {
+    const gated = this._gate(fn);
     if (cls === this.signClass) {
       this._signsClaimed = true;
-      super.forEachMesh(cls, fn);
+      super.forEachMesh(cls, gated);
       return;
     }
-    super.forEachMesh(cls, fn);
+    super.forEachMesh(cls, gated);
     if (this._signsClaimed || cls !== this.lastOpaque || !this.signClass) return;
     const r = this._signRenderer();
     if (!r || !r.font || !r.font.texture) return;
-    super.forEachMesh(this.signClass, (m) => r.drawText(m));
+    super.forEachMesh(this.signClass, this._gate((m) => r.drawText(m)));
   }
 }
 
@@ -163,11 +265,12 @@ function surroundVerts(mb) {
  * the float run it owns. Every triangle lands in exactly one tile, so nothing is dropped and
  * nothing is drawn twice.
  */
-function* splitCapture(grid, cap, stageOf, tileChunks) {
+function* splitCapture(grid, cap, stageOf, tileChunks, defaultStage) {
   const VF = VERT_FLOATS;
+  const dflt = Number.isFinite(defaultStage) ? defaultStage : S_MASS;
   for (let c = 0; c < MESH_CLASSES.length; c++) {
     const name = MESH_CLASSES[c];
-    const stage = stageOf[name] === undefined ? S_MASS : stageOf[name];
+    const stage = stageOf[name] === undefined ? dflt : stageOf[name];
     const data = cap[name].data();
     const n = data.length;
     if (n < VF * 3) continue;
@@ -198,7 +301,7 @@ function* splitCapture(grid, cap, stageOf, tileChunks) {
     }
     for (const [id, arr] of buf) {
       let rec = tileChunks.get(id);
-      if (!rec) { rec = [null, null]; tileChunks.set(id, rec); }
+      if (!rec) { rec = []; tileChunks.set(id, rec); }
       if (!rec[stage]) rec[stage] = {};
       rec[stage][name] = arr;
       // Chunks are geometry too: the tile's draw box has to contain them or the culler will
@@ -221,8 +324,8 @@ function* splitCapture(grid, cap, stageOf, tileChunks) {
 }
 
 /** The same split, run to completion, for a caller that is not on a frame budget. */
-function captureSplit(grid, cap, stageOf, tileChunks) {
-  const it = splitCapture(grid, cap, stageOf, tileChunks);
+function captureSplit(grid, cap, stageOf, tileChunks, defaultStage) {
+  const it = splitCapture(grid, cap, stageOf, tileChunks, defaultStage);
   for (;;) { if (it.next().done) return; }
 }
 
@@ -245,12 +348,12 @@ function captureSplit(grid, cap, stageOf, tileChunks) {
  * them up is a fifth of a second. Doing that in one step would replace the stall this whole change
  * exists to remove with a smaller one in the same place.
  *
- * @param {object} W grid, tiles (may be null), cap (a builder set), stageOf, stats
+ * @param {object} W grid, tiles (may be null), cap (a builder set), stageOf, defaultStage, stats
  */
 function* deliverCapture(W) {
-  const { grid, tiles, cap, stageOf, stats } = W;
+  const { grid, tiles, cap, stageOf, stats, defaultStage } = W;
   const tileChunks = new Map();
-  yield* splitCapture(grid, cap, stageOf || {}, tileChunks);
+  yield* splitCapture(grid, cap, stageOf || {}, tileChunks, defaultStage);
   let verts = 0;
   for (const [id, rec] of tileChunks) {
     const t = grid.tiles[id];
@@ -293,7 +396,9 @@ const ISLE_TILE_DOWN = 18.0;
 
 export {
   MAX_CRANES, MAX_TOWER_SIGNS, PARK_TREE_SPACING, MAX_PARK_TREES, ISLE_TILE_UP, ISLE_TILE_DOWN,
-  S_MASS, S_DETAIL, S_SIGNS,
+  S_FAR, S_MASS, S_DETAIL, S_SIGNS,
+  FAR_RANGE, FAR_DROP, FAR_FLOOR, FAR_NEAR, FAR_MIN_H, FAR_TERRAIN_STEP,
+  FAR_LOW_CELLS, FAR_LOW_MIN_AREA, FAR_ROAD_CLASSES, farRangeAt,
   MASS_RANGE, MASS_DROP, DETAIL_RANGE, DETAIL_DROP, SIGN_RANGE, SIGN_DROP,
   VERTEX_CAP, TILE_BUDGET_MS, TILE_EVICT_MS,
   CityTiles, makeBuilders, surroundVerts, captureSplit, deliverCapture, appendChunk,
