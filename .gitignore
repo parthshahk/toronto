@@ -20,4 +20,3 @@ CONTRACT.md
 #     && python3 tools/pack_city.py
 # Committing them pushed the repo past GitHub's 50 MB file warning and toward its 100 MB limit.
 data/toronto.json
-data/toronto.bin
